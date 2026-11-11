@@ -6,3 +6,4 @@
 *.log
 .DS_Store
 /dist-pkg
+/app/release.conf.json

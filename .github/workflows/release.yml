@@ -1,0 +1,220 @@
+name: Release
+
+# Every merge to main ships a release v0.1.<run number>: a Windows installer, Linux .deb and
+# AppImage, an Arch package, SHA256SUMS and the updater manifest latest.json.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  VERSION: 0.1.${{ github.run_number }}
+
+jobs:
+  windows:
+    name: Windows x64 (NSIS)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: app/package.json
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+
+      - name: Set version ${{ env.VERSION }}
+        shell: bash
+        run: .github/release/set-version.sh "$VERSION"
+
+      - name: Build the service (sidecar)
+        shell: pwsh
+        run: ./scripts/prepare-sidecar.ps1
+
+      - name: Build the installer
+        shell: bash
+        working-directory: app
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          pnpm install --frozen-lockfile
+          # No code-signing certificate: the installer is unsigned (SmartScreen will warn).
+          pnpm tauri build --bundles nsis --config release.conf.json
+
+      - name: Collect
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/release/bundle/nsis/Drive_${VERSION}_x64-setup.exe" dist/
+          cp "target/release/bundle/nsis/Drive_${VERSION}_x64-setup.exe.sig" dist/
+          ls -l dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows
+          path: dist/*
+          if-no-files-found: error
+
+  linux:
+    name: Linux x64 (.deb, AppImage)
+    # The oldest supported runner, so the AppImage and the binaries run on older glibc too.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: app/package.json
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev \
+            libssl-dev patchelf file
+
+      - name: Set version ${{ env.VERSION }}
+        run: .github/release/set-version.sh "$VERSION"
+
+      - name: Build the service (sidecar)
+        run: scripts/prepare-sidecar.sh
+
+      - name: Build the bundles
+        working-directory: app
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm tauri build --bundles deb,appimage --config release.conf.json
+
+      - name: Check the .deb and collect
+        run: |
+          deb="target/release/bundle/deb/Drive_${VERSION}_amd64.deb"
+          appimage="target/release/bundle/appimage/Drive_${VERSION}_amd64.AppImage"
+          dpkg-deb --info "$deb"
+          dpkg-deb --contents "$deb"
+          dpkg-deb --field "$deb" Depends | grep -q fuse3
+          rm -rf pkgroot && mkdir -p pkgroot/root
+          dpkg-deb -x "$deb" pkgroot/root
+          for f in usr/bin/drive usr/bin/drive-app; do test -x "pkgroot/root/$f"; done
+          test -f pkgroot/root/usr/lib/systemd/user/drive.service
+          ls pkgroot/root/usr/share/applications/*.desktop
+          ls pkgroot/root/usr/share/icons/hicolor/*/apps/
+          # Same files for the Arch package (see packaging/arch/PKGBUILD).
+          tar -C pkgroot -czf "drive-${VERSION}-x86_64-root.tar.gz" root
+          mkdir -p dist
+          cp "$deb" "$appimage" "$appimage.sig" dist/
+          if [ -f "$deb.sig" ]; then cp "$deb.sig" dist/; fi
+          ls -l dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux
+          path: dist/*
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-root
+          path: drive-${{ env.VERSION }}-x86_64-root.tar.gz
+          if-no-files-found: error
+
+  arch:
+    name: Arch Linux (.pkg.tar.zst)
+    needs: linux
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+    steps:
+      - name: Install makepkg
+        run: |
+          pacman -Syu --noconfirm --needed base-devel
+          useradd -m builder
+
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-root
+          path: packaging/arch
+
+      - name: makepkg
+        working-directory: packaging/arch
+        run: |
+          sum="$(sha256sum "drive-${VERSION}-x86_64-root.tar.gz" | cut -d' ' -f1)"
+          sed -i -e "s/^pkgver=.*/pkgver=${VERSION}/" -e "s/^sha256sums=.*/sha256sums=('${sum}')/" PKGBUILD
+          chown -R builder: .
+          su builder -c 'makepkg --nodeps --noconfirm'
+          ls -l ./*.pkg.tar.zst
+
+      - name: Install the package and check it
+        working-directory: packaging/arch
+        run: |
+          pkg="drive-${VERSION}-1-x86_64.pkg.tar.zst"
+          pacman -Qip "$pkg"
+          pacman -Qlp "$pkg"
+          pacman -U --noconfirm "$pkg"
+          if ldd /usr/bin/drive /usr/bin/drive-app | grep 'not found'; then exit 1; fi
+          /usr/bin/drive --version || /usr/bin/drive --help
+          mkdir -p /tmp/dist && cp "$pkg" /tmp/dist/
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: arch
+          path: /tmp/dist/*
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    needs: [windows, linux, arch]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Drop the build-only tarball
+        run: rm -f dist/drive-*-root.tar.gz && ls -l dist
+
+      - name: latest.json, SHA256SUMS and release notes
+        run: .github/release/make-release-files.sh "$VERSION" dist
+
+      - name: Publish v${{ env.VERSION }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${VERSION}" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Drive ${VERSION}" \
+            --notes-file notes.md \
+            --latest

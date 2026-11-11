@@ -1,0 +1,27 @@
+# Maintainer: Drive contributors <https://github.com/samcannas/drive>
+#
+# Arch Linux (also Manjaro, Omarchy) package for Drive. It repackages the files of the Linux
+# release build instead of compiling again: .github/workflows/release.yml extracts the .deb into
+# drive-<pkgver>-x86_64-root.tar.gz (root/usr/bin/drive, root/usr/bin/drive-app, the systemd
+# user unit, the desktop file and icons), sets pkgver/sha256sums and runs `makepkg` in an
+# archlinux container. To build locally, put that tarball next to this file and run `makepkg`.
+pkgname=drive
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Encrypted cloud drive for uloz.to: tray app and background sync service'
+arch=('x86_64')
+url='https://github.com/samcannas/drive'
+license=('MIT')
+depends=('fuse3' 'webkit2gtk-4.1' 'gtk3' 'libayatana-appindicator')
+options=('!strip' '!debug')
+install=drive.install
+source=("drive-${pkgver}-x86_64-root.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+  cp -a --no-preserve=ownership "${srcdir}/root/." "${pkgdir}/"
+  # The service runs as a systemd *user* unit (/usr/lib/systemd/user/drive.service).
+  test -f "${pkgdir}/usr/lib/systemd/user/drive.service"
+  test -x "${pkgdir}/usr/bin/drive"
+  test -x "${pkgdir}/usr/bin/drive-app"
+}

@@ -1,0 +1,14 @@
+post_install() {
+  cat <<'MSG'
+==> Start the Drive sync service for your user (run this as yourself, not as root):
+==>     systemctl --user enable --now drive
+==> Then open "Drive" from the application menu to sign in.
+MSG
+}
+
+post_upgrade() {
+  cat <<'MSG'
+==> Restart the Drive service to run the new version:
+==>     systemctl --user restart drive
+MSG
+}

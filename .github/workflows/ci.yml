@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches-ignore: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: short
+  RCLONE_VERSION: v1.76.0
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install Linux packages (FUSE, WebKitGTK 4.1, appindicator)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            fuse3 libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            libxdo-dev libssl-dev
+
+      - name: Make /dev/fuse usable
+        if: runner.os == 'Linux'
+        run: |
+          sudo modprobe fuse || true
+          test -c /dev/fuse
+          sudo chmod 666 /dev/fuse
+          grep -q '^user_allow_other' /etc/fuse.conf || echo user_allow_other | sudo tee -a /etc/fuse.conf
+          ls -l /dev/fuse "$(command -v fusermount3)"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt
+        if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
+
+      - name: Download rclone ${{ env.RCLONE_VERSION }}
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then plat=windows-amd64; exe=rclone.exe; else plat=linux-amd64; exe=rclone; fi
+          dir="$(cd "$RUNNER_TEMP" && pwd)"
+          curl -fsSL --retry 3 -o "$dir/rclone.zip" \
+            "https://downloads.rclone.org/$RCLONE_VERSION/rclone-$RCLONE_VERSION-$plat.zip"
+          unzip -q "$dir/rclone.zip" -d "$dir"
+          bin="$dir/rclone-$RCLONE_VERSION-$plat/$exe"
+          "$bin" version
+          if [ "$RUNNER_OS" = Windows ]; then bin="$(cygpath -w "$bin")"; fi
+          echo "RCLONE_BIN=$bin" >> "$GITHUB_ENV"
+
+      - name: clippy (drive-core, drive-daemon)
+        run: cargo clippy --locked -p drive-core -p drive-daemon --all-targets -- -D warnings
+
+      - name: Tests (drive-core, drive-daemon)
+        run: cargo test --locked -p drive-core -p drive-daemon
+
+      - name: Check the app crate (drive-app)
+        shell: bash
+        env:
+          # The sidecar (binaries/drive-<triple>) is only needed for bundling.
+          TAURI_CONFIG: '{"bundle":{"externalBin":[]}}'
+        run: |
+          # generate_context! embeds the frontend; a placeholder is enough to type-check.
+          mkdir -p app/dist
+          [ -f app/dist/index.html ] || echo '<!doctype html>' > app/dist/index.html
+          cargo check --locked -p drive-app
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: app/package.json
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      - run: pnpm build
