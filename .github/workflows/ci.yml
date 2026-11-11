@@ -14,6 +14,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: 0
   CARGO_INCREMENTAL: 0
   # Pinned to the toolchain the team develops with, so clippy/rustfmt in CI match local runs.
   # Bump it deliberately (and fix the new lints) rather than following `stable`.
@@ -31,6 +32,15 @@ jobs:
         os: [windows-latest, ubuntu-24.04]
     runs-on: ${{ matrix.os }}
     steps:
+      # Real-time scanning of every file rustc and the linker write slows builds noticeably.
+      - name: Turn off Defender real-time scanning
+        if: runner.os == 'Windows'
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Set-MpPreference -DisableRealtimeMonitoring $true -ExclusionPath $env:GITHUB_WORKSPACE, $env:USERPROFILE
+          Get-MpPreference | Select-Object DisableRealtimeMonitoring, ExclusionPath | Format-List
+
       - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@master
@@ -38,19 +48,28 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt, clippy
 
+      # Runs every test binary in parallel (cargo test runs them one after another).
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      # Plain-HTTP Ubuntu mirrors (azure.archive / archive / security) are sometimes
+      # unreachable from GitHub's runners while HTTPS works: use an HTTPS mirror for any
+      # download the package cache below has to make.
+      - name: Use an HTTPS Ubuntu mirror
+        if: runner.os == 'Linux'
+        run: sudo sed -i -E 's#http://(azure\.archive|archive|security)\.ubuntu\.com/ubuntu#https://mirrors.edge.kernel.org/ubuntu#g' /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+
+      # Restores the installed packages from the Actions cache instead of apt-get (seconds
+      # instead of most of a minute). Bump `version` to rebuild the cache.
       - name: Install Linux packages (FUSE, WebKitGTK 4.1, appindicator)
         if: runner.os == 'Linux'
-        timeout-minutes: 15 # mirrors occasionally hang; fail fast instead of stalling the job
-        run: |
-          # Each attempt is capped; a hung mirror connection is retried instead of blocking.
-          apt() { for i in 1 2 3; do sudo timeout 240 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 "$@" && return 0; echo "apt-get $1 failed (attempt $i), retrying"; sleep 10; done; return 1; }
-          # Plain-HTTP Ubuntu mirrors (azure.archive / archive / security) are sometimes
-          # unreachable from GitHub's runners while HTTPS works: use an HTTPS mirror.
-          sudo sed -i -E 's#http://(azure\.archive|archive|security)\.ubuntu\.com/ubuntu#https://mirrors.edge.kernel.org/ubuntu#g' /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
-          apt update
-          apt install -y --no-install-recommends \
-            fuse3 libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
-            libxdo-dev libssl-dev
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        timeout-minutes: 15
+        with:
+          packages: fuse3 libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev
+          version: ci-1
+          execute_install_scripts: true
 
       - name: Make /dev/fuse usable
         if: runner.os == 'Linux'
@@ -58,10 +77,17 @@ jobs:
           sudo modprobe fuse || true
           test -c /dev/fuse
           sudo chmod 666 /dev/fuse
-          grep -q '^user_allow_other' /etc/fuse.conf || echo user_allow_other | sudo tee -a /etc/fuse.conf
+          # fusermount3 must be setuid root to mount as the runner user.
+          sudo chmod u+s "$(command -v fusermount3)"
+          grep -q '^user_allow_other' /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
           ls -l /dev/fuse "$(command -v fusermount3)"
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # v1: started over with the rust-lld linker (v0 caches hold link.exe builds too).
+          prefix-key: v1-rust
+          # Branches restore main's cache but don't each save their own.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: rustfmt
         if: runner.os == 'Linux'
@@ -80,8 +106,17 @@ jobs:
           if [ "$RUNNER_OS" = Windows ]; then bin="$(cygpath -w "$bin")"; fi
           echo "RCLONE_BIN=$bin" >> "$GITHUB_ENV"
 
-      - name: clippy (drive-core, drive-daemon)
-        run: cargo clippy --locked -p drive-core -p drive-daemon --all-targets -- -D warnings
+      # The whole workspace, the app included (this also type-checks it).
+      - name: clippy
+        shell: bash
+        env:
+          # The sidecar (binaries/drive-<triple>) is only needed for bundling.
+          TAURI_CONFIG: '{"bundle":{"externalBin":[]}}'
+        run: |
+          # generate_context! embeds the frontend; a placeholder is enough to type-check.
+          mkdir -p app/dist
+          [ -f app/dist/index.html ] || echo '<!doctype html>' > app/dist/index.html
+          cargo clippy --locked --workspace --all-targets -- -D warnings
 
       # Some Windows runner images don't have the Cloud Files filter attached to the work
       # volume, so registering a sync root there fails with ERROR_INVALID_FUNCTION.
@@ -98,25 +133,14 @@ jobs:
       - name: Tests (drive-core, drive-daemon)
         shell: bash
         run: |
-          skip=()
+          filter=()
           if [ "$RUNNER_OS" = Windows ]; then
             # The runner (Windows Server) can't do the Explorer/shell sync-root registration
             # (0x80070490), so Drive falls back to a native one, and `copy` of a placeholder
             # there fails with "not supported by the cloud sync provider". Passes on Windows 11.
-            skip=(--skip platform::windows::tests::cloud_files_show_up_and_download_on_demand)
+            filter=(-E 'not test(cloud_files_show_up_and_download_on_demand)')
           fi
-          cargo test --locked --no-fail-fast -p drive-core -p drive-daemon -- "${skip[@]}"
-
-      - name: Check the app crate (drive-app)
-        shell: bash
-        env:
-          # The sidecar (binaries/drive-<triple>) is only needed for bundling.
-          TAURI_CONFIG: '{"bundle":{"externalBin":[]}}'
-        run: |
-          # generate_context! embeds the frontend; a placeholder is enough to type-check.
-          mkdir -p app/dist
-          [ -f app/dist/index.html ] || echo '<!doctype html>' > app/dist/index.html
-          cargo check --locked -p drive-app
+          cargo nextest run --locked --no-fail-fast -p drive-core -p drive-daemon "${filter[@]}"
 
   frontend:
     name: Frontend
@@ -127,15 +151,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: pnpm/action-setup@v6
-        with:
-          package_json_file: app/package.json
-
       - uses: actions/setup-node@v7
         with:
           node-version: 24
-          cache: pnpm
-          cache-dependency-path: app/pnpm-lock.yaml
+      # pnpm through Corepack (bundled with Node), at the version app/package.json pins:
+      # seconds, where pnpm/action-setup spends ~20 s installing itself through npm.
+      - name: Enable pnpm
+        run: corepack enable pnpm && pnpm --version
 
       - run: pnpm install --frozen-lockfile
       - run: pnpm check

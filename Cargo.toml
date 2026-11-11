@@ -35,8 +35,9 @@ base64 = "0.22"
 tempfile = "3"
 
 [profile.release]
-lto = "thin"
-codegen-units = 4
+# No cross-crate LTO and the default 16 codegen units: a release build then recompiles only
+# the workspace crates and links against the cached dependencies, instead of re-optimizing
+# the whole dependency graph at every link (minutes per build in CI, for a few % of size).
 strip = true
 
 [profile.dev]

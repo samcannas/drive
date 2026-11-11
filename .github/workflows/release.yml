@@ -2,7 +2,8 @@ name: Release
 
 # Every merge to main ships a release v0.1.<run number>: a Windows installer, Linux .deb and
 # AppImage, an Arch package, SHA256SUMS and the updater manifest latest.json.
-# Run it by hand (Actions → Release → Run workflow) to release another branch or retry.
+# Run it by hand (Actions → Release → Run workflow) to retry on main, or on another branch
+# to build everything without publishing (a dry run).
 on:
   push:
     branches: [main]
@@ -14,7 +15,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: release
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -22,6 +23,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: 0
   CARGO_INCREMENTAL: 0
   # Pinned to the toolchain the team develops with, so clippy/rustfmt in CI match local runs.
   # Bump it deliberately (and fix the new lints) rather than following `stable`.
@@ -33,40 +35,44 @@ jobs:
     name: Windows x64 (NSIS)
     runs-on: windows-latest
     steps:
+      # Real-time scanning of every file rustc and the linker write slows builds noticeably.
+      - name: Turn off Defender real-time scanning
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Set-MpPreference -DisableRealtimeMonitoring $true -ExclusionPath $env:GITHUB_WORKSPACE, $env:USERPROFILE
+          Get-MpPreference | Select-Object DisableRealtimeMonitoring, ExclusionPath | Format-List
+
       - uses: actions/checkout@v7
+
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
         with:
+          # v1: started over when LTO was dropped; v0 caches also held the LTO builds.
+          prefix-key: v1-rust
           shared-key: release
-      - uses: pnpm/action-setup@v6
-        with:
-          package_json_file: app/package.json
       - uses: actions/setup-node@v7
         with:
           node-version: 24
-          cache: pnpm
-          cache-dependency-path: app/pnpm-lock.yaml
+      # pnpm through Corepack (bundled with Node), at the version app/package.json pins:
+      # seconds, where pnpm/action-setup spends ~20 s installing itself through npm.
+      - name: Enable pnpm
+        shell: bash
+        run: corepack enable pnpm && (cd app && pnpm --version)
 
       - name: Set version ${{ env.VERSION }}
         shell: bash
         run: .github/release/set-version.sh "$VERSION"
 
-      - name: Build the service (sidecar)
-        shell: pwsh
-        run: ./scripts/prepare-sidecar.ps1
-
-      - name: Build the installer
+      - name: Build the app, the service and the installer
         shell: bash
-        working-directory: app
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: |
-          pnpm install --frozen-lockfile
-          # No code-signing certificate: the installer is unsigned (SmartScreen will warn).
-          pnpm tauri build --bundles nsis --config release.conf.json
+        # No code-signing certificate: the installer is unsigned (SmartScreen will warn).
+        run: .github/release/build-app.sh nsis
 
       - name: Collect
         shell: bash
@@ -83,7 +89,7 @@ jobs:
           mkdir -p dist
           cp "target/release/bundle/nsis/Drive_${VERSION}_x64-setup.exe" dist/
           cp "target/release/bundle/nsis/Drive_${VERSION}_x64-setup.exe.sig" dist/
-          ls -l dist
+          ls -l dist target/release/drive.exe target/release/drive-app.exe
 
       - uses: actions/upload-artifact@v7
         with:
@@ -91,8 +97,16 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+      # Where the compile time goes, per crate (open the HTML in a browser).
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: cargo-timings-windows
+          path: target/cargo-timings/cargo-timing.html
+          if-no-files-found: ignore
+
   linux:
-    name: Linux x64 (.deb, AppImage)
+    name: Linux x64 (.deb, AppImage, Arch)
     # The oldest supported runner, so the AppImage and the binaries run on older glibc too.
     runs-on: ubuntu-22.04
     steps:
@@ -102,48 +116,45 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
         with:
+          # v1: started over when LTO was dropped; v0 caches also held the LTO builds.
+          prefix-key: v1-rust
           shared-key: release
-      - uses: pnpm/action-setup@v6
-        with:
-          package_json_file: app/package.json
       - uses: actions/setup-node@v7
         with:
           node-version: 24
-          cache: pnpm
-          cache-dependency-path: app/pnpm-lock.yaml
+      # pnpm through Corepack (bundled with Node), at the version app/package.json pins:
+      # seconds, where pnpm/action-setup spends ~20 s installing itself through npm.
+      - name: Enable pnpm
+        shell: bash
+        run: corepack enable pnpm && (cd app && pnpm --version)
 
+      # Plain-HTTP Ubuntu mirrors (azure.archive / archive / security) are sometimes
+      # unreachable from GitHub's runners while HTTPS works: use an HTTPS mirror for any
+      # download the package cache below has to make.
+      - name: Use an HTTPS Ubuntu mirror
+        run: sudo sed -i -E 's#http://(azure\.archive|archive|security)\.ubuntu\.com/ubuntu#https://mirrors.edge.kernel.org/ubuntu#g' /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+
+      # Restores the installed packages from the Actions cache instead of apt-get (seconds
+      # instead of most of a minute). Bump `version` to rebuild the cache.
       - name: Install build dependencies
-        timeout-minutes: 15 # mirrors occasionally hang; fail fast instead of stalling the job
-        run: |
-          # Each attempt is capped; a hung mirror connection is retried instead of blocking.
-          apt() { for i in 1 2 3; do sudo timeout 240 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 "$@" && return 0; echo "apt-get $1 failed (attempt $i), retrying"; sleep 10; done; return 1; }
-          # Plain-HTTP Ubuntu mirrors (azure.archive / archive / security) are sometimes
-          # unreachable from GitHub's runners while HTTPS works: use an HTTPS mirror.
-          sudo sed -i -E 's#http://(azure\.archive|archive|security)\.ubuntu\.com/ubuntu#https://mirrors.edge.kernel.org/ubuntu#g' /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
-          apt update
-          apt install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev \
-            libssl-dev patchelf file
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        timeout-minutes: 15
+        with:
+          packages: libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev patchelf file
+          version: release-1
 
       - name: Set version ${{ env.VERSION }}
         run: .github/release/set-version.sh "$VERSION"
 
-      - name: Build the service (sidecar)
-        run: bash scripts/prepare-sidecar.sh
-
-      - name: Build the bundles
-        working-directory: app
+      - name: Build the app, the service and the .deb
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: |
-          pnpm install --frozen-lockfile
-          pnpm tauri build --bundles deb,appimage --config release.conf.json
+        run: .github/release/build-app.sh deb
 
-      - name: Check the .deb and collect
+      - name: Check the .deb
         run: |
           deb="target/release/bundle/deb/Drive_${VERSION}_amd64.deb"
-          appimage="target/release/bundle/appimage/Drive_${VERSION}_amd64.AppImage"
           dpkg-deb --info "$deb"
           dpkg-deb --contents "$deb"
           dpkg-deb --field "$deb" Depends | grep -q fuse3
@@ -155,10 +166,42 @@ jobs:
           ls pkgroot/root/usr/share/icons/hicolor/*/apps/
           # Same files for the Arch package (see packaging/arch/PKGBUILD).
           tar -C pkgroot -czf "drive-${VERSION}-x86_64-root.tar.gz" root
+
+      # The Arch package only needs the .deb's files: build it in an Arch container in the
+      # background while the AppImage bundles (that takes over a minute), instead of in a
+      # separate job that waits for this whole one.
+      - name: Start the Arch package (background)
+        run: |
+          docker run -d --name arch -v "$PWD:/work" -e VERSION archlinux:latest \
+            bash /work/.github/release/arch-package.sh
+
+      - name: Bundle the AppImage
+        working-directory: app
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # linuxdeploy strips every library it copies into the AppImage; Ubuntu's are
+          # already stripped, so that only costs time.
+          NO_STRIP: "true"
+        run: pnpm tauri bundle --ci --bundles appimage --config release.conf.json
+
+      - name: Finish the Arch package
+        if: always()
+        run: |
+          code="$(docker wait arch)"
+          docker logs arch
+          docker rm arch >/dev/null
+          test "$code" = 0
+          ls -l arch-dist
+
+      - name: Collect
+        run: |
+          deb="target/release/bundle/deb/Drive_${VERSION}_amd64.deb"
+          appimage="target/release/bundle/appimage/Drive_${VERSION}_amd64.AppImage"
           mkdir -p dist
-          cp "$deb" "$appimage" "$appimage.sig" dist/
+          cp "$deb" "$appimage" "$appimage.sig" arch-dist/*.pkg.tar.zst dist/
           if [ -f "$deb.sig" ]; then cp "$deb.sig" dist/; fi
-          ls -l dist
+          ls -l dist target/release/drive target/release/drive-app
 
       - uses: actions/upload-artifact@v7
         with:
@@ -166,59 +209,19 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+      # Where the compile time goes, per crate (open the HTML in a browser).
       - uses: actions/upload-artifact@v7
+        if: always()
         with:
-          name: linux-root
-          path: drive-${{ env.VERSION }}-x86_64-root.tar.gz
-          if-no-files-found: error
-
-  arch:
-    name: Arch Linux (.pkg.tar.zst)
-    needs: linux
-    runs-on: ubuntu-24.04
-    container: archlinux:latest
-    steps:
-      - name: Install makepkg
-        run: |
-          pacman -Syu --noconfirm --needed base-devel
-          useradd -m builder
-
-      - uses: actions/checkout@v7
-
-      - uses: actions/download-artifact@v8
-        with:
-          name: linux-root
-          path: packaging/arch
-
-      - name: makepkg
-        working-directory: packaging/arch
-        run: |
-          sum="$(sha256sum "drive-${VERSION}-x86_64-root.tar.gz" | cut -d' ' -f1)"
-          sed -i -e "s/^pkgver=.*/pkgver=${VERSION}/" -e "s/^sha256sums=.*/sha256sums=('${sum}')/" PKGBUILD
-          chown -R builder: .
-          su builder -c 'makepkg --nodeps --noconfirm'
-          ls -l ./*.pkg.tar.zst
-
-      - name: Install the package and check it
-        working-directory: packaging/arch
-        run: |
-          pkg="drive-${VERSION}-1-x86_64.pkg.tar.zst"
-          pacman -Qip "$pkg"
-          pacman -Qlp "$pkg"
-          pacman -U --noconfirm "$pkg"
-          if ldd /usr/bin/drive /usr/bin/drive-app | grep 'not found'; then exit 1; fi
-          /usr/bin/drive --version || /usr/bin/drive --help
-          mkdir -p /tmp/dist && cp "$pkg" /tmp/dist/
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: arch
-          path: /tmp/dist/*
-          if-no-files-found: error
+          name: cargo-timings-linux
+          path: target/cargo-timings/cargo-timing.html
+          if-no-files-found: ignore
 
   release:
     name: GitHub Release
-    needs: [windows, linux, arch]
+    needs: [windows, linux]
+    # Only main publishes; elsewhere the run is a dry run of the builds.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -227,13 +230,18 @@ jobs:
         with:
           fetch-depth: 0 # the changelog is built from commits between release tags
 
+      # Only the packages (not the cargo timing reports).
       - uses: actions/download-artifact@v8
         with:
+          name: windows
           path: dist
-          merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux
+          path: dist
 
-      - name: Drop the build-only tarball
-        run: rm -f dist/drive-*-root.tar.gz && ls -l dist
+      - name: Files
+        run: ls -l dist
 
       - name: Changelog
         run: .github/release/changelog.sh "$VERSION" dist
