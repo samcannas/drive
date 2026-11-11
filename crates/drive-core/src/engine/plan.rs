@@ -9,6 +9,12 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::db::{Node, NodeId, ROOT_ID, name_key, pending};
 use crate::remote::{Kind, RemoteEntry, RemoteTree};
 
+/// Encrypted marker file at the vault root. It lets a new device check its encryption
+/// password even when the vault is otherwise empty; it is never shown locally.
+pub const VAULT_MARKER: &str = ".drive-vault";
+pub const VAULT_MARKER_CONTENT: &[u8] = b"drive-vault-v1
+";
+
 /// New nodes get negative temporary ids until they are inserted.
 pub type TempId = i64;
 
@@ -276,8 +282,13 @@ pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
 
     let mut m = Model::new(input.nodes);
     let mut out = Plan::default();
-    let remote: HashMap<&str, &RemoteEntry> =
-        tree.entries.iter().filter(|e| !input.orphans.contains(&e.id)).map(|e| (e.id.as_str(), e)).collect();
+    let remote: HashMap<&str, &RemoteEntry> = tree
+        .entries
+        .iter()
+        .filter(|e| !input.orphans.contains(&e.id))
+        .filter(|e| !(e.parent_id == tree.root_id && e.name == VAULT_MARKER))
+        .map(|e| (e.id.as_str(), e))
+        .collect();
     let mut kids: HashMap<&str, Vec<&RemoteEntry>> = HashMap::new();
     for e in remote.values() {
         kids.entry(e.parent_id.as_str()).or_default().push(e);

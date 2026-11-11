@@ -1,5 +1,6 @@
 [package]
 name = "drive-daemon"
+description = "Drive background service and command-line interface"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,3 +12,38 @@ path = "src/main.rs"
 
 [dependencies]
 drive-core.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+chrono.workspace = true
+clap.workspace = true
+dirs.workspace = true
+rand.workspace = true
+interprocess.workspace = true
+futures.workspace = true
+bytes.workspace = true
+rpassword = "7"
+fs4 = { version = "0.13", features = ["sync"] }
+
+[target.'cfg(windows)'.dependencies]
+cloud-filter = "0.0.7"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Memory",
+    "Win32_UI_Shell",
+] }
+widestring = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "0.15", default-features = false }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true

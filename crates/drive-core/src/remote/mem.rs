@@ -11,14 +11,21 @@ use futures::StreamExt;
 
 use super::{ByteStream, Kind, Remote, RemoteEntry, RemoteError, RemoteTree, UploadBody};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct Item {
     parent: String,
     kind: Kind,
     name: String,
+    #[serde(skip)]
     data: Bytes,
     mtime_ms: i64,
     trashed: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct Index {
+    next: u64,
+    items: HashMap<String, Item>,
 }
 
 #[derive(Default)]
@@ -30,6 +37,8 @@ pub struct MemRemote {
     /// Every operation fails as offline while set.
     offline: std::sync::atomic::AtomicBool,
     calls: Mutex<Vec<String>>,
+    /// When set, the remote is persisted to this directory (`index.json` + `blobs/<id>`).
+    dir: Option<std::path::PathBuf>,
 }
 
 pub const ROOT: &str = "root";
@@ -37,6 +46,37 @@ pub const ROOT: &str = "root";
 impl MemRemote {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A remote persisted in `dir` — a stand-in for uloz.to during development
+    /// (`DRIVE_DEV_REMOTE=<dir>`).
+    pub fn persistent(dir: impl Into<std::path::PathBuf>) -> std::io::Result<Self> {
+        let dir = dir.into();
+        std::fs::create_dir_all(dir.join("blobs"))?;
+        let index: Index = match std::fs::read(dir.join("index.json")) {
+            Ok(b) => serde_json::from_slice(&b).map_err(std::io::Error::other)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Index::default(),
+            Err(e) => return Err(e),
+        };
+        let mut items = index.items;
+        for (id, it) in items.iter_mut() {
+            if it.kind == Kind::File {
+                it.data = std::fs::read(dir.join("blobs").join(id)).map(Bytes::from).unwrap_or_default();
+            }
+        }
+        Ok(Self { items: Mutex::new(items), next: AtomicU64::new(index.next), dir: Some(dir), ..Default::default() })
+    }
+
+    fn persist(&self, new_blob: Option<(&str, &[u8])>) {
+        let Some(dir) = &self.dir else { return };
+        if let Some((id, data)) = new_blob {
+            let _ = std::fs::write(dir.join("blobs").join(id), data);
+        }
+        let index = Index { next: self.next.load(Ordering::SeqCst), items: self.items.lock().unwrap().clone() };
+        let tmp = dir.join("index.json.tmp");
+        if std::fs::write(&tmp, serde_json::to_vec(&index).unwrap_or_default()).is_ok() {
+            let _ = std::fs::rename(&tmp, dir.join("index.json"));
+        }
     }
 
     pub fn fail_next(&self, n: u64) {
@@ -93,6 +133,7 @@ impl MemRemote {
             id.clone(),
             Item { parent: parent.into(), kind: Kind::File, name: name.into(), data: Bytes::copy_from_slice(data), mtime_ms, trashed: false },
         );
+        self.persist(Some((&id, data)));
         id
     }
 
@@ -102,6 +143,7 @@ impl MemRemote {
             id.clone(),
             Item { parent: parent.into(), kind: Kind::Folder, name: name.into(), data: Bytes::new(), mtime_ms: 0, trashed: false },
         );
+        self.persist(None);
         id
     }
 
@@ -114,6 +156,8 @@ impl MemRemote {
             }
             stack.extend(items.iter().filter(|(_, i)| i.parent == cur && !i.trashed).map(|(k, _)| k.clone()));
         }
+        drop(items);
+        self.persist(None);
     }
 
     pub fn move_item(&self, id: &str, parent: &str, name: &str) {
@@ -121,6 +165,8 @@ impl MemRemote {
         let it = items.get_mut(id).unwrap();
         it.parent = parent.into();
         it.name = name.into();
+        drop(items);
+        self.persist(None);
     }
 
     /// Live (non-trashed) entries as `path -> data` for assertions; folders end with `/`.
@@ -243,7 +289,10 @@ impl Remote for MemRemote {
         let it = items.get_mut(&entry.id).filter(|i| !i.trashed).ok_or_else(|| RemoteError::NotFound(entry.id.clone()))?;
         it.parent = new_parent_id.into();
         it.name = new_name.into();
-        Ok(Self::entry(&entry.id, it))
+        let e = Self::entry(&entry.id, it);
+        drop(items);
+        self.persist(None);
+        Ok(e)
     }
 
     async fn trash(&self, entry: &RemoteEntry) -> Result<(), RemoteError> {
