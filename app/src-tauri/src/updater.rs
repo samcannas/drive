@@ -3,8 +3,9 @@
 //! A small state machine ([`UpdateStatus`]) that the webviews read with `update_state` and
 //! follow through the `drive://update` event, and that the tray menu mirrors:
 //!
-//! * Checks 15 s after startup and then every 6 hours against the `latest.json` the release
-//!   workflow publishes, plus whenever the user clicks "Check for updates".
+//! * Checks the `latest.json` the release workflow publishes 15 s after startup, then hourly
+//!   by the wall clock (10 minutes after a failed check), when the popover opens if the last
+//!   check is over 15 minutes old, and whenever the user clicks "Check for updates".
 //! * With the `auto_update` setting on (the default), a newer version downloads in the
 //!   background and Drive offers "Restart to update". With it off, checks only tell the user;
 //!   nothing downloads until they choose to update.
@@ -24,6 +25,7 @@
 //! In debug builds, `DRIVE_UI_MOCK_UPDATE=1` replaces the release feed with a made-up update
 //! so the UI can be previewed; "installing" it only pretends.
 
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -37,7 +39,15 @@ pub const EV_UPDATE: &str = "drive://update";
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const FIRST_CHECK_DELAY: Duration = Duration::from_secs(15);
-const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+/// Time between scheduled checks, by the wall clock: a computer that slept through a check
+/// checks again soon after it wakes.
+const CHECK_EVERY_MS: i64 = 60 * 60 * 1000;
+/// After a failed check (offline, GitHub unreachable), try again sooner.
+const RETRY_AFTER_MS: i64 = 10 * 60 * 1000;
+/// Opening the popover checks too, unless a check ran this recently.
+const CHECK_ON_OPEN_AFTER_MS: i64 = 15 * 60 * 1000;
+/// How often the scheduler looks at the clock.
+const SCHEDULER_TICK: Duration = Duration::from_secs(60);
 const CHANGELOG_URL: &str =
     "https://github.com/samcannas/drive/releases/latest/download/changelog.json";
 /// How often download progress is sent to the webviews.
@@ -139,6 +149,9 @@ pub struct Updates {
     inner: Mutex<Inner>,
     /// Serializes checks, downloads and installs.
     op: tokio::sync::Mutex<()>,
+    /// Wall-clock ms of the last finished check (0: none yet), and when the next one is due.
+    last_check_ms: AtomicI64,
+    next_check_ms: AtomicI64,
 }
 
 fn mode() -> Mode {
@@ -203,6 +216,8 @@ pub fn start(app: &AppHandle) {
             changelog: None,
         }),
         op: tokio::sync::Mutex::new(()),
+        last_check_ms: AtomicI64::new(0),
+        next_check_ms: AtomicI64::new(0),
     });
     let Some(first_delay) = first_delay else {
         return;
@@ -211,10 +226,39 @@ pub fn start(app: &AppHandle) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(first_delay).await;
         loop {
-            background_check(&app).await;
-            tokio::time::sleep(CHECK_INTERVAL).await;
+            let due =
+                updates(&app).is_some_and(|u| now_ms() >= u.next_check_ms.load(Ordering::SeqCst));
+            if due {
+                background_check(&app).await;
+            }
+            // Short ticks against the wall clock instead of one long sleep: a monotonic
+            // timer doesn't count time the computer spends asleep.
+            tokio::time::sleep(SCHEDULER_TICK).await;
         }
     });
+}
+
+/// The popover opened: check now unless a check ran recently.
+pub fn popover_opened(app: &AppHandle) {
+    let Some(u) = updates(app) else { return };
+    if matches!(u.mode, Mode::Off(_))
+        || now_ms() - u.last_check_ms.load(Ordering::SeqCst) < CHECK_ON_OPEN_AFTER_MS
+    {
+        return;
+    }
+    // Claim this check so reopening the popover meanwhile doesn't start another.
+    u.last_check_ms.store(now_ms(), Ordering::SeqCst);
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move { background_check(&app).await });
+}
+
+/// Records a finished check and schedules the next one.
+fn checked(app: &AppHandle, ok: bool) {
+    let Some(u) = updates(app) else { return };
+    let now = now_ms();
+    u.last_check_ms.store(now, Ordering::SeqCst);
+    let wait = if ok { CHECK_EVERY_MS } else { RETRY_AFTER_MS };
+    u.next_check_ms.store(now + wait, Ordering::SeqCst);
 }
 
 fn updates(app: &AppHandle) -> Option<State<'_, Updates>> {
@@ -254,7 +298,7 @@ async fn background_check(app: &AppHandle) {
         match check_locked(app, false).await {
             Ok(found) => found,
             Err(e) => {
-                tracing::debug!("update check failed: {e}");
+                tracing::info!("update check failed, trying again in 10 minutes: {e}");
                 return;
             }
         }
@@ -310,6 +354,7 @@ async fn check_locked(app: &AppHandle, manual: bool) -> Result<Option<Found>, St
         Mode::Mock => mock_check().await,
         _ => real_check(app).await,
     };
+    checked(app, result.is_ok());
     let found = match result {
         Ok(f) => f,
         Err(message) => {

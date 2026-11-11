@@ -177,6 +177,7 @@ pub fn show_main(app: &AppHandle, rect: Option<TrayRect>) {
     let _ = win.unminimize();
     let _ = win.set_focus();
     let _ = win.emit_to(POPOVER, EV_POPOVER_SHOWN, ());
+    crate::updater::popover_opened(app);
 }
 
 /// Left click on the tray icon.

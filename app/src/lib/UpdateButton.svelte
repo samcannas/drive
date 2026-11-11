@@ -229,9 +229,10 @@
   }
   .dot {
     position: absolute;
-    /* In the button's corner, clear of the icon's ring. */
-    inset-block-start: 3px;
-    inset-inline-end: 3px;
+    /* A badge on the icon's ring (top right, just clear of it), not in the button's corner,
+       so the icon still reads as centered. Whole pixels keep the dot round. */
+    inset-block-start: 5px;
+    inset-inline-end: 5px;
     width: 6px;
     height: 6px;
     border-radius: 50%;
