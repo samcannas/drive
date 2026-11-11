@@ -1,0 +1,611 @@
+/* Drive design tokens and base controls. Windows 11 (Fluent) inspired, system fonts only. */
+
+:root {
+  color-scheme: light dark;
+
+  --font: "Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI", system-ui, -apple-system, Cantarell,
+    "Noto Sans", Ubuntu, sans-serif;
+  --font-display: "Segoe UI Variable Display", "Segoe UI Variable", "Segoe UI", system-ui, -apple-system, Cantarell,
+    "Noto Sans", Ubuntu, sans-serif;
+  --font-mono: "Cascadia Mono", Consolas, "DejaVu Sans Mono", "Liberation Mono", monospace;
+
+  /* Type scale: role → size / line-height / weight. */
+  --text-caption: 0.75rem;
+  --lh-caption: 1.34;
+  --text-body: 0.875rem;
+  --lh-body: 1.43;
+  --text-subtitle: 1.25rem;
+  --lh-subtitle: 1.3;
+  --text-title: 1.75rem;
+  --lh-title: 1.25;
+
+  /* 4px grid. */
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s5: 20px;
+  --s6: 24px;
+  --s8: 32px;
+
+  --radius-control: 4px;
+  --radius-card: 8px;
+
+  /* Light theme */
+  --bg: #f3f3f3;
+  --surface: #ffffff;
+  --surface-raised: #fbfbfb;
+  --fill-hover: rgb(0 0 0 / 0.04);
+  --fill-press: rgb(0 0 0 / 0.07);
+  --stroke-card: rgb(0 0 0 / 0.09);
+  --stroke-divider: rgb(0 0 0 / 0.08);
+  --stroke-control: #868686;
+  --text: #1a1a1a;
+  --text-2: #5c5c5c;
+  --text-disabled: #9e9e9e;
+  --accent: #005fb8;
+  --accent-hover: #1a6dbd;
+  --accent-press: #2674c0;
+  --on-accent: #ffffff;
+  --accent-text: #005fb8;
+  --accent-soft: #e5eff9;
+  --danger: #c42b1c;
+  --danger-hover: #b02719;
+  --on-danger: #ffffff;
+  --danger-text: #c42b1c;
+  --danger-soft: #fde7e9;
+  --warning-text: #7a4b00;
+  --warning-icon: #9d5d00;
+  --warning-soft: #fff4ce;
+  --success-text: #0e700e;
+  --success-soft: #dff6dd;
+  --neutral-soft: rgb(0 0 0 / 0.06);
+  --track: rgb(0 0 0 / 0.14);
+  --focus: #000000;
+  --focus-inner: #ffffff;
+  --icon-knockout: #ffffff;
+  --shadow-dialog: 0 8px 32px rgb(0 0 0 / 0.18), 0 2px 8px rgb(0 0 0 / 0.1);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #202020;
+    --surface: #2b2b2b;
+    --surface-raised: #323232;
+    --fill-hover: rgb(255 255 255 / 0.06);
+    --fill-press: rgb(255 255 255 / 0.04);
+    --stroke-card: rgb(255 255 255 / 0.08);
+    --stroke-divider: rgb(255 255 255 / 0.08);
+    --stroke-control: #8f8f8f;
+    --text: #ffffff;
+    --text-2: #c5c5c5;
+    --text-disabled: #7a7a7a;
+    --accent: #60cdff;
+    --accent-hover: #5abce9;
+    --accent-press: #52a9d1;
+    --on-accent: #000000;
+    --accent-text: #79d4ff;
+    --accent-soft: #1f3646;
+    --danger: #ff99a4;
+    --danger-hover: #f08a95;
+    --on-danger: #000000;
+    --danger-text: #ff99a4;
+    --danger-soft: #442726;
+    --warning-text: #fce100;
+    --warning-icon: #fce100;
+    --warning-soft: #433519;
+    --success-text: #6ccb5f;
+    --success-soft: #2a3d24;
+    --neutral-soft: rgb(255 255 255 / 0.08);
+    --track: rgb(255 255 255 / 0.2);
+    --focus: #ffffff;
+    --focus-inner: #000000;
+    --icon-knockout: #000000;
+    --shadow-dialog: 0 8px 32px rgb(0 0 0 / 0.5), 0 2px 8px rgb(0 0 0 / 0.3);
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #202020;
+  --surface: #2b2b2b;
+  --surface-raised: #323232;
+  --fill-hover: rgb(255 255 255 / 0.06);
+  --fill-press: rgb(255 255 255 / 0.04);
+  --stroke-card: rgb(255 255 255 / 0.08);
+  --stroke-divider: rgb(255 255 255 / 0.08);
+  --stroke-control: #8f8f8f;
+  --text: #ffffff;
+  --text-2: #c5c5c5;
+  --text-disabled: #7a7a7a;
+  --accent: #60cdff;
+  --accent-hover: #5abce9;
+  --accent-press: #52a9d1;
+  --on-accent: #000000;
+  --accent-text: #79d4ff;
+  --accent-soft: #1f3646;
+  --danger: #ff99a4;
+  --danger-hover: #f08a95;
+  --on-danger: #000000;
+  --danger-text: #ff99a4;
+  --danger-soft: #442726;
+  --warning-text: #fce100;
+  --warning-icon: #fce100;
+  --warning-soft: #433519;
+  --success-text: #6ccb5f;
+  --success-soft: #2a3d24;
+  --neutral-soft: rgb(255 255 255 / 0.08);
+  --track: rgb(255 255 255 / 0.2);
+  --focus: #ffffff;
+  --focus-inner: #000000;
+  --icon-knockout: #000000;
+  --shadow-dialog: 0 8px 32px rgb(0 0 0 / 0.5), 0 2px 8px rgb(0 0 0 / 0.3);
+  color-scheme: dark;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+}
+
+/* On a Mica / Acrylic backdrop the window background is the material itself; cards get
+   translucent so the material shows through, as in Windows 11. */
+:root[data-material="mica"],
+:root[data-material="acrylic"] {
+  --bg: transparent;
+  --surface: rgb(255 255 255 / 0.7);
+  --surface-raised: rgb(255 255 255 / 0.85);
+}
+@media (prefers-color-scheme: dark) {
+  :root[data-material="mica"]:not([data-theme="light"]),
+  :root[data-material="acrylic"]:not([data-theme="light"]) {
+    --surface: rgb(255 255 255 / 0.05);
+    --surface-raised: rgb(255 255 255 / 0.08);
+  }
+}
+:root[data-material="mica"][data-theme="dark"],
+:root[data-material="acrylic"][data-theme="dark"] {
+  --surface: rgb(255 255 255 / 0.05);
+  --surface-raised: rgb(255 255 255 / 0.08);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-size-adjust: 100%;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: var(--text-body);
+  line-height: var(--lh-body);
+  /* App chrome: no stray text selection on double click, but values stay selectable (.selectable). */
+  cursor: default;
+}
+
+#app {
+  height: 100%;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+
+h1,
+h2,
+h3 {
+  font-size: inherit;
+  font-weight: inherit;
+  text-wrap: balance;
+}
+
+/* Headings that receive focus programmatically (after a view change) aren't controls. */
+[tabindex="-1"]:focus {
+  outline: none;
+  box-shadow: none;
+}
+
+p {
+  text-wrap: pretty;
+}
+
+.title {
+  font-family: var(--font-display);
+  font-size: var(--text-title);
+  line-height: var(--lh-title);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.subtitle {
+  font-family: var(--font-display);
+  font-size: var(--text-subtitle);
+  line-height: var(--lh-subtitle);
+  font-weight: 600;
+}
+
+.body-strong {
+  font-weight: 600;
+}
+
+.caption {
+  font-size: var(--text-caption);
+  line-height: var(--lh-caption);
+}
+
+.secondary {
+  color: var(--text-2);
+}
+
+.numeric {
+  font-variant-numeric: tabular-nums;
+}
+
+.selectable {
+  user-select: text;
+  cursor: text;
+}
+
+.mono {
+  font-family: var(--font-mono);
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.icon {
+  flex: none;
+}
+
+/* Focus: a two-tone ring that stays visible on any surface. */
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+  box-shadow: 0 0 0 1px var(--focus-inner);
+}
+:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* ---------- Buttons ---------- */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--s2);
+  min-height: 32px;
+  padding: 5px 12px;
+  border: 1px solid var(--stroke-card);
+  border-radius: var(--radius-control);
+  background: var(--surface-raised);
+  color: var(--text);
+  font: inherit;
+  line-height: 1.43;
+  text-align: center;
+  white-space: nowrap;
+  cursor: default;
+  transition-property: background-color, border-color, color, scale;
+  transition-duration: 100ms;
+  transition-timing-function: ease-out;
+  -webkit-tap-highlight-color: transparent;
+}
+.btn:has(.icon:first-child) {
+  padding-inline-start: 10px;
+}
+@media (hover: hover) {
+  .btn:not(:disabled, [aria-disabled="true"]):hover {
+    background: color-mix(in srgb, var(--surface-raised), var(--text) 4%);
+  }
+}
+.btn:not(:disabled, [aria-disabled="true"]):active {
+  background: color-mix(in srgb, var(--surface-raised), var(--text) 7%);
+  color: var(--text-2);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .btn:not(:disabled, [aria-disabled="true"]):active {
+    scale: 0.96;
+  }
+}
+.btn:disabled,
+.btn[aria-disabled="true"] {
+  color: var(--text-disabled);
+}
+
+.btn.primary {
+  background: var(--accent);
+  border-color: transparent;
+  color: var(--on-accent);
+}
+@media (hover: hover) {
+  .btn.primary:not(:disabled, [aria-disabled="true"]):hover {
+    background: var(--accent-hover);
+  }
+}
+.btn.primary:not(:disabled, [aria-disabled="true"]):active {
+  background: var(--accent-press);
+  color: var(--on-accent);
+}
+.btn.primary:disabled {
+  background: var(--neutral-soft);
+  color: var(--text-disabled);
+}
+
+.btn.danger {
+  background: var(--danger);
+  border-color: transparent;
+  color: var(--on-danger);
+}
+@media (hover: hover) {
+  .btn.danger:not(:disabled, [aria-disabled="true"]):hover {
+    background: var(--danger-hover);
+  }
+}
+.btn.danger:not(:disabled, [aria-disabled="true"]):active {
+  background: var(--danger-hover);
+  color: var(--on-danger);
+}
+
+.btn.subtle {
+  background: transparent;
+  border-color: transparent;
+}
+@media (hover: hover) {
+  .btn.subtle:not(:disabled, [aria-disabled="true"]):hover {
+    background: var(--fill-hover);
+  }
+}
+.btn.subtle:not(:disabled, [aria-disabled="true"]):active {
+  background: var(--fill-press);
+}
+
+.link {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s1);
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent-text);
+  font: inherit;
+  text-decoration: underline;
+  text-decoration-thickness: from-font;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+/* ---------- Form controls ---------- */
+
+.field {
+  display: grid;
+  gap: var(--s1);
+}
+
+.field > label,
+.label {
+  font-weight: 600;
+}
+
+.hint {
+  color: var(--text-2);
+  font-size: var(--text-caption);
+  line-height: var(--lh-caption);
+}
+
+.error-text {
+  display: flex;
+  gap: var(--s1);
+  align-items: flex-start;
+  color: var(--danger-text);
+  font-size: var(--text-caption);
+  line-height: var(--lh-caption);
+}
+
+.input {
+  width: 100%;
+  min-height: 32px;
+  padding: 5px 10px;
+  border: 1px solid var(--stroke-control);
+  border-radius: var(--radius-control);
+  background: var(--surface-raised);
+  color: var(--text);
+  font: inherit;
+  cursor: text;
+}
+.input:focus-visible,
+.input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+  box-shadow: none;
+  border-color: var(--accent);
+}
+.input[aria-invalid="true"] {
+  border-color: var(--danger-text);
+}
+.input::placeholder {
+  color: var(--text-2);
+}
+
+select.input {
+  cursor: default;
+}
+
+input[type="checkbox"],
+input[type="radio"],
+input[type="range"] {
+  accent-color: var(--accent);
+}
+
+/* Toggle switch: a native checkbox with role="switch". */
+.switch {
+  appearance: none;
+  position: relative;
+  flex: none;
+  width: 40px;
+  height: 20px;
+  margin: 0;
+  border: 1px solid var(--stroke-control);
+  border-radius: 10px;
+  background: transparent;
+  transition-property: background-color, border-color;
+  transition-duration: 100ms;
+}
+.switch::after {
+  content: "";
+  position: absolute;
+  inset-block-start: 3px;
+  inset-inline-start: 3px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--text-2);
+}
+.switch:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.switch:checked::after {
+  inset-inline-start: 23px;
+  background: var(--on-accent);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .switch::after {
+    transition: inset-inline-start 150ms cubic-bezier(0.2, 0, 0, 1);
+  }
+}
+.switch:focus-visible {
+  outline-offset: 2px;
+}
+
+/* ---------- Surfaces ---------- */
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--stroke-card);
+  border-radius: var(--radius-card);
+}
+
+.callout {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: var(--s2) var(--s3);
+  padding: var(--s3);
+  border-radius: var(--radius-card);
+  border: 1px solid var(--stroke-card);
+}
+.callout > .icon {
+  margin-block-start: 1px;
+}
+.callout.warning {
+  background: var(--warning-soft);
+}
+.callout.warning > .icon {
+  color: var(--warning-icon);
+}
+.callout.danger {
+  background: var(--danger-soft);
+}
+.callout.danger > .icon {
+  color: var(--danger-text);
+}
+.callout.info {
+  background: var(--accent-soft);
+}
+.callout.info > .icon {
+  color: var(--accent-text);
+}
+.callout .actions {
+  grid-column: 2;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s2);
+  margin-block-start: var(--s1);
+}
+
+.meter {
+  position: relative;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--track);
+  overflow: hidden;
+}
+.meter > span {
+  position: absolute;
+  inset-block: 0;
+  inset-inline-start: 0;
+  border-radius: 2px;
+  background: var(--accent);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .meter > span {
+    transition: width 300ms cubic-bezier(0.2, 0, 0, 1);
+  }
+}
+
+/* ---------- Dialog ---------- */
+
+dialog {
+  width: min(440px, calc(100vw - 32px));
+  padding: 0;
+  border: 1px solid var(--stroke-card);
+  border-radius: var(--radius-card);
+  background: var(--surface-raised);
+  color: var(--text);
+  box-shadow: var(--shadow-dialog);
+  overscroll-behavior: contain;
+}
+:root[data-material] dialog {
+  background: var(--bg-dialog, #ffffff);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) dialog {
+    --bg-dialog: #2b2b2b;
+  }
+}
+:root[data-theme="dark"] dialog {
+  --bg-dialog: #2b2b2b;
+}
+dialog::backdrop {
+  background: rgb(0 0 0 / 0.3);
+}
+
+@media (forced-colors: active) {
+  .switch:checked::after,
+  .meter > span {
+    background: Highlight;
+  }
+  .btn {
+    border-color: ButtonText;
+  }
+}
