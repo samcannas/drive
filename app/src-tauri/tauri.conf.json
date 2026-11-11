@@ -33,5 +33,12 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDRGRDFBNEUxMzQzNTBGMEEKUldRS0R6VTA0YVRSVDJnRWRXU1RXR1JGZFBnbWhjYkdPbmp4U0hvL042UHpjaTMvcXVqMnlPZkcK",
+      "endpoints": ["https://github.com/samcannas/drive/releases/latest/download/latest.json"],
+      "windows": { "installMode": "passive" }
+    }
   }
 }

@@ -13,6 +13,7 @@ mod notify;
 mod platform;
 mod tray;
 mod tray_icon;
+mod updater;
 mod windows;
 
 use std::sync::Arc;
@@ -43,6 +44,7 @@ fn main() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             commands::app_info,
             commands::connection_state,
@@ -77,6 +79,7 @@ fn main() {
             app.manage(windows::PopoverState::default());
             tray::create(&handle)?;
             backend.start(autostarted);
+            updater::start(&handle);
             Ok(())
         })
         .build(tauri::generate_context!())

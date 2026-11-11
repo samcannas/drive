@@ -331,8 +331,24 @@ pub async fn quit(app: AppHandle, svc: Svc<'_>) -> Res<()> {
 
 /// Quitting Drive stops syncing: the service is asked to shut down, then the app exits.
 pub async fn quit_now(app: &AppHandle, svc: &Arc<Backend>) {
-    if svc.connection().state == Link::Connected && !svc.connection().mock {
-        let _ = tokio::time::timeout(Duration::from_secs(3), svc.call_value(Call::Shutdown)).await;
-    }
+    stop_service(svc, false).await;
+    crate::updater::install_on_quit(app);
     app.exit(0);
+}
+
+/// Asks the service to shut down. With `wait`, also waits (up to 10 s) until it has stopped
+/// listening, so that an update can replace its binary.
+pub async fn stop_service(svc: &Arc<Backend>, wait: bool) {
+    svc.stop_supervising();
+    if svc.connection().state != Link::Connected || svc.connection().mock {
+        return;
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(3), svc.call_value(Call::Shutdown)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while wait
+        && tokio::time::Instant::now() < deadline
+        && drive_core::ipc_client::Client::connect().await.is_ok()
+    {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }

@@ -1,6 +1,7 @@
 //! Tray icon, tooltip and menu.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -20,6 +21,10 @@ struct Items {
     /// Linux only: the headline as a disabled first item, since the tooltip isn't shown there.
     status: MenuItem<tauri::Wry>,
     pause: MenuItem<tauri::Wry>,
+    menu: Menu<tauri::Wry>,
+    /// "Restart to update", added to the menu once an update has been downloaded.
+    update: MenuItem<tauri::Wry>,
+    update_shown: AtomicBool,
 }
 
 #[derive(Default)]
@@ -57,6 +62,7 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
     let pause = MenuItem::with_id(app, "pause", "Pause syncing", false, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit Drive", true, None::<&str>)?;
+    let update = MenuItem::with_id(app, "update", "Restart to update", true, None::<&str>)?;
     let sep1 = PredefinedMenuItem::separator(app)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
     let menu = if cfg!(windows) {
@@ -102,7 +108,13 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
             }
         })
         .build(app)?;
-    app.manage(Items { status, pause });
+    app.manage(Items {
+        status,
+        pause,
+        menu,
+        update,
+        update_shown: AtomicBool::new(false),
+    });
     Ok(())
 }
 
@@ -127,6 +139,12 @@ fn on_menu(app: &AppHandle, id: &str) {
                 }
             });
         }
+        "update" => {
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                crate::updater::restart_to_update(&app, &backend).await
+            });
+        }
         "quit" => {
             let app = app.clone();
             tauri::async_runtime::spawn(
@@ -134,6 +152,28 @@ fn on_menu(app: &AppHandle, id: &str) {
             );
         }
         _ => {}
+    }
+}
+
+/// Offers "Restart to update" for a downloaded update: just above "Quit Drive".
+pub fn show_update(app: &AppHandle, version: &str) {
+    let Some(items) = app.try_state::<Items>() else {
+        return;
+    };
+    let _ = items
+        .update
+        .set_text(format!("Restart to update to {version}"));
+    if !items.update_shown.swap(true, Ordering::SeqCst) {
+        let quit_at = items
+            .menu
+            .items()
+            .map(|i| i.len())
+            .unwrap_or(1)
+            .saturating_sub(1);
+        if let Err(e) = items.menu.insert(&items.update, quit_at) {
+            tracing::debug!("could not add the update menu item: {e}");
+            items.update_shown.store(false, Ordering::SeqCst);
+        }
     }
 }
 

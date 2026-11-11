@@ -1,6 +1,7 @@
 //! Connection to the Drive service: connects (starting the service if needed), reconnects
 //! when the socket drops, and forwards service events to the webviews and the tray.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -128,6 +129,8 @@ pub struct Backend {
     status: Mutex<Status>,
     settings: Mutex<Option<Settings>>,
     wake: Notify,
+    /// Set while quitting or updating: don't start the service again when it goes away.
+    stopping: AtomicBool,
 }
 
 impl Backend {
@@ -142,6 +145,7 @@ impl Backend {
             }),
             settings: Mutex::new(None),
             wake: Notify::new(),
+            stopping: AtomicBool::new(false),
         }
     }
 
@@ -161,6 +165,11 @@ impl Backend {
 
     pub fn cached_settings(&self) -> Option<Settings> {
         self.settings.lock().unwrap().clone()
+    }
+
+    /// Stop restarting the service from now on (it is being shut down on purpose).
+    pub fn stop_supervising(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
     }
 
     /// Skip the current backoff and try to connect now.
@@ -206,7 +215,7 @@ impl Backend {
                 }
                 Err(e) => {
                     let respawn = spawned_at.is_none_or(|t| t.elapsed() > Duration::from_secs(30));
-                    if respawn {
+                    if respawn && !self.stopping.load(Ordering::SeqCst) {
                         spawned_at = Some(Instant::now());
                         if let Err(err) = crate::platform::spawn_daemon() {
                             tracing::warn!("could not start the Drive service: {err:#}");
