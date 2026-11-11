@@ -128,20 +128,17 @@ jobs:
         shell: bash
         run: corepack enable pnpm && (cd app && pnpm --version)
 
-      # Plain-HTTP Ubuntu mirrors (azure.archive / archive / security) are sometimes
-      # unreachable from GitHub's runners while HTTPS works: use an HTTPS mirror for any
-      # download the package cache below has to make.
-      - name: Use an HTTPS Ubuntu mirror
-        run: sudo sed -i -E 's#http://(azure\.archive|archive|security)\.ubuntu\.com/ubuntu#https://mirrors.edge.kernel.org/ubuntu#g' /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
-
-      # Restores the installed packages from the Actions cache instead of apt-get (seconds
-      # instead of most of a minute). Bump `version` to rebuild the cache.
       - name: Install build dependencies
-        uses: awalsh128/cache-apt-pkgs-action@v1
-        timeout-minutes: 15
-        with:
-          packages: libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev patchelf file
-          version: release-1
+        timeout-minutes: 15 # mirrors occasionally hang; fail fast instead of stalling the job
+        run: |
+          # Each attempt is capped; a hung mirror connection is retried instead of blocking.
+          apt() { for i in 1 2 3; do sudo timeout 240 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 "$@" && return 0; echo "apt-get $1 failed (attempt $i), retrying"; sleep 10; done; return 1; }
+          # Plain-HTTP Ubuntu mirrors (azure.archive / archive / security) are sometimes
+          # unreachable from GitHub's runners while HTTPS works: use an HTTPS mirror.
+          sudo sed -i -E 's#http://(azure\.archive|archive|security)\.ubuntu\.com/ubuntu#https://mirrors.edge.kernel.org/ubuntu#g' /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+          apt update
+          apt install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev             libssl-dev patchelf file
 
       - name: Set version ${{ env.VERSION }}
         run: .github/release/set-version.sh "$VERSION"
