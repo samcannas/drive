@@ -127,6 +127,67 @@ pub struct CreateUploadUrlResponse {
     pub private_slug: String,
 }
 
+// ---- chunked (resumable) uploads: https://uloz.to/upload-resumable-api-beta ----------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateChunkedLinkRequest<'a> {
+    pub user_login: &'a str,
+    /// Renews the link of an existing batch (new signature, same batch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub private_slug: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateChunkedLinkResponse {
+    pub private_slug: String,
+    pub upload_signature: String,
+    pub upload_resumable_base_url: String,
+    /// Seconds until the signature expires.
+    #[serde(default)]
+    pub validity_interval: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RegisterChunkedRequest<'a> {
+    pub batch_file_id: u32,
+    pub upload_signature: &'a str,
+    pub name: &'a str,
+    pub filesize: u64,
+    pub chunksize: u64,
+    pub crc32: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExtendChunkedRequest<'a> {
+    pub upload_signature: &'a str,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ChunkedStatus {
+    /// `pending` / `processing` (still assembling), `finished`, `bad-crc32`, or another failure.
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub uploaded_chunks: Vec<u32>,
+    #[serde(default)]
+    pub missing_chunks: Vec<u32>,
+    #[serde(default)]
+    pub irpc: Option<ChunkedResult>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChunkedResult {
+    pub slug: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct HashVerifyResponse {
+    #[serde(default)]
+    pub md5: Option<bool>,
+    #[serde(default)]
+    pub crc32: Option<bool>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SendFilePayloadResponse {
     #[serde(default)]

@@ -77,6 +77,14 @@ pub enum Call {
     SignOut,
     /// Stops the service.
     Shutdown,
+    /// Every upload and download that is running, queued or held, with the reason for anything
+    /// that isn't moving. Returns [`TransferList`].
+    Transfers,
+    /// Pause, resume, defer to tonight or force a single upload (by its [`TransferItem::id`]).
+    SetTransferMode {
+        id: i64,
+        mode: TransferMode,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,7 +120,12 @@ pub enum ErrorCode {
 pub enum Event {
     Status(Status),
     Activity(Activity),
-    IssuesChanged { count: u32 },
+    IssuesChanged {
+        count: u32,
+    },
+    /// Sent about once a second while anything is transferring or queued, and once more when the
+    /// list becomes empty. Only to subscribed clients.
+    Transfers(TransferList),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,6 +244,28 @@ pub struct Settings {
     /// still checks for updates but only tells the user about them.
     #[serde(default = "default_true")]
     pub auto_update: bool,
+    /// Hold uploads of large files until the overnight window.
+    #[serde(default)]
+    pub night_uploads: bool,
+    /// Window start and end, local time, "HH:MM" (end may be earlier than start: it wraps
+    /// past midnight).
+    #[serde(default = "default_night_start")]
+    pub night_start: String,
+    #[serde(default = "default_night_end")]
+    pub night_end: String,
+    /// Files at least this large wait for the window when `night_uploads` is on.
+    #[serde(default = "default_night_min_bytes")]
+    pub night_min_bytes: u64,
+}
+
+pub fn default_night_start() -> String {
+    "01:00".into()
+}
+pub fn default_night_end() -> String {
+    "07:00".into()
+}
+pub fn default_night_min_bytes() -> u64 {
+    200 * 1024 * 1024
 }
 
 fn default_true() -> bool {
@@ -262,6 +297,95 @@ pub struct SettingsPatch {
     pub app_token: Option<String>,
     pub close_action: Option<CloseAction>,
     pub auto_update: Option<bool>,
+    pub night_uploads: Option<bool>,
+    pub night_start: Option<String>,
+    pub night_end: Option<String>,
+    pub night_min_bytes: Option<u64>,
+}
+
+// ---- transfers ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferDirection {
+    Upload,
+    Download,
+}
+
+/// What a transfer is doing right now.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferState {
+    /// Reading and hashing the file before the first byte goes out.
+    Preparing,
+    /// Bytes are moving.
+    Active,
+    /// All bytes sent; the server is assembling and checking the file.
+    Verifying,
+    /// Ready to go; waiting for a free slot.
+    Queued,
+    /// Can't start yet; `reason` says why (file open in another app, offline, retrying…).
+    Waiting,
+    /// Paused by the user.
+    Paused,
+    /// Held for the overnight window.
+    Scheduled,
+}
+
+/// The user's choice for one upload.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferMode {
+    /// Follow the settings (large files may wait for the overnight window).
+    #[default]
+    Auto,
+    Paused,
+    /// Wait for the overnight window regardless of size.
+    Tonight,
+    /// Upload now, even if the overnight window applies.
+    Now,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TransferItem {
+    /// Stable id for actions (the file's node id).
+    pub id: i64,
+    /// Relative to the Drive folder, `/`-separated.
+    pub path: String,
+    pub direction: TransferDirection,
+    pub state: TransferState,
+    /// Plain-language explanation for `waiting` / `scheduled` (and a hint for others).
+    pub reason: Option<String>,
+    /// Bytes already safely transferred (for uploads: confirmed by the server, so they survive
+    /// a restart when `resumable` is true).
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    /// Smoothed bytes per second while active.
+    pub rate_bps: u64,
+    pub eta_secs: Option<u64>,
+    /// Unix ms of the next automatic retry, when waiting after a failure.
+    pub retry_at_ms: Option<i64>,
+    /// Progress is kept if Drive restarts or the connection drops.
+    pub resumable: bool,
+    pub mode: TransferMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct TransferList {
+    /// Active first, then queued/waiting, then paused/scheduled; at most 200 entries.
+    pub items: Vec<TransferItem>,
+    /// Total number of transfers (may exceed `items.len()`).
+    pub total_count: u32,
+    pub upload_rate_bps: u64,
+    pub download_rate_bps: u64,
+    /// Bytes still to upload for everything that isn't paused or scheduled.
+    pub upload_remaining_bytes: u64,
+    /// Estimated time until everything that isn't paused or scheduled is uploaded.
+    pub upload_eta_secs: Option<u64>,
+    /// Unix ms when the overnight window next opens (only when night uploads are on and the
+    /// window is closed).
+    pub night_window_opens_ms: Option<i64>,
+    pub night_window_open: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -367,6 +491,32 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transfer_wire_format() {
+        let r: Request = serde_json::from_str(
+            r#"{"id":1,"method":"set_transfer_mode","params":{"id":7,"mode":"tonight"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            r.call,
+            Call::SetTransferMode {
+                id: 7,
+                mode: TransferMode::Tonight
+            }
+        ));
+        let e = serde_json::to_value(Event::Transfers(TransferList::default())).unwrap();
+        assert_eq!(e["event"], "transfers");
+        // Older settings files without the new fields still parse.
+        let s: Settings = serde_json::from_str(
+            r#"{"folder":"x","cache_limit_bytes":1,"poll_interval_secs":1,"upload_limit_kbps":0,
+                "download_limit_kbps":0,"max_parallel_transfers":3,"launch_at_login":true,
+                "notifications":true,"device_name":"pc","app_token_custom":false}"#,
+        )
+        .unwrap();
+        assert_eq!(s.night_start, "01:00");
+        assert!(!s.night_uploads);
+    }
 
     #[test]
     fn wire_format() {

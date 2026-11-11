@@ -9,6 +9,7 @@
 
 pub mod crypt;
 pub mod mem;
+pub mod resumable;
 
 use std::io;
 use std::pin::Pin;
@@ -85,6 +86,9 @@ pub enum RemoteError {
     InvalidName(String),
     #[error("data integrity check failed: {0}")]
     Integrity(String),
+    /// The caller stopped the transfer (pause, shutdown). Resume state is kept.
+    #[error("cancelled")]
+    Cancelled,
     #[error("{0}")]
     Other(String),
 }
@@ -140,6 +144,27 @@ pub trait Remote: Send + Sync + 'static {
     /// Whether a file still exists (not deleted or trashed). Used before uploading an edit to
     /// make sure the version it was based on is still the current one.
     async fn exists(&self, entry: &RemoteEntry) -> Result<bool, RemoteError>;
+
+    /// Uploads from a random-access source, picking up where an earlier attempt stopped when
+    /// `upload.state` holds that attempt's resume state. Backends that can't resume read the
+    /// source from the start (the default).
+    async fn upload_resumable(
+        &self,
+        parent_id: &str,
+        name: &str,
+        upload: resumable::ResumableUpload,
+    ) -> Result<RemoteEntry, RemoteError> {
+        resumable::upload_whole(self, parent_id, name, upload).await
+    }
+
+    /// Best-effort cleanup of an abandoned resumable upload (its partial data on the server).
+    async fn discard_resumable(&self, _state: &resumable::ResumeState) {}
+
+    /// Smallest upload (in this remote's bytes) that [`Remote::upload_resumable`] can resume;
+    /// `None` if it never resumes.
+    fn resumable_min_size(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Collects a stream into memory (tests and small reads).

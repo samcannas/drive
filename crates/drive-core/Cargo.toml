@@ -31,6 +31,7 @@ aes = "0.8"
 ctr = "0.9"
 sha2 = "0.10"
 md-5 = "0.10"
+crc32fast = "1"
 data-encoding = "2"
 hex = "0.4"
 zeroize = "1"
@@ -40,4 +41,5 @@ tokio-stream = "0.1"
 
 [dev-dependencies]
 tempfile.workspace = true
+axum = { version = "0.8", features = ["multipart"] }
 tokio = { workspace = true, features = ["test-util"] }

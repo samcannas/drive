@@ -8,10 +8,100 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 
+use super::resumable::{ResumableUpload, ResumeState, UploadSource};
 use super::{ByteStream, Kind, Remote, RemoteEntry, RemoteError, RemoteTree, UploadBody};
 use crate::crypt::{
-    self, BLOCK_DATA_SIZE, Cipher, CryptError, Decryptor, Encryptor, HEADER_SIZE, Nonce,
+    self, BLOCK_DATA_SIZE, BLOCK_SIZE, Cipher, CryptError, Decryptor, Encryptor, FILE_MAGIC,
+    HEADER_SIZE, Nonce,
 };
+
+/// Resume-state key of this layer.
+const LAYER: &str = "crypt";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CryptResume {
+    /// The file nonce, hex. Reusing it is only safe for byte-identical plaintext: the inner
+    /// layer verifies every chunk against the hashes it recorded before sending anything, and
+    /// the engine drops the whole state whenever the file or the upload changes.
+    nonce: String,
+}
+
+/// The rclone-crypt encoding of a plaintext source, readable at any offset. Deterministic for a
+/// given nonce, so a resumed upload sends exactly the bytes the first attempt would have.
+pub struct EncryptedSource {
+    plain: Arc<dyn UploadSource>,
+    cipher: Cipher,
+    nonce: Nonce,
+    len: u64,
+}
+
+impl EncryptedSource {
+    pub fn new(plain: Arc<dyn UploadSource>, cipher: Cipher, nonce: Nonce) -> Self {
+        let len = crypt::encrypted_size(plain.len());
+        Self {
+            plain,
+            cipher,
+            nonce,
+            len,
+        }
+    }
+}
+
+impl UploadSource for EncryptedSource {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        let end = offset + buf.len() as u64;
+        if end > self.len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "read past the end of the encrypted file",
+            ));
+        }
+        let mut pos = offset;
+        let mut written = 0usize;
+        let header = HEADER_SIZE as u64;
+        if pos < header {
+            let mut h = [0u8; HEADER_SIZE];
+            h[..FILE_MAGIC.len()].copy_from_slice(FILE_MAGIC);
+            h[FILE_MAGIC.len()..].copy_from_slice(&self.nonce.0);
+            let n = (header.min(end) - pos) as usize;
+            buf[..n].copy_from_slice(&h[pos as usize..pos as usize + n]);
+            pos += n as u64;
+            written += n;
+        }
+        if pos >= end {
+            return Ok(());
+        }
+        // Blocks covering [pos, end): read their plaintext in one go, then seal each.
+        let block = BLOCK_SIZE as u64;
+        let first = (pos - header) / block;
+        let last = (end - 1 - header) / block;
+        let plain_len = self.plain.len();
+        let plain_start = first * BLOCK_DATA_SIZE as u64;
+        let plain_end = ((last + 1) * BLOCK_DATA_SIZE as u64).min(plain_len);
+        let mut plain = vec![0u8; (plain_end - plain_start) as usize];
+        self.plain.read_at(plain_start, &mut plain)?;
+        let mut sealed = Vec::with_capacity(BLOCK_SIZE);
+        for (i, chunk) in plain.chunks(BLOCK_DATA_SIZE).enumerate() {
+            let idx = first + i as u64;
+            sealed.clear();
+            self.cipher
+                .seal_block(&self.nonce.plus(idx), chunk, &mut sealed);
+            let block_start = header + idx * block;
+            let from = pos.max(block_start) - block_start;
+            let to = (end.min(block_start + sealed.len() as u64) - block_start) as usize;
+            let piece = &sealed[from as usize..to];
+            buf[written..written + piece.len()].copy_from_slice(piece);
+            written += piece.len();
+            pos += piece.len() as u64;
+        }
+        debug_assert_eq!(written, buf.len());
+        Ok(())
+    }
+}
 
 /// Max plaintext name length that still fits uloz.to's 255-character limit once encrypted.
 /// 143 bytes → 144 padded → 9 blocks → 144 bytes → 231 base32 chars; 159 would be 256.
@@ -328,6 +418,81 @@ impl<R: Remote> Remote for CryptRemote<R> {
         let raw = self.inner_entry(entry)?;
         self.inner.exists(&raw).await
     }
+
+    async fn upload_resumable(
+        &self,
+        parent_id: &str,
+        name: &str,
+        up: ResumableUpload,
+    ) -> Result<RemoteEntry, RemoteError> {
+        let enc_name = self.enc_name(name)?;
+        let plain_len = up.source.len();
+        let enc_len = crypt::encrypted_size(plain_len);
+        let mut state = up.state.clone();
+        let resumes = self
+            .inner
+            .resumable_min_size()
+            .is_some_and(|min| enc_len >= min);
+        let nonce = if resumes {
+            let saved = state
+                .get::<CryptResume>(LAYER)
+                .and_then(|c| hex::decode(c.nonce).ok())
+                .and_then(|b| <[u8; crypt::NONCE_SIZE]>::try_from(b).ok())
+                .map(Nonce);
+            match saved {
+                Some(n) => n,
+                None => {
+                    // Persist the nonce before a single byte goes out.
+                    let n = Nonce::random();
+                    state.set(
+                        LAYER,
+                        &CryptResume {
+                            nonce: hex::encode(n.0),
+                        },
+                    );
+                    (up.checkpoint)(&state);
+                    n
+                }
+            }
+        } else {
+            // Not resumable: never reuse a nonce across attempts.
+            state.remove(LAYER);
+            Nonce::random()
+        };
+        let source = Arc::new(EncryptedSource::new(
+            up.source.clone(),
+            self.cipher.clone(),
+            nonce,
+        ));
+        let scale = if enc_len == 0 {
+            0.0
+        } else {
+            up.scale * plain_len as f64 / enc_len as f64
+        };
+        let inner_up = ResumableUpload {
+            source,
+            mtime_ms: up.mtime_ms,
+            state,
+            checkpoint: up.checkpoint.clone(),
+            meter: up.meter.clone(),
+            progress: up.progress.clone(),
+            scale,
+            cancel: up.cancel.clone(),
+        };
+        let e = self
+            .inner
+            .upload_resumable(parent_id, &enc_name, inner_up)
+            .await?;
+        Ok(self.map_entry(e, name, Some(plain_len)))
+    }
+
+    async fn discard_resumable(&self, state: &ResumeState) {
+        self.inner.discard_resumable(state).await
+    }
+
+    fn resumable_min_size(&self) -> Option<u64> {
+        self.inner.resumable_min_size()
+    }
 }
 
 #[cfg(test)]
@@ -335,6 +500,46 @@ mod tests {
     use super::*;
     use crate::remote::mem::{MemRemote, ROOT};
     use crate::remote::read_all;
+
+    #[test]
+    fn encrypted_source_matches_streaming_encryption() {
+        use crate::remote::resumable::BytesSource;
+        let cipher = Cipher::new("pw", "salt").unwrap();
+        let nonce = Nonce::random();
+        for size in [0usize, 1, 65_535, 65_536, 65_537, 300_000, 3 * 65_536] {
+            let plain: Vec<u8> = (0..size).map(|i| (i * 13 % 251) as u8).collect();
+            let expected = crypt::encrypt_bytes(&cipher, nonce, &plain);
+            let src = EncryptedSource::new(
+                Arc::new(BytesSource(Bytes::from(plain))),
+                cipher.clone(),
+                nonce,
+            );
+            assert_eq!(src.len(), expected.len() as u64);
+            let mut all = vec![0u8; expected.len()];
+            src.read_at(0, &mut all).unwrap();
+            assert_eq!(all, expected, "size {size}");
+            // Arbitrary windows, including ones crossing the header and block edges.
+            let len = expected.len();
+            for (off, n) in [
+                (0, 10),
+                (5, 40),
+                (31, 2),
+                (32, 17),
+                (40, 70_000),
+                (65_560, 5),
+                (len.saturating_sub(7), 7),
+            ] {
+                if off + n > len {
+                    continue;
+                }
+                let mut buf = vec![0u8; n];
+                src.read_at(off as u64, &mut buf).unwrap();
+                assert_eq!(buf, &expected[off..off + n], "size {size} window {off}+{n}");
+            }
+            let mut over = vec![0u8; 1];
+            assert!(src.read_at(len as u64, &mut over).is_err());
+        }
+    }
 
     fn setup() -> (Arc<MemRemote>, CryptRemote<MemRemote>) {
         let mem = Arc::new(MemRemote::new());

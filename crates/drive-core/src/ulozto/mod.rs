@@ -8,6 +8,7 @@
 //! * MD5 verification of every upload, and auth headers never sent off uloz.to hosts.
 
 pub mod api;
+pub mod chunked;
 pub mod meta;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -48,6 +49,18 @@ pub struct UlozConfig {
     pub app_token: String,
     pub device_id: String,
     pub api_root: String,
+    /// An upload fails if no bytes go out for this long…
+    pub stall_timeout: Duration,
+    /// …or if the server hasn't answered this long after the last byte (it hashes big files).
+    pub response_wait: Duration,
+    /// Files at least this large (as stored, i.e. encrypted) use resumable chunked uploads.
+    pub chunked_min_size: u64,
+    /// Fixed chunk size (tests); `None` picks 4/32/128 MiB from the file size.
+    pub chunk_size: Option<u64>,
+    /// Most chunk requests in flight at once (across all uploads); adapts below this.
+    pub max_chunk_streams: usize,
+    /// How often to ask whether an uploaded file has been assembled.
+    pub status_poll: Duration,
 }
 
 impl UlozConfig {
@@ -62,6 +75,12 @@ impl UlozConfig {
             app_token: DEFAULT_APP_TOKEN.into(),
             device_id: device_id.into(),
             api_root: API_ROOT.into(),
+            stall_timeout: Duration::from_secs(120),
+            response_wait: Duration::from_secs(600),
+            chunked_min_size: 16 * 1024 * 1024,
+            chunk_size: None,
+            max_chunk_streams: 4,
+            status_poll: Duration::from_secs(2),
         }
     }
 }
@@ -121,6 +140,10 @@ pub struct UlozClient {
     session: Mutex<Option<Session>>,
     pacer: Pacer,
     links: std::sync::Mutex<HashMap<String, (String, std::time::Instant)>>,
+    /// Chunk streams in flight, adapted to how the server copes (AIMD).
+    chunk_limit: chunked::AdaptiveLimit,
+    /// Set when the chunked API refused us; single-request uploads are used until then.
+    chunked_unavailable_until: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 /// Error from a single API call, before retry policy is applied.
@@ -144,11 +167,6 @@ fn transfer_err(e: reqwest::Error) -> RemoteError {
         RemoteError::Server(format!("transfer interrupted: {e}"))
     }
 }
-
-/// An upload fails if no bytes go out for this long…
-const UPLOAD_STALL: Duration = Duration::from_secs(120);
-/// …or if the server hasn't answered this long after the last byte (it hashes big files).
-const UPLOAD_RESPONSE_WAIT: Duration = Duration::from_secs(600);
 
 fn map_status(status: StatusCode, err: &api::ApiError, body: &str) -> RemoteError {
     let msg = if err.message.is_empty() {
@@ -177,6 +195,7 @@ fn is_uloz_host(url: &reqwest::Url) -> bool {
 
 impl UlozClient {
     pub fn new(cfg: UlozConfig) -> Result<Self, RemoteError> {
+        let cfg_max_streams = cfg.max_chunk_streams.max(1);
         let api = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .connect_timeout(Duration::from_secs(20))
@@ -207,6 +226,8 @@ impl UlozClient {
             session: Mutex::new(None),
             pacer: Pacer::new(4),
             links: std::sync::Mutex::new(HashMap::new()),
+            chunk_limit: chunked::AdaptiveLimit::new(2, cfg_max_streams),
+            chunked_unavailable_until: std::sync::Mutex::new(None),
         })
     }
 
@@ -744,7 +765,7 @@ impl UlozClient {
                     if sent != seen {
                         (seen, since) = (sent, std::time::Instant::now());
                     }
-                    let limit = if sent >= body.size { UPLOAD_RESPONSE_WAIT } else { UPLOAD_STALL };
+                    let limit = if sent >= body.size { self.cfg.response_wait } else { self.cfg.stall_timeout };
                     if since.elapsed() > limit {
                         return Err(RemoteError::Server(format!(
                             "upload stalled ({sent} of {} bytes sent, no progress for {} s)",
@@ -756,7 +777,7 @@ impl UlozClient {
             }
         };
         let status = resp.status();
-        let text = tokio::time::timeout(UPLOAD_RESPONSE_WAIT, resp.text())
+        let text = tokio::time::timeout(self.cfg.response_wait, resp.text())
             .await
             .map_err(|_| RemoteError::Server("no response after the upload finished".into()))?
             .map_err(transfer_err)?;
@@ -791,40 +812,15 @@ impl UlozClient {
             sha256: sha,
             mtime_micros: body.mtime_ms.saturating_mul(1000),
         });
-        let mut tokens = HashMap::new();
-        tokens.insert(sent.slug.as_str(), format!("{}:1", link.private_slug));
-        let req = api::BatchUpdateFilePropertiesRequest {
+        self.finalize(
+            &link.private_slug,
+            1,
+            &sent.slug,
+            folder,
             name,
-            folder_slug: folder,
-            description: &description,
-            slugs: vec![sent.slug.as_str()],
-            upload_tokens: tokens,
-        };
-        let files: Vec<api::File> = self
-            .call(Method::PATCH, "/v8/file-list/private", &[], Some(&req))
-            .await?;
-        let _: serde::de::IgnoredAny = self
-            .call(
-                Method::PATCH,
-                &format!("/v8/upload-batch/private/{}", link.private_slug),
-                &[],
-                Some(&api::CommitUploadBatchRequest {
-                    status: "confirmed",
-                    owner_login: &s.login,
-                }),
-            )
-            .await?;
-        let mut file = files
-            .into_iter()
-            .next()
-            .ok_or_else(|| RemoteError::Other("upload commit returned no file".into()))?;
-        if file.folder_slug.is_none() {
-            file.folder_slug = Some(folder.to_string());
-        }
-        if file.description.as_deref().unwrap_or("").is_empty() {
-            file.description = Some(description);
-        }
-        Ok(file)
+            &description,
+        )
+        .await
     }
 
     /// Gets (and caches) a download link. Tries the premium endpoint first, then the free one.
@@ -1183,5 +1179,41 @@ impl Remote for UlozRemote {
             Kind::File => self.client.file_exists(&entry.id).await,
             Kind::Folder => Ok(true),
         }
+    }
+
+    async fn upload_resumable(
+        &self,
+        parent_id: &str,
+        name: &str,
+        mut up: crate::remote::resumable::ResumableUpload,
+    ) -> Result<RemoteEntry, RemoteError> {
+        let mtime = up.mtime_ms;
+        if up.source.len() >= self.client.cfg.chunked_min_size && self.client.chunked_available() {
+            match self.client.upload_chunked(parent_id, name, &up).await {
+                Ok(f) => {
+                    let mut e = Self::file_entry(f);
+                    e.mtime_ms = mtime;
+                    return Ok(e);
+                }
+                Err(RemoteError::Other(m)) if m.starts_with("chunked uploads unavailable") => {
+                    debug!("{m}; uploading {name} in one request");
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        up.state.remove(chunked::LAYER);
+        crate::remote::resumable::upload_whole(self, parent_id, name, up).await
+    }
+
+    async fn discard_resumable(&self, state: &crate::remote::resumable::ResumeState) {
+        if let Some(st) = state.get::<chunked::ChunkedState>(chunked::LAYER) {
+            self.client.discard_batch(&st).await;
+        }
+    }
+
+    fn resumable_min_size(&self) -> Option<u64> {
+        self.client
+            .chunked_available()
+            .then_some(self.client.cfg.chunked_min_size)
     }
 }
