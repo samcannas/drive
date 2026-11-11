@@ -213,6 +213,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # the changelog is built from commits between release tags
 
       - uses: actions/download-artifact@v8
         with:
@@ -221,6 +223,9 @@ jobs:
 
       - name: Drop the build-only tarball
         run: rm -f dist/drive-*-root.tar.gz && ls -l dist
+
+      - name: Changelog
+        run: .github/release/changelog.sh "$VERSION" dist
 
       - name: latest.json, SHA256SUMS and release notes
         run: .github/release/make-release-files.sh "$VERSION" dist

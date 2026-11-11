@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Writes the updater manifest (<dist>/latest.json), <dist>/SHA256SUMS and ./notes.md for
-# release v<version> from the bundles in <dist>.
+# release v<version> from the bundles in <dist>. Run changelog.sh first: it writes
+# ./whatsnew.md (this release's notes), which goes into latest.json and the release page.
 #
 #   .github/release/make-release-files.sh 0.1.42 dist
 set -euo pipefail
@@ -28,9 +29,10 @@ platforms="$(jq -n \
 if [ -f "$dist/$deb.sig" ]; then
   platforms="$(jq --argjson deb "$(entry "$deb")" '. + {"linux-x86_64-deb": $deb}' <<<"$platforms")"
 fi
+whatsnew="$(cat whatsnew.md 2>/dev/null || echo "- Reliability improvements and fixes")"
 jq -n \
   --arg version "$version" \
-  --arg notes "Drive $version: https://github.com/$repo/releases/tag/v$version" \
+  --arg notes "$whatsnew" \
   --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --argjson platforms "$platforms" \
   '{version: $version, notes: $notes, pub_date: $date, platforms: $platforms}' \
@@ -44,14 +46,14 @@ if [ -f "$dist/$deb.sig" ]; then
 fi
 commit="${GITHUB_SHA:-$(git rev-parse HEAD)}"
 cat > notes.md <<NOTES
-Drive $version, built from ${commit:0:12}.
+## What's new in $version
 
-The repository is private, so download with the GitHub CLI (or from this page while signed in):
+$whatsnew
 
-\`\`\`sh
-gh release download v$version --repo $repo
-sha256sum --check --ignore-missing SHA256SUMS
-\`\`\`
+---
+
+Built from ${commit:0:12}. Already have Drive? It updates itself (tray icon → update button, or
+Settings → Updates). To check a download: \`sha256sum --check --ignore-missing SHA256SUMS\`.
 
 ### Windows 10/11 (x64)
 Run **$exe**. It installs for your user only (no administrator rights needed) and starts Drive.
