@@ -86,6 +86,10 @@ pub struct Config {
     pub close_action: CloseAction,
     /// Install app updates automatically (the tray app reads this; the service only stores it).
     pub auto_update: bool,
+    pub night_uploads: bool,
+    pub night_start: String,
+    pub night_end: String,
+    pub night_min_bytes: u64,
     /// A dedicated uloz.to API key; `None` uses the shared default.
     pub app_token: Option<String>,
 }
@@ -115,6 +119,10 @@ impl Default for Config {
             notifications: true,
             close_action: CloseAction::Minimize,
             auto_update: true,
+            night_uploads: false,
+            night_start: drive_core::ipc::default_night_start(),
+            night_end: drive_core::ipc::default_night_end(),
+            night_min_bytes: drive_core::ipc::default_night_min_bytes(),
             app_token: None,
         }
     }
@@ -190,6 +198,10 @@ impl Config {
             app_token_custom: self.app_token.is_some(),
             close_action: self.close_action,
             auto_update: self.auto_update,
+            night_uploads: self.night_uploads,
+            night_start: self.night_start.clone(),
+            night_end: self.night_end.clone(),
+            night_min_bytes: self.night_min_bytes,
         }
     }
 }

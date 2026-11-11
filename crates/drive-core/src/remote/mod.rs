@@ -165,6 +165,11 @@ pub trait Remote: Send + Sync + 'static {
     fn resumable_min_size(&self) -> Option<u64> {
         None
     }
+
+    /// Progress of a saved upload session, if this backend understands it.
+    fn resume_info(&self, _state: &resumable::ResumeState) -> Option<resumable::ResumeInfo> {
+        None
+    }
 }
 
 /// Collects a stream into memory (tests and small reads).

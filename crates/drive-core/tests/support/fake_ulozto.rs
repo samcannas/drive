@@ -2,7 +2,7 @@
 //! injection. Implements the subset of the protocol Drive uses, following
 //! https://uloz.to/upload-resumable-api-beta and the public OpenAPI spec.
 
-#![allow(dead_code)]
+#![allow(dead_code, clippy::result_large_err)]
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};

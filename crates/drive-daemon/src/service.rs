@@ -181,6 +181,12 @@ impl Service {
             max_parallel_transfers: cfg.max_parallel_transfers.clamp(1, 16) as usize,
             upload_limit_kbps: cfg.upload_limit_kbps,
             download_limit_kbps: cfg.download_limit_kbps,
+            night: if cfg.night_uploads {
+                drive_core::engine::schedule::NightWindow::parse(&cfg.night_start, &cfg.night_end)
+            } else {
+                None
+            },
+            night_min_bytes: cfg.night_min_bytes,
             ..Default::default()
         }
     }
@@ -429,6 +435,20 @@ impl Service {
                 self.shutdown.notify_one();
                 ok(Value::Null)
             }
+            Call::Transfers => match self.engine().await {
+                Ok(e) => ok(serde_json::to_value(e.transfers()).map_err(internal)?),
+                Err(_) => ok(
+                    serde_json::to_value(drive_core::ipc::TransferList::default())
+                        .map_err(internal)?,
+                ),
+            },
+            Call::SetTransferMode { id, mode } => {
+                self.engine()
+                    .await?
+                    .set_transfer_mode(id, mode)
+                    .map_err(|e| rpc(ErrorCode::NotFound, e.to_string()))?;
+                ok(Value::Null)
+            }
         }
     }
 
@@ -647,6 +667,22 @@ impl Service {
         }
         if let Some(v) = patch.auto_update {
             c.auto_update = v;
+        }
+        if let Some(v) = patch.night_uploads {
+            c.night_uploads = v;
+        }
+        if let Some(v) = patch.night_start {
+            c.night_start = drive_core::engine::schedule::parse_hhmm(&v)
+                .map(drive_core::engine::schedule::format_hhmm)
+                .ok_or_else(|| rpc(ErrorCode::BadRequest, "Enter a start time like 01:00"))?;
+        }
+        if let Some(v) = patch.night_end {
+            c.night_end = drive_core::engine::schedule::parse_hhmm(&v)
+                .map(drive_core::engine::schedule::format_hhmm)
+                .ok_or_else(|| rpc(ErrorCode::BadRequest, "Enter an end time like 07:00"))?;
+        }
+        if let Some(v) = patch.night_min_bytes {
+            c.night_min_bytes = v;
         }
         if let Some(v) = patch.notifications {
             c.notifications = v;

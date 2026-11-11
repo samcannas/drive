@@ -35,7 +35,53 @@ pub mod pending {
     pub const TRASH: i64 = 4;
 }
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+
+/// v2: per-file transfer mode, and persisted resumable-upload sessions.
+const SCHEMA_V2: &str = r#"
+ALTER TABLE node ADD COLUMN upload_mode INTEGER NOT NULL DEFAULT 0 CHECK (upload_mode BETWEEN 0 AND 3);
+
+CREATE TABLE upload_session (
+    node_id     INTEGER PRIMARY KEY REFERENCES node(id) ON DELETE CASCADE,
+    size        INTEGER NOT NULL CHECK (size >= 0),
+    mtime_ms    INTEGER NOT NULL,
+    state       TEXT    NOT NULL,
+    created_ms  INTEGER NOT NULL,
+    updated_ms  INTEGER NOT NULL
+) STRICT;
+"#;
+
+/// `node.upload_mode` values (see [`crate::ipc::TransferMode`]).
+pub mod upload_mode {
+    pub const AUTO: i64 = 0;
+    pub const PAUSED: i64 = 1;
+    pub const TONIGHT: i64 = 2;
+    pub const NOW: i64 = 3;
+}
+
+/// Which uploads may start right now (pause, overnight window).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UploadGate {
+    /// Night uploads are on and the window is closed.
+    pub night_closed: bool,
+    /// With `night_closed`: files at least this large wait (when in auto mode).
+    pub night_min_bytes: u64,
+}
+
+/// SQL condition (on `node`) that is true for uploads held back by the user or the schedule.
+/// Parameters: `?night_closed` (0/1) and `?night_min`.
+const HELD: &str = "(kind = 0 AND pending & 1 != 0 AND (
+        upload_mode = 1
+        OR (upload_mode = 2 AND :night_closed)
+        OR (upload_mode = 0 AND :night_closed AND size >= :night_min)))";
+
+#[derive(Debug, Clone)]
+pub struct UploadSession {
+    pub node_id: NodeId,
+    pub size: u64,
+    pub mtime_ms: i64,
+    pub state: crate::remote::resumable::ResumeState,
+}
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE node (
@@ -133,10 +179,11 @@ pub struct Node {
     pub hydrated: bool,
     pub pinned: bool,
     pub accessed_ms: i64,
+    pub upload_mode: i64,
 }
 
 pub const NODE_COLUMNS: &str = "id, parent_id, name, kind, size, mtime_ms, remote_id, remote_parent_id, remote_name, \
-     dirty, deleted, pending, generation, op_seq, changed_ms, retry_at_ms, attempts, hydrated, pinned, accessed_ms";
+     dirty, deleted, pending, generation, op_seq, changed_ms, retry_at_ms, attempts, hydrated, pinned, accessed_ms, upload_mode";
 
 impl Node {
     pub fn from_row(r: &Row<'_>) -> rusqlite::Result<Self> {
@@ -165,6 +212,7 @@ impl Node {
             hydrated: r.get(17)?,
             pinned: r.get(18)?,
             accessed_ms: r.get(19)?,
+            upload_mode: r.get(20)?,
         })
     }
 
@@ -422,23 +470,142 @@ impl Db {
         now: i64,
         debounce_before: i64,
         limit: u32,
+        gate: UploadGate,
     ) -> rusqlite::Result<Vec<Node>> {
         self.read(|c| {
             let mut st = c.prepare_cached(&format!(
                 "SELECT {NODE_COLUMNS} FROM node
-                 WHERE pending != 0 AND retry_at_ms <= ?1 AND (changed_ms <= ?2 OR pending & 4 != 0 OR kind = 1)
-                 ORDER BY retry_at_ms, changed_ms LIMIT ?3"
+                 WHERE pending != 0 AND retry_at_ms <= :now AND (changed_ms <= :settled OR pending & 4 != 0 OR kind = 1)
+                   AND NOT {HELD}
+                 ORDER BY upload_mode = 3 DESC, retry_at_ms, changed_ms LIMIT :limit"
             ))?;
-            st.query_map(params![now, debounce_before, limit], Node::from_row)?.collect()
+            st.query_map(
+                rusqlite::named_params! {
+                    ":now": now, ":settled": debounce_before, ":limit": limit,
+                    ":night_closed": gate.night_closed, ":night_min": gate.night_min_bytes as i64,
+                },
+                Node::from_row,
+            )?
+            .collect()
+        })
+    }
+
+    /// Files waiting to upload that aren't in `exclude`, held ones last (transfer list).
+    pub fn queued_uploads(
+        &self,
+        limit: u32,
+        gate: UploadGate,
+    ) -> rusqlite::Result<(Vec<Node>, u32)> {
+        self.read(|c| {
+            let mut st = c.prepare_cached(&format!(
+                "SELECT {NODE_COLUMNS} FROM node
+                 WHERE kind = 0 AND deleted = 0 AND pending & 1 != 0
+                 ORDER BY {HELD}, upload_mode = 3 DESC, retry_at_ms, changed_ms LIMIT :limit"
+            ))?;
+            let rows = st
+                .query_map(
+                    rusqlite::named_params! {
+                        ":limit": limit, ":night_closed": gate.night_closed,
+                        ":night_min": gate.night_min_bytes as i64,
+                    },
+                    Node::from_row,
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            let count: u32 = c.query_row(
+                "SELECT COUNT(*) FROM node WHERE kind = 0 AND deleted = 0 AND pending & 1 != 0",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok((rows, count))
+        })
+    }
+
+    pub fn set_upload_mode(&self, id: NodeId, mode: i64) -> rusqlite::Result<bool> {
+        self.write(|tx| {
+            tx.execute(
+                "UPDATE node SET upload_mode = ?2, retry_at_ms = CASE WHEN ?2 = 3 THEN 0 ELSE retry_at_ms END
+                 WHERE id = ?1 AND kind = 0",
+                params![id, mode],
+            )
+            .map(|n| n > 0)
+        })
+    }
+
+    // ---- upload sessions -------------------------------------------------------------------
+
+    pub fn upload_session(&self, id: NodeId) -> rusqlite::Result<Option<UploadSession>> {
+        self.read(|c| {
+            c.prepare_cached(
+                "SELECT node_id, size, mtime_ms, state FROM upload_session WHERE node_id = ?1",
+            )?
+            .query_row([id], |r| {
+                let state: String = r.get(3)?;
+                Ok(UploadSession {
+                    node_id: r.get(0)?,
+                    size: r.get::<_, i64>(1)? as u64,
+                    mtime_ms: r.get(2)?,
+                    state: serde_json::from_str(&state).unwrap_or_default(),
+                })
+            })
+            .optional()
+        })
+    }
+
+    /// All sessions (small table: one row per upload in progress).
+    pub fn upload_sessions(&self) -> rusqlite::Result<Vec<UploadSession>> {
+        self.read(|c| {
+            let mut st = c.prepare_cached(
+                "SELECT node_id, size, mtime_ms, state FROM upload_session LIMIT 10000",
+            )?;
+            st.query_map([], |r| {
+                let state: String = r.get(3)?;
+                Ok(UploadSession {
+                    node_id: r.get(0)?,
+                    size: r.get::<_, i64>(1)? as u64,
+                    mtime_ms: r.get(2)?,
+                    state: serde_json::from_str(&state).unwrap_or_default(),
+                })
+            })?
+            .collect()
+        })
+    }
+
+    pub fn save_upload_session(
+        &self,
+        id: NodeId,
+        size: u64,
+        mtime_ms: i64,
+        state: &crate::remote::resumable::ResumeState,
+    ) -> rusqlite::Result<()> {
+        let json = serde_json::to_string(state).unwrap_or_else(|_| "{}".into());
+        let now = now_ms();
+        self.write(|tx| {
+            tx.execute(
+                "INSERT INTO upload_session (node_id, size, mtime_ms, state, created_ms, updated_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+                 ON CONFLICT (node_id) DO UPDATE SET size = excluded.size, mtime_ms = excluded.mtime_ms,
+                     state = excluded.state, updated_ms = excluded.updated_ms",
+                params![id, size as i64, mtime_ms, json, now],
+            )
+            .map(|_| ())
+        })
+    }
+
+    pub fn delete_upload_session(&self, id: NodeId) -> rusqlite::Result<()> {
+        self.write(|tx| {
+            tx.execute("DELETE FROM upload_session WHERE node_id = ?1", [id])
+                .map(|_| ())
         })
     }
 
     /// Earliest time any pending work becomes due (for the worker's sleep).
-    pub fn next_work_at(&self) -> rusqlite::Result<Option<i64>> {
+    pub fn next_work_at(&self, gate: UploadGate) -> rusqlite::Result<Option<i64>> {
         self.read(|c| {
             c.query_row(
-                "SELECT MIN(MAX(retry_at_ms, changed_ms)) FROM node WHERE pending != 0",
-                [],
+                &format!("SELECT MIN(MAX(retry_at_ms, changed_ms)) FROM node WHERE pending != 0 AND NOT {HELD}"),
+                rusqlite::named_params! {
+                    ":night_closed": gate.night_closed, ":night_min": gate.night_min_bytes as i64,
+                },
                 |r| r.get(0),
             )
         })
@@ -760,7 +927,23 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             "database schema {version} is newer than this version of Drive supports ({SCHEMA_VERSION})"
         )));
     }
-    if version < 1 {
+    if version < 2 {
+        let v1 = version < 1;
+        if v1 {
+            migrate_v1(conn)?;
+        }
+        conn.execute_batch(&format!(
+            "BEGIN IMMEDIATE;
+             {SCHEMA_V2}
+             PRAGMA user_version = 2;
+             COMMIT;"
+        ))?;
+    }
+    Ok(())
+}
+
+fn migrate_v1(conn: &Connection) -> rusqlite::Result<()> {
+    {
         conn.execute_batch(&format!(
             "BEGIN IMMEDIATE;
              {SCHEMA_V1}
@@ -896,6 +1079,89 @@ mod tests {
   full scan: {p}"
             );
         }
+    }
+
+    #[test]
+    fn upgrades_a_v1_database_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("state.db");
+        {
+            let c = Connection::open(&p).unwrap();
+            migrate_v1(&c).unwrap();
+            c.execute(
+                "INSERT INTO node (parent_id, name, name_key, kind, size, pending, created_ms) VALUES (1, 'a.mp4', 'a.mp4', 0, 5, 1, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&p).unwrap();
+        let n = db.node_by_path("a.mp4").unwrap().expect("row survives");
+        assert_eq!((n.size, n.upload_mode), (5, upload_mode::AUTO));
+        let v: i64 = db
+            .read(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        // Sessions round-trip and cascade with their node.
+        let mut st = crate::remote::resumable::ResumeState::default();
+        st.set("crypt", &serde_json::json!({"nonce": "00"}));
+        db.save_upload_session(n.id, 5, 7, &st).unwrap();
+        assert_eq!(db.upload_session(n.id).unwrap().unwrap().state, st);
+        db.write(|tx| {
+            tx.execute("DELETE FROM node WHERE id = ?1", [n.id])
+                .map(|_| ())
+        })
+        .unwrap();
+        assert!(db.upload_session(n.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn held_uploads_are_not_due() {
+        let db = Db::open_in_memory().unwrap();
+        let mk = |name: &str, size: i64, mode: i64| {
+            db.write(|tx| {
+                tx.execute(
+                    "INSERT INTO node (parent_id, name, name_key, kind, size, pending, upload_mode, created_ms)
+                     VALUES (1, ?1, ?1, 0, ?2, 1, ?3, 0)",
+                    params![name, size, mode],
+                )
+                .map(|_| ())
+            })
+            .unwrap()
+        };
+        mk("small", 10, upload_mode::AUTO);
+        mk("big", 1_000, upload_mode::AUTO);
+        mk("paused", 10, upload_mode::PAUSED);
+        mk("tonight", 10, upload_mode::TONIGHT);
+        mk("forced", 1_000, upload_mode::NOW);
+        let names = |gate: UploadGate| -> Vec<String> {
+            let mut v: Vec<String> = db
+                .due_work(i64::MAX, i64::MAX, 100, gate)
+                .unwrap()
+                .into_iter()
+                .map(|n| n.name)
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            names(UploadGate::default()),
+            ["big", "forced", "small", "tonight"]
+        );
+        let closed = UploadGate {
+            night_closed: true,
+            night_min_bytes: 500,
+        };
+        assert_eq!(names(closed), ["forced", "small"]);
+        // Forced uploads go first.
+        assert_eq!(
+            db.due_work(i64::MAX, i64::MAX, 1, closed).unwrap()[0].name,
+            "forced"
+        );
+        let (all, count) = db.queued_uploads(10, closed).unwrap();
+        assert_eq!(count, 5);
+        // Held uploads (paused / waiting for the window) come last.
+        let last = all.last().map(|n| n.name.as_str()).unwrap_or("");
+        assert!(["big", "paused", "tonight"].contains(&last), "{last}");
     }
 
     #[test]

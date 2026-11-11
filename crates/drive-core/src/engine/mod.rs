@@ -11,7 +11,9 @@
 
 pub mod local;
 pub mod plan;
+pub mod schedule;
 pub mod throttle;
+mod transfers;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -22,13 +24,13 @@ use std::time::Duration;
 
 use rusqlite::params;
 use tokio::sync::{Notify, Semaphore, broadcast, watch};
-use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::db::{self, Db, Node, NodeId, ROOT_ID, kind_int, name_key, now_ms, pending};
 use crate::ipc::{Activity, ActivityKind, Event, IssueAction, IssueKind, Status, SyncState};
-use crate::remote::{ByteStream, Kind, Remote, RemoteEntry, RemoteError, UploadBody};
+use crate::remote::resumable::{FileSource, Progress, ResumableUpload, ResumeState};
+use crate::remote::{ByteStream, Kind, Remote, RemoteEntry, RemoteError};
 use local::{LocalItem, LocalSide, is_ignored_name};
 use plan::{Change, PlanError, PlanInput};
 use throttle::{Throttle, metered};
@@ -51,6 +53,10 @@ pub struct EngineConfig {
     pub debounce: Duration,
     /// Keep at least this much disk space free by evicting cached files.
     pub min_free_bytes: u64,
+    /// Large uploads wait for this window ("upload large files overnight"); `None` = off.
+    pub night: Option<schedule::NightWindow>,
+    /// Uploads at least this large wait for the night window.
+    pub night_min_bytes: u64,
 }
 
 impl Default for EngineConfig {
@@ -66,6 +72,8 @@ impl Default for EngineConfig {
             download_limit_kbps: 0,
             debounce: Duration::from_secs(3),
             min_free_bytes: 2 * 1024 * 1024 * 1024,
+            night: None,
+            night_min_bytes: 200 * 1024 * 1024,
         }
     }
 }
@@ -97,10 +105,19 @@ impl From<EngineError> for io::Error {
 
 pub type Result<T, E = EngineError> = std::result::Result<T, E>;
 
+/// A running upload or download.
 struct Transfer {
+    node: NodeId,
+    path: String,
     upload: bool,
     total: u64,
-    done: Arc<AtomicU64>,
+    progress: Arc<Progress>,
+    /// Progress survives a restart (a resumable upload session).
+    resumable: bool,
+    /// Smoothed bytes per second.
+    rate: f64,
+    last_done: u64,
+    last_at: std::time::Instant,
 }
 
 pub struct Engine {
@@ -130,6 +147,10 @@ pub struct Engine {
     recently_gone: Mutex<HashMap<String, i64>>,
     transfers: Mutex<HashMap<u64, Transfer>>,
     next_transfer: AtomicU64,
+    /// Cancels a running upload (pause).
+    upload_cancels: Mutex<HashMap<NodeId, CancellationToken>>,
+    /// When the transfer list was last pushed to subscribers, and whether it had entries.
+    transfers_pushed: Mutex<(std::time::Instant, bool)>,
     access: Mutex<HashMap<NodeId, i64>>,
     hydrating: Mutex<HashSet<NodeId>>,
     hydrate_permits: Semaphore,
@@ -182,6 +203,8 @@ impl Engine {
             recently_gone: Mutex::new(HashMap::new()),
             transfers: Mutex::new(HashMap::new()),
             next_transfer: AtomicU64::new(1),
+            upload_cancels: Mutex::new(HashMap::new()),
+            transfers_pushed: Mutex::new((std::time::Instant::now(), false)),
             access: Mutex::new(HashMap::new()),
             hydrating: Mutex::new(HashSet::new()),
             allow_remote_removal_until: AtomicI64::new(0),
@@ -332,7 +355,7 @@ impl Engine {
                 down += 1;
             }
             total += t.total;
-            done += t.done.load(Ordering::Relaxed).min(t.total);
+            done += t.progress.done().min(t.total);
         }
         let held = self.held_remote_removals.load(Ordering::Relaxed);
         let local_deletes = self.db.pending_trash_files().unwrap_or(0);
@@ -417,6 +440,8 @@ impl Engine {
                 _ = tokio::time::sleep(Duration::from_millis(1000)) => {}
             }
             self.refresh_status();
+            self.sample_rates();
+            self.push_transfers();
             // Coalesce bursts of changes.
             tokio::time::sleep(Duration::from_millis(150)).await;
         }
@@ -817,13 +842,19 @@ impl Engine {
                 return Err(e.into());
             }
         };
-        let done = Arc::new(AtomicU64::new(0));
-        let tid = self.begin_transfer(false, total, done.clone());
+        let progress = Arc::new(Progress::default());
+        let path = self
+            .db
+            .path_of(id)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| n.name.clone());
+        let tid = self.begin_transfer(id, path, false, total, progress.clone(), false);
         let guard = TransferGuard {
             engine: self.clone(),
             id: tid,
         };
-        let s = metered(stream, done, self.down.clone());
+        let s = metered(stream, progress, self.down.clone());
         // Keep the transfer registered until the stream is dropped.
         Ok(Box::pin(GuardedStream {
             inner: s,
@@ -831,14 +862,29 @@ impl Engine {
         }))
     }
 
-    fn begin_transfer(&self, upload: bool, total: u64, done: Arc<AtomicU64>) -> u64 {
+    fn begin_transfer(
+        &self,
+        node: NodeId,
+        path: String,
+        upload: bool,
+        total: u64,
+        progress: Arc<Progress>,
+        resumable: bool,
+    ) -> u64 {
         let id = self.next_transfer.fetch_add(1, Ordering::Relaxed);
+        let last_done = progress.done();
         self.transfers.lock().unwrap().insert(
             id,
             Transfer {
+                node,
+                path,
                 upload,
                 total,
-                done,
+                progress,
+                resumable,
+                rate: 0.0,
+                last_done,
+                last_at: std::time::Instant::now(),
             },
         );
         self.status_changed.notify_one();
@@ -1139,6 +1185,15 @@ impl Engine {
         let busy: HashSet<NodeId> = self.in_flight.lock().unwrap().clone();
         let nodes = self.db.all_nodes()?;
         let mut orphans = self.db.orphan_ids()?;
+        for s in self.db.upload_sessions()? {
+            if let Some(id) = self
+                .remote
+                .resume_info(&s.state)
+                .and_then(|i| i.assembled_id)
+            {
+                orphans.insert(id);
+            }
+        }
         orphans.extend(
             self.recently_gone
                 .lock()
@@ -1585,7 +1640,7 @@ impl Engine {
             } else {
                 let now = now_ms();
                 let debounce = self.config().debounce.as_millis() as i64;
-                match self.db.next_work_at().ok().flatten() {
+                match self.db.next_work_at(self.upload_gate()).ok().flatten() {
                     Some(at) => {
                         Duration::from_millis((at + debounce - now).clamp(200, 30_000) as u64)
                     }
@@ -1626,7 +1681,10 @@ impl Engine {
             blocked
         };
 
-        let Ok(due) = self.db.due_work(now, debounce_before, 200) else {
+        let Ok(due) = self
+            .db
+            .due_work(now, debounce_before, 200, self.upload_gate())
+        else {
             return 0;
         };
         for n in due {
@@ -1742,6 +1800,14 @@ impl Engine {
             .flatten()
             .unwrap_or_else(|| n.name.clone());
         let (delay_ms, count_attempt): (i64, bool) = match &e {
+            // Paused or shutting down: nothing failed.
+            EngineError::Remote(RemoteError::Cancelled) => return,
+            // The file is still being written: try again once it settles.
+            EngineError::Remote(RemoteError::Integrity(m))
+                if m.contains("changed while uploading") =>
+            {
+                (10_000, false)
+            }
             EngineError::Remote(re) => {
                 self.note_remote_error(re);
                 match re {
@@ -1897,19 +1963,72 @@ impl Engine {
             .map_err(io::Error::other)??;
         let size = src.size;
         let mtime = src.mtime_ms;
-        let file = tokio::fs::File::from_std(src.file);
-        use tokio::io::AsyncReadExt;
-        let reader = ReaderStream::with_capacity(file.take(size), 256 * 1024);
-        let stream: ByteStream = Box::pin(reader);
-        let done = Arc::new(AtomicU64::new(0));
-        let tid = self.begin_transfer(true, size, done.clone());
-        let body = UploadBody {
-            stream: metered(stream, done, self.up.clone()),
-            size,
-            mtime_ms: mtime,
+
+        // Continue an earlier attempt only if the file is exactly as it was then.
+        let state = match self.db.upload_session(n.id)? {
+            Some(s) if s.size == size && s.mtime_ms == mtime => s.state,
+            Some(s) => {
+                debug!(
+                    "{} changed since its upload started; starting over",
+                    item.path
+                );
+                self.db.delete_upload_session(n.id)?;
+                self.remote.discard_resumable(&s.state).await;
+                ResumeState::default()
+            }
+            None => ResumeState::default(),
         };
-        let result = self.remote.upload(&parent, &n.name, body).await;
+        let resumable = !state.is_empty();
+        let progress = Arc::new(Progress::default());
+        if let Some(info) = self.remote.resume_info(&state).filter(|i| i.total > 0) {
+            let done = (info.confirmed as f64 * size as f64 / info.total as f64) as u64;
+            progress.confirmed.store(done.min(size), Ordering::Relaxed);
+        }
+        let cancel = self.cancel.child_token();
+        self.upload_cancels
+            .lock()
+            .unwrap()
+            .insert(n.id, cancel.clone());
+        let db = self.db.clone();
+        let node_id = n.id;
+        let checkpoint: Arc<dyn Fn(&ResumeState) + Send + Sync> =
+            Arc::new(move |st: &ResumeState| {
+                if let Err(e) = db.save_upload_session(node_id, size, mtime, st) {
+                    warn!("saving upload progress failed: {e}");
+                }
+            });
+        let tid = self.begin_transfer(
+            n.id,
+            item.path.clone(),
+            true,
+            size,
+            progress.clone(),
+            resumable,
+        );
+        let upload = ResumableUpload {
+            source: Arc::new(FileSource::new(src.file, size)),
+            mtime_ms: mtime,
+            state,
+            checkpoint,
+            meter: Arc::new(throttle::ThrottleMeter(self.up.clone())),
+            progress,
+            scale: 1.0,
+            cancel,
+        };
+        let result = self.remote.upload_resumable(&parent, &n.name, upload).await;
         self.end_transfer(tid);
+        self.upload_cancels.lock().unwrap().remove(&n.id);
+        match &result {
+            Ok(_) => self.db.delete_upload_session(n.id)?,
+            Err(RemoteError::Integrity(_)) => {
+                // Never continue a session whose data didn't check out.
+                if let Some(s) = self.db.upload_session(n.id)? {
+                    self.remote.discard_resumable(&s.state).await;
+                }
+                self.db.delete_upload_session(n.id)?;
+            }
+            Err(_) => {}
+        }
         let entry = result?;
         let seq = self.next_seq();
 
@@ -1931,6 +2050,7 @@ impl Engine {
                      last_error = NULL, retry_at_ms = 0,
                      dirty = CASE WHEN ?6 THEN 0 ELSE dirty END,
                      pending = CASE WHEN ?6 THEN pending & ~1 ELSE pending END,
+                     upload_mode = CASE WHEN ?6 THEN 0 ELSE upload_mode END,
                      size = CASE WHEN ?6 THEN ?7 ELSE size END,
                      mtime_ms = CASE WHEN ?6 THEN ?8 ELSE mtime_ms END
                  WHERE id = ?1",

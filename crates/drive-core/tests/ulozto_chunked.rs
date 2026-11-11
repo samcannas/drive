@@ -318,7 +318,7 @@ async fn small_files_use_a_single_request() {
         (1, 0)
     );
     assert!(
-        run.state().0.get("crypt").is_none(),
+        !run.state().0.contains_key("crypt"),
         "no nonce saved for non-resumable uploads"
     );
     assert_eq!(plain_of(&fake), plain);

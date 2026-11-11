@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use drive_core::ipc::{
     Activity, Call, ErrorCode, Issue, IssueAction, RecoveryKit, Settings, SettingsPatch,
-    SetupRequest, SetupResult, Status,
+    SetupRequest, SetupResult, Status, TransferList, TransferMode, TransferState,
 };
 use drive_core::ipc_client::{Client, ClientError};
 use tracing::{error, info};
@@ -85,6 +85,18 @@ enum Command {
     },
     /// Stop the background service.
     Stop,
+    /// List uploads and downloads: what's moving, what's waiting and why.
+    Transfers {
+        /// Show every queued item, not just the first 20.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Control one upload: pause, resume, tonight (wait for the overnight window) or now.
+    Transfer {
+        action: String,
+        /// The file's path, or its id from `drive transfers`.
+        target: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -185,6 +197,76 @@ async fn connect() -> Result<Client> {
             )
         }
         Err(e) => Err(e.into()),
+    }
+}
+
+fn human_duration(secs: u64) -> String {
+    if secs < 60 {
+        "less than a minute".into()
+    } else if secs < 3600 {
+        format!("about {} min", secs.div_ceil(60))
+    } else {
+        format!("about {} h {} min", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+fn print_transfers(list: &TransferList, all: bool) {
+    if list.items.is_empty() {
+        println!("Nothing to transfer.");
+        return;
+    }
+    let mut head = format!("{} transfer(s)", list.total_count);
+    if list.upload_rate_bps > 0 {
+        head.push_str(&format!(
+            " · uploading at {}/s",
+            human_bytes(list.upload_rate_bps)
+        ));
+    }
+    if let Some(eta) = list.upload_eta_secs {
+        head.push_str(&format!(" · {} left", human_duration(eta)));
+    }
+    println!("{head}");
+    let shown = if all {
+        list.items.len()
+    } else {
+        list.items.len().min(20)
+    };
+    for i in &list.items[..shown] {
+        let state = match i.state {
+            TransferState::Preparing => "preparing",
+            TransferState::Active => "active",
+            TransferState::Verifying => "verifying",
+            TransferState::Queued => "queued",
+            TransferState::Waiting => "waiting",
+            TransferState::Paused => "paused",
+            TransferState::Scheduled => "tonight",
+        };
+        let pct = if i.bytes_total > 0 {
+            i.bytes_done * 100 / i.bytes_total
+        } else {
+            0
+        };
+        let mut line = format!(
+            "{:>7}  {:<9} {:>3}%  {} of {}",
+            i.id,
+            state,
+            pct,
+            human_bytes(i.bytes_done),
+            human_bytes(i.bytes_total)
+        );
+        if let Some(eta) = i.eta_secs {
+            line.push_str(&format!(", {}", human_duration(eta)));
+        }
+        println!("{line}  {}", i.path);
+        if let Some(r) = &i.reason {
+            println!("         {r}");
+        }
+    }
+    if shown < list.items.len() {
+        println!(
+            "…and {} more (drive transfers --all)",
+            list.items.len() - shown
+        );
     }
 }
 
@@ -400,6 +482,16 @@ async fn run_client(cmd: Command) -> Result<()> {
                             _ => bail!("auto-update needs on or off"),
                         })
                     }
+                    "night-uploads" => {
+                        patch.night_uploads = Some(match v {
+                            "on" | "true" | "yes" | "1" => true,
+                            "off" | "false" | "no" | "0" => false,
+                            _ => bail!("night-uploads needs on or off"),
+                        })
+                    }
+                    "night-start" => patch.night_start = Some(v.to_string()),
+                    "night-end" => patch.night_end = Some(v.to_string()),
+                    "night-min-mb" => patch.night_min_bytes = Some(num()? * 1024 * 1024),
                     other => bail!("unknown setting {other}"),
                 }
             }
@@ -438,6 +530,34 @@ async fn run_client(cmd: Command) -> Result<()> {
         Command::Stop => {
             client.call_value(Call::Shutdown).await?;
             println!("Stopping the Drive service.");
+        }
+        Command::Transfers { all } => {
+            let list: TransferList = client.call(Call::Transfers).await?;
+            print_transfers(&list, all);
+        }
+        Command::Transfer { action, target } => {
+            let mode = match action.as_str() {
+                "pause" => TransferMode::Paused,
+                "resume" | "auto" => TransferMode::Auto,
+                "tonight" => TransferMode::Tonight,
+                "now" => TransferMode::Now,
+                other => bail!("unknown action {other}: use pause, resume, tonight or now"),
+            };
+            let list: TransferList = client.call(Call::Transfers).await?;
+            let rel = target.replace('\\', "/");
+            let id = match target.parse::<i64>() {
+                Ok(id) => id,
+                Err(_) => list
+                    .items
+                    .iter()
+                    .find(|i| rel.ends_with(&i.path) || i.path == rel)
+                    .map(|i| i.id)
+                    .with_context(|| format!("{target} isn't waiting to upload"))?,
+            };
+            client
+                .call_value(Call::SetTransferMode { id, mode })
+                .await?;
+            println!("Done.");
         }
     }
     Ok(())

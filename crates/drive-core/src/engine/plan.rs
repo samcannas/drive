@@ -684,6 +684,7 @@ mod tests {
             hydrated: false,
             pinned: false,
             accessed_ms: 0,
+            upload_mode: 0,
         }
     }
 

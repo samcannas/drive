@@ -39,6 +39,25 @@ pub struct MemRemote {
     calls: Mutex<Vec<String>>,
     /// When set, the remote is persisted to this directory (`index.json` + `blobs/<id>`).
     dir: Option<std::path::PathBuf>,
+    /// Resumable-upload simulation: partial uploads by session id.
+    sessions: Mutex<HashMap<String, Vec<u8>>>,
+    /// The next resumable upload fails (as a dropped connection) once it has this many bytes.
+    fail_upload_at: Mutex<Option<u64>>,
+    /// Delay per resumable chunk (to observe uploads in progress).
+    chunk_delay_ms: AtomicU64,
+    /// Total bytes received by resumable uploads (to check nothing is re-sent).
+    received: AtomicU64,
+}
+
+/// Chunk size of the resumable simulation.
+pub const MEM_CHUNK: u64 = 64 * 1024;
+/// Uploads at least this large are resumable.
+pub const MEM_RESUMABLE_MIN: u64 = 128 * 1024;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MemResume {
+    session: String,
+    len: u64,
 }
 
 pub const ROOT: &str = "root";
@@ -87,6 +106,21 @@ impl MemRemote {
         if std::fs::write(&tmp, serde_json::to_vec(&index).unwrap_or_default()).is_ok() {
             let _ = std::fs::rename(&tmp, dir.join("index.json"));
         }
+    }
+
+    /// Makes the next resumable upload break off once it has received `bytes`.
+    pub fn fail_upload_at(&self, bytes: u64) {
+        *self.fail_upload_at.lock().unwrap() = Some(bytes);
+    }
+
+    pub fn set_chunk_delay(&self, d: std::time::Duration) {
+        self.chunk_delay_ms
+            .store(d.as_millis() as u64, Ordering::SeqCst);
+    }
+
+    /// Bytes received by resumable uploads so far.
+    pub fn received_bytes(&self) -> u64 {
+        self.received.load(Ordering::SeqCst)
     }
 
     pub fn fail_next(&self, n: u64) {
@@ -392,5 +426,127 @@ impl Remote for MemRemote {
             .unwrap()
             .get(&entry.id)
             .is_some_and(|i| !i.trashed))
+    }
+
+    async fn upload_resumable(
+        &self,
+        parent_id: &str,
+        name: &str,
+        up: super::resumable::ResumableUpload,
+    ) -> Result<RemoteEntry, RemoteError> {
+        use super::resumable::{UploadPhase, read_range};
+        let len = up.source.len();
+        if len < MEM_RESUMABLE_MIN {
+            return super::resumable::upload_whole(self, parent_id, name, up).await;
+        }
+        self.check(String::new())?;
+        let mut state = up.state.clone();
+        let session = match state.get::<MemResume>("mem") {
+            Some(r) if r.len == len && self.sessions.lock().unwrap().contains_key(&r.session) => {
+                r.session
+            }
+            _ => {
+                let id = format!("s{}", self.next.fetch_add(1, Ordering::SeqCst) + 1);
+                self.sessions.lock().unwrap().insert(id.clone(), Vec::new());
+                state.set(
+                    "mem",
+                    &MemResume {
+                        session: id.clone(),
+                        len,
+                    },
+                );
+                (up.checkpoint)(&state);
+                id
+            }
+        };
+        up.progress.set_phase(UploadPhase::Sending);
+        loop {
+            let offset = self
+                .sessions
+                .lock()
+                .unwrap()
+                .get(&session)
+                .map(|v| v.len() as u64)
+                .unwrap_or(0);
+            up.progress
+                .confirmed
+                .store(up.outer(offset), Ordering::Relaxed);
+            if offset >= len {
+                break;
+            }
+            if up.cancel.is_cancelled() {
+                return Err(RemoteError::Cancelled);
+            }
+            if self.offline.load(Ordering::SeqCst) {
+                return Err(RemoteError::Network("offline".into()));
+            }
+            {
+                let mut fail = self.fail_upload_at.lock().unwrap();
+                if fail.is_some_and(|at| offset >= at) {
+                    *fail = None;
+                    return Err(RemoteError::Network("connection dropped".into()));
+                }
+            }
+            let n = MEM_CHUNK.min(len - offset) as usize;
+            up.meter.consume(n).await;
+            let delay = self.chunk_delay_ms.load(Ordering::SeqCst);
+            if delay > 0 {
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(delay)) => {}
+                    _ = up.cancel.cancelled() => return Err(RemoteError::Cancelled),
+                }
+            }
+            let buf = read_range(&up.source, offset, n)
+                .await
+                .map_err(|e| RemoteError::Other(e.to_string()))?;
+            self.received.fetch_add(n as u64, Ordering::SeqCst);
+            if let Some(v) = self.sessions.lock().unwrap().get_mut(&session) {
+                v.extend_from_slice(&buf);
+            }
+            (up.checkpoint)(&state);
+        }
+        up.progress.set_phase(UploadPhase::Verifying);
+        let data = self
+            .sessions
+            .lock()
+            .unwrap()
+            .remove(&session)
+            .unwrap_or_default();
+        self.check(format!("upload {name}"))?;
+        if !Self::exists_folder(&self.items.lock().unwrap(), parent_id) {
+            return Err(RemoteError::NotFound(parent_id.into()));
+        }
+        let id = self.put_file(parent_id, name, &data, up.mtime_ms);
+        let items = self.items.lock().unwrap();
+        Ok(Self::entry(&id, &items[&id]))
+    }
+
+    async fn discard_resumable(&self, state: &super::resumable::ResumeState) {
+        if let Some(r) = state.get::<MemResume>("mem") {
+            self.sessions.lock().unwrap().remove(&r.session);
+        }
+    }
+
+    fn resumable_min_size(&self) -> Option<u64> {
+        Some(MEM_RESUMABLE_MIN)
+    }
+
+    fn resume_info(
+        &self,
+        state: &super::resumable::ResumeState,
+    ) -> Option<super::resumable::ResumeInfo> {
+        let r = state.get::<MemResume>("mem")?;
+        let confirmed = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&r.session)
+            .map(|v| v.len() as u64)
+            .unwrap_or(0);
+        Some(super::resumable::ResumeInfo {
+            confirmed,
+            total: r.len,
+            assembled_id: None,
+        })
     }
 }

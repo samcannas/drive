@@ -1216,4 +1216,17 @@ impl Remote for UlozRemote {
             .chunked_available()
             .then_some(self.client.cfg.chunked_min_size)
     }
+
+    fn resume_info(
+        &self,
+        state: &crate::remote::resumable::ResumeState,
+    ) -> Option<crate::remote::resumable::ResumeInfo> {
+        let (confirmed, total) = chunked::confirmed_bytes(state).unwrap_or((0, 0));
+        let assembled_id = chunked::finished_slug(state);
+        (total > 0 || assembled_id.is_some()).then_some(crate::remote::resumable::ResumeInfo {
+            confirmed,
+            total,
+            assembled_id,
+        })
+    }
 }

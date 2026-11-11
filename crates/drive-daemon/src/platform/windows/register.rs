@@ -98,13 +98,31 @@ fn provider_of(id: &SyncRootId) -> String {
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {
+    // Windows accepts both separators, and a folder that no longer exists can't be
+    // canonicalized, so compare spellings: verbatim prefix, separators, case, trailing slash.
     let norm = |p: &Path| {
         super::util::strip_verbatim(p)
             .to_string_lossy()
+            .replace('/', "\\")
             .trim_end_matches('\\')
             .to_lowercase()
     };
     norm(a) == norm(b)
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::same_path;
+    use std::path::Path;
+
+    #[test]
+    fn spellings_of_one_folder_match() {
+        let reg = Path::new(r"C:\Users\me\Drive");
+        assert!(same_path(reg, Path::new("C:/Users/me/Drive")));
+        assert!(same_path(reg, Path::new(r"c:\users\ME\Drive\")));
+        assert!(same_path(reg, Path::new(r"\\?\C:\Users\me\Drive")));
+        assert!(!same_path(reg, Path::new(r"C:\Users\me\Drive2")));
+    }
 }
 
 /// Icon shown in the navigation pane: the tray app's icon when it is installed next to us

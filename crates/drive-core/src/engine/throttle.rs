@@ -9,6 +9,7 @@ use tokio::time::Instant;
 use futures::StreamExt;
 
 use crate::remote::ByteStream;
+use crate::remote::resumable::{Meter, Progress};
 
 /// Token bucket shared by all transfers in one direction. A rate of 0 means unlimited.
 pub struct Throttle {
@@ -53,19 +54,31 @@ impl Throttle {
     }
 }
 
-/// Wraps a stream so every chunk is counted in `done` and passes through `throttle`.
-pub fn metered(stream: ByteStream, done: Arc<AtomicU64>, throttle: Arc<Throttle>) -> ByteStream {
+/// Wraps a stream so every chunk is counted as progress and passes through `throttle`.
+pub fn metered(stream: ByteStream, progress: Arc<Progress>, throttle: Arc<Throttle>) -> ByteStream {
     Box::pin(stream.then(move |chunk| {
-        let done = done.clone();
+        let progress = progress.clone();
         let throttle = throttle.clone();
         async move {
             if let Ok(b) = &chunk {
                 throttle.consume(b.len()).await;
-                done.fetch_add(b.len() as u64, Ordering::Relaxed);
+                progress
+                    .confirmed
+                    .fetch_add(b.len() as u64, Ordering::Relaxed);
             }
             chunk
         }
     }))
+}
+
+/// Paces uploads through a [`Throttle`].
+pub struct ThrottleMeter(pub Arc<Throttle>);
+
+#[async_trait::async_trait]
+impl Meter for ThrottleMeter {
+    async fn consume(&self, bytes: usize) {
+        self.0.consume(bytes).await;
+    }
 }
 
 #[cfg(test)]

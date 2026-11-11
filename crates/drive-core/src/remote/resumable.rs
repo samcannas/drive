@@ -24,6 +24,9 @@ use super::{Remote, RemoteEntry, RemoteError, UploadBody};
 /// task.
 pub trait UploadSource: Send + Sync + 'static {
     fn len(&self) -> u64;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     /// Fills `buf` with the bytes at `offset`. Errors if fewer bytes are available.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()>;
 }
@@ -119,6 +122,17 @@ pub async fn read_range(
     })
     .await
     .map_err(io::Error::other)?
+}
+
+/// What a backend can tell about a saved upload session.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResumeInfo {
+    /// Bytes (of the backend's own source) the server has confirmed.
+    pub confirmed: u64,
+    pub total: u64,
+    /// The server already assembled the file under this id (it may even be committed): a
+    /// remote file with this id belongs to the pending upload.
+    pub assembled_id: Option<String>,
 }
 
 /// Per-layer resume state, persisted between attempts.

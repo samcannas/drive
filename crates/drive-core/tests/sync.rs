@@ -513,3 +513,254 @@ async fn safe_save_pattern() {
     assert_eq!(b.paths(), vec!["report.docx"]);
     assert_eq!(b.read("report.docx").await, b"v2");
 }
+
+// ---- Track 1: transfers ----------------------------------------------------------------
+
+use chrono::Timelike;
+use drive_core::engine::schedule::NightWindow;
+use drive_core::ipc::{TransferMode, TransferState};
+
+fn device_with(remote: Arc<dyn Remote>, cfg: EngineConfig, db: Arc<Db>) -> Device {
+    let engine = Engine::new(db, remote, cfg).unwrap();
+    let local = Arc::new(FakeLocal::default());
+    let _ = local.engine.set(Arc::downgrade(&engine));
+    engine.set_local(local.clone());
+    engine.start();
+    Device { engine, local }
+}
+
+fn retry_now(d: &Device) {
+    d.engine
+        .db()
+        .write(|tx| {
+            tx.execute("UPDATE node SET retry_at_ms = 0", [])
+                .map(|_| ())
+        })
+        .unwrap();
+    d.engine.sync_now();
+}
+
+async fn until(what: &str, mut f: impl FnMut() -> bool) {
+    for _ in 0..1000 {
+        if f() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for: {what}");
+}
+
+fn item(d: &Device, path: &str) -> Option<drive_core::ipc::TransferItem> {
+    d.engine
+        .transfers()
+        .items
+        .into_iter()
+        .find(|i| i.path == path)
+}
+
+fn big(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i * 7 % 253) as u8).collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn big_upload_continues_after_a_dropped_connection() {
+    let (mem, remote) = vault();
+    let a = device(remote.clone(), "A");
+    let data = big(1_000_000);
+    let enc = drive_core::crypt::encrypted_size(data.len() as u64);
+    mem.fail_upload_at(400_000);
+    a.write("movie.mp4", &data);
+    until("the upload to break off", || {
+        mem.received_bytes() >= 400_000
+    })
+    .await;
+    until("the failure to be recorded", || {
+        item(&a, "movie.mp4").is_some_and(|i| i.state == TransferState::Waiting)
+    })
+    .await;
+    let waiting = item(&a, "movie.mp4").unwrap();
+    assert!(
+        waiting.resumable && waiting.bytes_done >= 300_000,
+        "{waiting:?}"
+    );
+    retry_now(&a);
+    a.sync().await;
+    assert!(
+        mem.received_bytes() <= enc + 65_536,
+        "only the rest was sent: {} of {enc}",
+        mem.received_bytes()
+    );
+    let b = device(remote, "B");
+    b.sync().await;
+    assert_eq!(b.read("movie.mp4").await, data);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upload_picks_up_where_it_left_off_after_a_restart() {
+    let (mem, remote) = vault();
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("state.db");
+    let data = big(1_500_000);
+    let enc = drive_core::crypt::encrypted_size(data.len() as u64);
+    mem.set_chunk_delay(Duration::from_millis(15));
+    {
+        let a = device_with(
+            remote.clone(),
+            config("A"),
+            Arc::new(Db::open(&db_path).unwrap()),
+        );
+        a.write("big.iso", &data);
+        until("some progress", || {
+            item(&a, "big.iso").is_some_and(|i| i.bytes_done > 400_000)
+        })
+        .await;
+        // The app quits (or crashes) mid-upload.
+        a.engine.shutdown();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(mem.received_bytes() < enc);
+    mem.set_chunk_delay(Duration::ZERO);
+    // A new process: same database, same cloud.
+    let a = device_with(
+        remote.clone(),
+        config("A"),
+        Arc::new(Db::open(&db_path).unwrap()),
+    );
+    // The local file is still there (the fake file system doesn't survive the "restart").
+    a.local.fs.lock().unwrap().insert(
+        "big.iso".into(),
+        Entry::File {
+            data: Some(data.clone()),
+            size: data.len() as u64,
+        },
+    );
+    let queued = item(&a, "big.iso").expect("listed after restart");
+    assert!(
+        queued.resumable && queued.bytes_done >= 400_000,
+        "{queued:?}"
+    );
+    a.sync().await;
+    assert!(
+        mem.received_bytes() <= enc + 65_536,
+        "{} of {enc} bytes",
+        mem.received_bytes()
+    );
+    let b = device(remote, "B");
+    b.sync().await;
+    assert_eq!(b.read("big.iso").await, data);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pausing_keeps_progress_and_resuming_finishes() {
+    let (mem, remote) = vault();
+    mem.set_chunk_delay(Duration::from_millis(15));
+    let a = device(remote.clone(), "A");
+    let data = big(1_200_000);
+    let enc = drive_core::crypt::encrypted_size(data.len() as u64);
+    a.write("talk.mkv", &data);
+    until("uploading", || {
+        item(&a, "talk.mkv")
+            .is_some_and(|i| i.state == TransferState::Active && i.bytes_done > 200_000)
+    })
+    .await;
+    let id = item(&a, "talk.mkv").unwrap().id;
+    a.engine
+        .set_transfer_mode(id, TransferMode::Paused)
+        .unwrap();
+    until("paused", || {
+        item(&a, "talk.mkv").is_some_and(|i| i.state == TransferState::Paused)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let paused = item(&a, "talk.mkv").unwrap();
+    assert_eq!(paused.mode, TransferMode::Paused);
+    assert!(
+        paused.resumable && paused.bytes_done > 200_000,
+        "{paused:?}"
+    );
+    let sent = mem.received_bytes();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(mem.received_bytes(), sent, "nothing sent while paused");
+    mem.set_chunk_delay(Duration::ZERO);
+    a.engine.set_transfer_mode(id, TransferMode::Auto).unwrap();
+    a.sync().await;
+    assert!(mem.received_bytes() <= enc + 65_536);
+    assert!(item(&a, "talk.mkv").is_none(), "done");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn large_files_wait_for_the_night_window_unless_forced() {
+    let (mem, remote) = vault();
+    let now = chrono::Local::now();
+    let start = ((now.time().hour() + 2) % 24) as u16 * 60;
+    let mut cfg = config("A");
+    cfg.night = Some(NightWindow {
+        start,
+        end: (start + 60) % (24 * 60),
+    });
+    cfg.night_min_bytes = 500_000;
+    let a = device_with(remote.clone(), cfg, Arc::new(Db::open_in_memory().unwrap()));
+    a.write("small.txt", b"hello");
+    a.write("huge.mov", &big(800_000));
+    until("the small file to upload", || {
+        mem.snapshot().contains_key("small.txt") || item(&a, "small.txt").is_none()
+    })
+    .await;
+    let list = a.engine.transfers();
+    let huge = list
+        .items
+        .iter()
+        .find(|i| i.path == "huge.mov")
+        .expect("listed");
+    assert_eq!(huge.state, TransferState::Scheduled);
+    assert!(
+        huge.reason.as_deref().unwrap_or("").contains("tonight"),
+        "{huge:?}"
+    );
+    assert!(list.night_window_opens_ms.is_some());
+    assert_eq!(
+        list.upload_remaining_bytes, 0,
+        "held uploads don't count toward the ETA"
+    );
+    a.engine
+        .set_transfer_mode(huge.id, TransferMode::Now)
+        .unwrap();
+    a.sync().await;
+    assert!(item(&a, "huge.mov").is_none());
+    // The mode resets after the upload.
+    assert_eq!(
+        a.engine
+            .node_by_path("huge.mov")
+            .unwrap()
+            .unwrap()
+            .upload_mode,
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_list_explains_waits_and_estimates() {
+    let (mem, remote) = vault();
+    let a = device(remote.clone(), "A");
+    mem.set_offline(true);
+    a.write("notes.txt", b"x");
+    until("an offline reason", || {
+        item(&a, "notes.txt")
+            .and_then(|i| i.reason)
+            .is_some_and(|r| r.contains("Offline") || r.contains("Connection"))
+    })
+    .await;
+    mem.set_offline(false);
+    retry_now(&a);
+    a.sync().await;
+    // A slow upload (about 3 s) gets a rate and an ETA.
+    mem.set_chunk_delay(Duration::from_millis(200));
+    a.write("slow.bin", &big(1_000_000));
+    until("a rate and an ETA", || {
+        let l = a.engine.transfers();
+        l.upload_rate_bps > 0 && l.upload_eta_secs.is_some()
+    })
+    .await;
+    mem.set_chunk_delay(Duration::ZERO);
+    a.sync().await;
+}

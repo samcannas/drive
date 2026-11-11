@@ -493,6 +493,11 @@ impl<R: Remote> Remote for CryptRemote<R> {
     fn resumable_min_size(&self) -> Option<u64> {
         self.inner.resumable_min_size()
     }
+
+    fn resume_info(&self, state: &ResumeState) -> Option<super::resumable::ResumeInfo> {
+        // Inner bytes are ciphertext; the caller scales to its own sizes.
+        self.inner.resume_info(state)
+    }
 }
 
 #[cfg(test)]

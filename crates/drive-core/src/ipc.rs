@@ -20,7 +20,16 @@ pub fn socket_name() -> String {
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect();
-    format!("drive-{user}.sock")
+    // A separate instance (`DRIVE_HOME`, used for development and tests) gets its own socket,
+    // so it never talks to — or is blocked by — the real Drive of the same user.
+    match std::env::var("DRIVE_HOME") {
+        Ok(home) if !home.is_empty() => {
+            use sha2::Digest as _;
+            let h = sha2::Sha256::digest(home.as_bytes());
+            format!("drive-{user}-{}.sock", hex::encode(&h[..4]))
+        }
+        _ => format!("drive-{user}.sock"),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
