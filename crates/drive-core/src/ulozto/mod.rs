@@ -115,6 +115,9 @@ pub struct UlozClient {
     cfg: UlozConfig,
     api: reqwest::Client,
     cdn: reqwest::Client,
+    /// Uploads: no read timeout (the server says nothing until the whole body has arrived,
+    /// which takes minutes for big files); a progress watchdog guards against stalls instead.
+    upload: reqwest::Client,
     session: Mutex<Option<Session>>,
     pacer: Pacer,
     links: std::sync::Mutex<HashMap<String, (String, std::time::Instant)>>,
@@ -131,6 +134,21 @@ enum CallError {
 fn net(e: reqwest::Error) -> RemoteError {
     RemoteError::Network(e.to_string())
 }
+
+/// Errors during a long transfer: only failing to connect means we're offline; a transfer
+/// cut off midway is a transient failure to retry.
+fn transfer_err(e: reqwest::Error) -> RemoteError {
+    if e.is_connect() {
+        RemoteError::Network(e.to_string())
+    } else {
+        RemoteError::Server(format!("transfer interrupted: {e}"))
+    }
+}
+
+/// An upload fails if no bytes go out for this long…
+const UPLOAD_STALL: Duration = Duration::from_secs(120);
+/// …or if the server hasn't answered this long after the last byte (it hashes big files).
+const UPLOAD_RESPONSE_WAIT: Duration = Duration::from_secs(600);
 
 fn map_status(status: StatusCode, err: &api::ApiError, body: &str) -> RemoteError {
     let msg = if err.message.is_empty() {
@@ -174,10 +192,18 @@ impl UlozClient {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(net)?;
+        let upload = reqwest::Client::builder()
+            .user_agent(USER_AGENT)
+            .connect_timeout(Duration::from_secs(20))
+            .tcp_keepalive(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(net)?;
         Ok(Self {
             cfg,
             api,
             cdn,
+            upload,
             session: Mutex::new(None),
             pacer: Pacer::new(4),
             links: std::sync::Mutex::new(HashMap::new()),
@@ -707,15 +733,33 @@ impl UlozClient {
         .map_err(net)?;
         let form = reqwest::multipart::Form::new().part("file", part);
         let url = format!("{}&batch_file_id=1&is_porn=false", link.upload_url);
-        let resp = self
-            .cdn
-            .post(&url)
-            .multipart(form)
-            .send()
-            .await
-            .map_err(net)?;
+        let send = self.upload.post(&url).multipart(form).send();
+        tokio::pin!(send);
+        let (mut seen, mut since) = (0u64, std::time::Instant::now());
+        let resp = loop {
+            tokio::select! {
+                r = &mut send => break r.map_err(transfer_err)?,
+                _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                    let sent = counted.load(Ordering::Relaxed);
+                    if sent != seen {
+                        (seen, since) = (sent, std::time::Instant::now());
+                    }
+                    let limit = if sent >= body.size { UPLOAD_RESPONSE_WAIT } else { UPLOAD_STALL };
+                    if since.elapsed() > limit {
+                        return Err(RemoteError::Server(format!(
+                            "upload stalled ({sent} of {} bytes sent, no progress for {} s)",
+                            body.size,
+                            limit.as_secs()
+                        )));
+                    }
+                }
+            }
+        };
         let status = resp.status();
-        let text = resp.text().await.map_err(net)?;
+        let text = tokio::time::timeout(UPLOAD_RESPONSE_WAIT, resp.text())
+            .await
+            .map_err(|_| RemoteError::Server("no response after the upload finished".into()))?
+            .map_err(transfer_err)?;
         if !status.is_success() {
             let err: api::ApiError = serde_json::from_str(&text).unwrap_or_default();
             return Err(map_status(status, &err, &text));
@@ -890,7 +934,7 @@ impl UlozClient {
                     .header("X-Auth-Token", &self.cfg.app_token)
                     .header("X-User-Token", &session.token);
             }
-            let r = req.send().await.map_err(net)?;
+            let r = req.send().await.map_err(transfer_err)?;
             if r.status().is_redirection() {
                 let loc = r
                     .headers()
