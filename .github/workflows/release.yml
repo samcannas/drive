@@ -68,7 +68,7 @@ jobs:
         run: |
           exe="target/release/bundle/nsis/Drive_${VERSION}_x64-setup.exe"
           # The installer must carry the service next to the app.
-          7z l "$exe" | tr -d '' > nsis-contents.txt
+          7z l "$exe" | tr -d '\r' > nsis-contents.txt
           if ! grep -qiE '(^| )drive\.exe$' nsis-contents.txt || ! grep -qiE '(^| )drive-app\.exe$' nsis-contents.txt; then
             cat nsis-contents.txt
             echo "drive.exe or drive-app.exe is missing from the installer" >&2
