@@ -7,6 +7,9 @@
 //! Optional knobs (debug builds only):
 //! * `DRIVE_UI_MOCK=onboarding` starts in the not-set-up state.
 //! * `DRIVE_UI_MOCK_MASS_DELETE=1` starts with a pending mass-delete confirmation.
+//! * `DRIVE_UI_MOCK_TRANSFERS=1` starts with a long transfer list: one item in every state,
+//!   a paused upload, large files held for the overnight window and a partly done one that
+//!   resumes. Progress moves, and items finish and come back.
 //! * `DRIVE_UI_MOCK_UPDATE=1` offers a made-up update (see `updater`); installing it only
 //!   pretends. Works with or without the mock service.
 
@@ -15,7 +18,8 @@ use std::time::Duration;
 
 use drive_core::ipc::{
     AccountCheck, Activity, ActivityKind, Call, ErrorCode, Event, Hello, Issue, IssueAction,
-    IssueKind, RecoveryKit, RpcError, Settings, SetupResult, Status, SyncState,
+    IssueKind, RecoveryKit, RpcError, Settings, SetupResult, Status, SyncState, TransferDirection,
+    TransferItem, TransferList, TransferMode, TransferState,
 };
 use rand::Rng;
 use serde_json::{Value, json};
@@ -28,6 +32,11 @@ const MB: u64 = 1024 * 1024;
 pub fn forced() -> bool {
     cfg!(debug_assertions)
         && std::env::var("DRIVE_UI_MOCK").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Whether to start with the long transfer list. Always false in release builds.
+pub fn transfers_forced() -> bool {
+    cfg!(debug_assertions) && std::env::var("DRIVE_UI_MOCK_TRANSFERS").is_ok_and(|v| v == "1")
 }
 
 /// Whether the update UI should be fed a made-up update. Always false in release builds.
@@ -47,6 +56,34 @@ struct State {
     pending_delete: Option<u32>,
     /// Size of the batch currently "transferring".
     batch: Vec<(&'static str, u64, bool)>,
+    /// The long transfer list (`DRIVE_UI_MOCK_TRANSFERS=1`); replaces `batch` when set.
+    transfers: Option<Vec<MockTransfer>>,
+}
+
+#[derive(Clone)]
+struct MockTransfer {
+    id: i64,
+    path: &'static str,
+    direction: TransferDirection,
+    state: TransferState,
+    mode: TransferMode,
+    hold: Hold,
+    done: u64,
+    total: u64,
+    /// Bytes per second while active.
+    speed: u64,
+    resumable: bool,
+    /// Ticks left while preparing or verifying.
+    countdown: u32,
+    retry_at_ms: Option<i64>,
+}
+
+/// Why a waiting transfer can't start.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Hold {
+    None,
+    Locked,
+    Offline,
 }
 
 pub struct Mock {
@@ -162,11 +199,16 @@ impl Mock {
                 app_token_custom: false,
                 close_action: Default::default(),
                 auto_update: true,
+                night_uploads: transfers_forced(),
+                night_start: drive_core::ipc::default_night_start(),
+                night_end: drive_core::ipc::default_night_end(),
+                night_min_bytes: drive_core::ipc::default_night_min_bytes(),
             },
             activity,
             issues,
             pending_delete: mass.then_some(1_240),
             batch: Vec::new(),
+            transfers: transfers_forced().then(|| rich_transfers(now)),
         };
         let (events, _) = broadcast::channel(64);
         let mock = Arc::new(Self {
@@ -192,6 +234,10 @@ impl Mock {
         let _ = self.events.send(Event::Status(status_of(st)));
     }
 
+    fn emit_transfers(&self, st: &State) {
+        let _ = self.events.send(Event::Transfers(transfers_of(st)));
+    }
+
     /// Cycles between "syncing" (about 10 s) and "up to date" (about 12 s).
     fn tick(&self) {
         let mut st = self.state.lock().unwrap();
@@ -199,6 +245,12 @@ impl Mock {
             return;
         }
         st.tick += 1;
+        if st.transfers.is_some() {
+            self.tick_transfers(&mut st);
+            self.emit_status(&st);
+            self.emit_transfers(&st);
+            return;
+        }
         let phase = st.tick % 32;
         if phase == 1 {
             let mut rng = rand::thread_rng();
@@ -229,6 +281,88 @@ impl Mock {
         }
         if phase <= 15 {
             self.emit_status(&st);
+            self.emit_transfers(&st);
+        }
+    }
+
+    /// Moves the long transfer list along by one tick (0.7 s).
+    fn tick_transfers(&self, st: &mut State) {
+        let now = now_ms();
+        let mut rng = rand::thread_rng();
+        let mut finished = Vec::new();
+        for t in st.transfers.iter_mut().flatten() {
+            match t.state {
+                TransferState::Preparing | TransferState::Verifying => {
+                    t.countdown = t.countdown.saturating_sub(1);
+                    if t.countdown == 0 {
+                        if t.state == TransferState::Verifying {
+                            finished.push(t.id);
+                        } else {
+                            t.state = TransferState::Queued;
+                        }
+                    }
+                }
+                TransferState::Active => {
+                    let step = t.speed * 7 / 10 * rng.gen_range(80..=120) / 100;
+                    t.done = (t.done + step).min(t.total);
+                    if t.done == t.total {
+                        if t.direction == TransferDirection::Upload {
+                            t.state = TransferState::Verifying;
+                            t.countdown = 3;
+                        } else {
+                            finished.push(t.id);
+                        }
+                    }
+                }
+                TransferState::Waiting if t.hold == Hold::Offline => {
+                    if t.retry_at_ms.is_none_or(|at| at <= now) {
+                        t.retry_at_ms = Some(now + 30_000);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for id in finished {
+            let list = st.transfers.get_or_insert_default();
+            let Some(pos) = list.iter().position(|t| t.id == id) else {
+                continue;
+            };
+            let mut t = list.remove(pos);
+            st.next_id += 1;
+            let kind = match t.direction {
+                TransferDirection::Upload => ActivityKind::Uploaded,
+                TransferDirection::Download => ActivityKind::Downloaded,
+            };
+            let a = act(st.next_id, now, kind, t.path, t.total);
+            st.activity.insert(0, a.clone());
+            st.activity.truncate(50);
+            let _ = self.events.send(Event::Activity(a));
+            // The same file comes back as a new change, so the demo never runs dry.
+            t.id = st.next_id + 1000;
+            t.done = 0;
+            t.state = TransferState::Preparing;
+            t.countdown = 4;
+            st.transfers.get_or_insert_default().push(t);
+        }
+        // Two uploads and one download at a time, like a modest connection.
+        let list = st.transfers.get_or_insert_default();
+        for (dir, slots) in [
+            (TransferDirection::Upload, 2),
+            (TransferDirection::Download, 1),
+        ] {
+            let mut busy = list
+                .iter()
+                .filter(|t| t.direction == dir && moving(t.state))
+                .count();
+            for t in list.iter_mut() {
+                if busy >= slots {
+                    break;
+                }
+                if t.direction == dir && t.state == TransferState::Queued {
+                    t.state = TransferState::Active;
+                    busy += 1;
+                }
+            }
         }
     }
 
@@ -302,6 +436,19 @@ impl Mock {
                 if let Some(v) = p.auto_update { s.auto_update = v }
                 if let Some(v) = p.device_name { s.device_name = v }
                 if let Some(v) = p.app_token { s.app_token_custom = !v.is_empty() }
+                let start = p.night_start.as_deref().unwrap_or(&s.night_start);
+                let end = p.night_end.as_deref().unwrap_or(&s.night_end);
+                if parse_hhmm(start).is_none() || parse_hhmm(end).is_none() {
+                    return Err(err(ErrorCode::BadRequest, "Enter a time like 01:00."));
+                }
+                if start == end {
+                    return Err(err(ErrorCode::BadRequest, "Start and end can't be the same time. Change one of them."));
+                }
+                if let Some(v) = p.night_start { s.night_start = v }
+                if let Some(v) = p.night_end { s.night_end = v }
+                if let Some(v) = p.night_uploads { s.night_uploads = v }
+                if let Some(v) = p.night_min_bytes { s.night_min_bytes = v.max(MB) }
+                reschedule(&mut st);
                 json!(st.settings)
             }
             Call::RecentActivity { limit } => json!(st.activity.iter().take(limit as usize).collect::<Vec<_>>()),
@@ -337,6 +484,13 @@ impl Mock {
                 Value::Null
             }
             Call::Shutdown => Value::Null,
+            Call::Transfers => json!(transfers_of(&st)),
+            Call::SetTransferMode { id, mode } => {
+                set_transfer_mode(&mut st, id, mode)?;
+                self.emit_status(&st);
+                self.emit_transfers(&st);
+                Value::Null
+            }
         };
         Ok(v)
     }
@@ -396,15 +550,30 @@ fn status_of(st: &State) -> Status {
         };
     }
     let phase = st.tick % 32;
-    let syncing = !st.paused && (1..15).contains(&phase) && !st.batch.is_empty();
-    let total: u64 = st.batch.iter().map(|b| b.1).sum();
-    let done = if syncing { total * phase / 15 } else { 0 };
-    let up = st.batch.iter().filter(|b| b.2).count() as u32;
-    let down = st.batch.len() as u32 - up;
+    let (syncing, total, done, up, down) = if let Some(list) = &st.transfers {
+        let moving: Vec<_> = list.iter().filter(|t| moving(t.state)).collect();
+        let up = moving
+            .iter()
+            .filter(|t| t.direction == TransferDirection::Upload)
+            .count() as u32;
+        (
+            !st.paused && !moving.is_empty(),
+            moving.iter().map(|t| t.total).sum::<u64>(),
+            moving.iter().map(|t| t.done).sum::<u64>(),
+            up,
+            moving.len() as u32 - up,
+        )
+    } else {
+        let syncing = !st.paused && (1..15).contains(&phase) && !st.batch.is_empty();
+        let total: u64 = st.batch.iter().map(|b| b.1).sum();
+        let up = st.batch.iter().filter(|b| b.2).count() as u32;
+        let done = if syncing { total * phase / 15 } else { 0 };
+        (syncing, total, done, up, st.batch.len() as u32 - up)
+    };
     let (state, headline) = if st.paused {
         (SyncState::Paused, "Syncing paused".to_string())
     } else if syncing {
-        let n = st.batch.len();
+        let n = (up + down) as usize;
         (
             SyncState::Syncing,
             format!("Syncing {n} {}…", if n == 1 { "file" } else { "files" }),
@@ -419,7 +588,7 @@ fn status_of(st: &State) -> Status {
         folder: Some(st.settings.folder.clone()),
         uploading: if syncing { up } else { 0 },
         downloading: if syncing { down } else { 0 },
-        pending: if syncing { st.batch.len() as u32 } else { 0 },
+        pending: if syncing { up + down } else { 0 },
         transfer_bytes_total: if syncing { total } else { 0 },
         transfer_bytes_done: done,
         issues: st.issues.len() as u32,
@@ -430,5 +599,323 @@ fn status_of(st: &State) -> Status {
         cloud_files: 23_418,
         last_sync_ms: Some(now_ms() - 40_000),
         pending_delete_confirmation: st.pending_delete,
+    }
+}
+
+// ---- transfers ---------------------------------------------------------------------------
+
+/// Preparing, sending or verifying: holds a transfer slot.
+fn moving(s: TransferState) -> bool {
+    matches!(
+        s,
+        TransferState::Preparing | TransferState::Active | TransferState::Verifying
+    )
+}
+
+/// Sort order of the list: moving, then waiting, then held.
+fn rank(s: TransferState) -> u8 {
+    match s {
+        TransferState::Active | TransferState::Verifying | TransferState::Preparing => 0,
+        TransferState::Queued | TransferState::Waiting => 1,
+        TransferState::Paused | TransferState::Scheduled => 2,
+    }
+}
+
+fn parse_hhmm(s: &str) -> Option<(i64, i64)> {
+    let (h, m) = s.split_once(':')?;
+    let (h, m): (i64, i64) = (h.parse().ok()?, m.parse().ok()?);
+    ((0..24).contains(&h) && (0..60).contains(&m) && s.len() == 5).then_some((h, m))
+}
+
+/// The next time the overnight window opens. The mock has no time zone database, so this is
+/// UTC; the rows' reasons quote the configured time, as the real service does.
+fn next_window_ms(settings: &Settings, now: i64) -> Option<i64> {
+    const DAY: i64 = 86_400_000;
+    let (h, m) = parse_hhmm(&settings.night_start)?;
+    let mut t = now - now.rem_euclid(DAY) + (h * 60 + m) * 60_000;
+    if t <= now {
+        t += DAY;
+    }
+    Some(t)
+}
+
+fn upload(
+    id: i64,
+    path: &'static str,
+    total: u64,
+    done: u64,
+    state: TransferState,
+) -> MockTransfer {
+    MockTransfer {
+        id,
+        path,
+        direction: TransferDirection::Upload,
+        state,
+        mode: TransferMode::Auto,
+        hold: Hold::None,
+        done,
+        total,
+        speed: 2 * MB + 100 * 1024,
+        resumable: total > 8 * MB,
+        countdown: 4,
+        retry_at_ms: None,
+    }
+}
+
+fn rich_transfers(now: i64) -> Vec<MockTransfer> {
+    use TransferState::*;
+    vec![
+        upload(
+            201,
+            "Videos/2026/Birthday party at the lake house (full length, 4K).mp4",
+            1_640 * MB,
+            45 * MB,
+            Active,
+        ),
+        MockTransfer {
+            speed: 900 * 1024,
+            ..upload(
+                202,
+                "Photos/2026/Lisbon/IMG_4822.HEIC",
+                3 * MB + 200 * 1024,
+                0,
+                Active,
+            )
+        },
+        MockTransfer {
+            direction: TransferDirection::Download,
+            speed: 6 * MB,
+            ..upload(
+                203,
+                "Projects/drive/Design review.pdf",
+                84 * MB,
+                30 * MB,
+                Active,
+            )
+        },
+        MockTransfer {
+            countdown: 6,
+            ..upload(
+                204,
+                "Documents/Taxes/2025 return.pdf",
+                640 * 1024,
+                640 * 1024,
+                Verifying,
+            )
+        },
+        MockTransfer {
+            countdown: 8,
+            ..upload(
+                205,
+                "Documents/Scans/Passport and ID card.pdf",
+                2 * MB,
+                0,
+                Preparing,
+            )
+        },
+        upload(
+            206,
+            "Music/Field recordings/Rain on tin roof.flac",
+            38 * MB,
+            0,
+            Queued,
+        ),
+        MockTransfer {
+            hold: Hold::Locked,
+            ..upload(207, "Documents/Budget 2026.xlsx", 84 * 1024, 0, Waiting)
+        },
+        MockTransfer {
+            hold: Hold::Offline,
+            retry_at_ms: Some(now + 25_000),
+            ..upload(
+                208,
+                "Projects/Garden/Site plan.dwg",
+                12 * MB,
+                5 * MB,
+                Waiting,
+            )
+        },
+        MockTransfer {
+            mode: TransferMode::Paused,
+            ..upload(
+                209,
+                "Backups/Laptop image 2026-11.vhdx",
+                48 * GB,
+                12 * GB + 400 * MB,
+                Paused,
+            )
+        },
+        upload(
+            210,
+            "Videos/Drone/Coast flight.mov",
+            3 * GB + 200 * MB,
+            0,
+            Scheduled,
+        ),
+        upload(
+            211,
+            "Videos/Drone/Harbor at dusk.mov",
+            2 * GB + 400 * MB,
+            600 * MB,
+            Scheduled,
+        ),
+    ]
+}
+
+fn waits_for_night(settings: &Settings, t: &MockTransfer) -> bool {
+    t.direction == TransferDirection::Upload
+        && match t.mode {
+            TransferMode::Tonight => true,
+            TransferMode::Auto => settings.night_uploads && t.total >= settings.night_min_bytes,
+            TransferMode::Paused | TransferMode::Now => false,
+        }
+}
+
+/// After a settings change: hold or release the uploads that follow the overnight setting.
+fn reschedule(st: &mut State) {
+    let settings = st.settings.clone();
+    for t in st.transfers.iter_mut().flatten() {
+        if t.mode != TransferMode::Auto {
+            continue;
+        }
+        let hold = waits_for_night(&settings, t);
+        if hold && matches!(t.state, TransferState::Queued | TransferState::Active) {
+            t.state = TransferState::Scheduled;
+        } else if !hold && t.state == TransferState::Scheduled {
+            t.state = TransferState::Queued;
+        }
+    }
+}
+
+fn set_transfer_mode(st: &mut State, id: i64, mode: TransferMode) -> Result<(), RpcError> {
+    let settings = st.settings.clone();
+    let Some(t) = st.transfers.iter_mut().flatten().find(|t| t.id == id) else {
+        return Err(err(
+            ErrorCode::NotFound,
+            "That transfer has already finished.",
+        ));
+    };
+    if t.direction == TransferDirection::Download {
+        return Err(err(
+            ErrorCode::BadRequest,
+            "Downloads can't be paused or scheduled one at a time.",
+        ));
+    }
+    t.mode = mode;
+    t.hold = Hold::None;
+    t.retry_at_ms = None;
+    t.state = match mode {
+        TransferMode::Paused => TransferState::Paused,
+        TransferMode::Now => TransferState::Active,
+        _ if waits_for_night(&settings, t) => TransferState::Scheduled,
+        _ => TransferState::Queued,
+    };
+    Ok(())
+}
+
+fn item_of(t: &MockTransfer, settings: &Settings, now: i64) -> TransferItem {
+    let rate = if t.state == TransferState::Active {
+        t.speed
+    } else {
+        0
+    };
+    let reason = match (t.state, t.hold) {
+        (TransferState::Waiting, Hold::Locked) => {
+            Some("Open in another app — Drive will upload it once it's closed".to_string())
+        }
+        (TransferState::Waiting, Hold::Offline) => {
+            let secs = ((t.retry_at_ms.unwrap_or(now) - now) / 1000).max(1);
+            Some(format!("Offline — retrying in {secs} s"))
+        }
+        (TransferState::Scheduled, _) => {
+            Some(format!("Waiting for tonight ({})", settings.night_start))
+        }
+        _ => None,
+    };
+    TransferItem {
+        id: t.id,
+        path: t.path.into(),
+        direction: t.direction,
+        state: t.state,
+        reason,
+        bytes_done: t.done,
+        bytes_total: t.total,
+        rate_bps: rate,
+        eta_secs: (rate > 0).then(|| (t.total - t.done) / rate),
+        retry_at_ms: t.retry_at_ms,
+        resumable: t.resumable,
+        mode: t.mode,
+    }
+}
+
+/// The short batch as a transfer list: everything moves at once, in step with the status.
+fn batch_items(st: &State) -> Vec<TransferItem> {
+    let phase = st.tick % 32;
+    if st.paused || !(1..15).contains(&phase) {
+        return Vec::new();
+    }
+    st.batch
+        .iter()
+        .enumerate()
+        .map(|(i, &(path, total, up))| {
+            let rate = total / 10 + 1;
+            let done = total * phase / 15;
+            TransferItem {
+                id: 100 + i as i64,
+                path: path.into(),
+                direction: if up {
+                    TransferDirection::Upload
+                } else {
+                    TransferDirection::Download
+                },
+                state: TransferState::Active,
+                reason: None,
+                bytes_done: done,
+                bytes_total: total,
+                rate_bps: rate,
+                eta_secs: Some((total - done) / rate),
+                retry_at_ms: None,
+                resumable: false,
+                mode: TransferMode::Auto,
+            }
+        })
+        .collect()
+}
+
+fn transfers_of(st: &State) -> TransferList {
+    let now = now_ms();
+    let mut items = match &st.transfers {
+        Some(list) => list.iter().map(|t| item_of(t, &st.settings, now)).collect(),
+        None => batch_items(st),
+    };
+    items.sort_by_key(|t| rank(t.state));
+    let uploads: Vec<&TransferItem> = items
+        .iter()
+        .filter(|t| t.direction == TransferDirection::Upload)
+        .collect();
+    let upload_rate: u64 = uploads.iter().map(|t| t.rate_bps).sum();
+    let remaining: u64 = uploads
+        .iter()
+        .filter(|t| rank(t.state) < 2)
+        .map(|t| t.bytes_total - t.bytes_done)
+        .sum();
+    let held = st.settings.night_uploads || uploads.iter().any(|t| t.mode == TransferMode::Tonight);
+    TransferList {
+        total_count: items.len() as u32,
+        upload_rate_bps: upload_rate,
+        download_rate_bps: items
+            .iter()
+            .filter(|t| t.direction == TransferDirection::Download)
+            .map(|t| t.rate_bps)
+            .sum(),
+        upload_remaining_bytes: remaining,
+        upload_eta_secs: (upload_rate > 0).then(|| remaining / upload_rate),
+        night_window_opens_ms: if held {
+            next_window_ms(&st.settings, now)
+        } else {
+            None
+        },
+        night_window_open: false,
+        items,
     }
 }

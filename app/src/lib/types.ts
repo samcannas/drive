@@ -36,12 +36,62 @@ export interface Settings {
   close_action: CloseAction;
   /** Download updates in the background and offer to restart; when off, only notify. */
   auto_update: boolean;
+  /** Hold uploads of large files until the overnight window. */
+  night_uploads: boolean;
+  /** Window start and end, local time, "HH:MM". The end may be earlier than the start (wraps past midnight). */
+  night_start: string;
+  night_end: string;
+  /** Files at least this large wait for the window when `night_uploads` is on. */
+  night_min_bytes: number;
 }
 
 /** What the window's close (X) button does: hide to the tray, or quit Drive. */
 export type CloseAction = "minimize" | "quit";
 
 export type SettingsPatch = Partial<Omit<Settings, "folder" | "app_token_custom">> & { app_token?: string };
+
+export type TransferDirection = "upload" | "download";
+
+/** What a transfer is doing right now (ipc `TransferState`). */
+export type TransferState = "preparing" | "active" | "verifying" | "queued" | "waiting" | "paused" | "scheduled";
+
+/** The user's choice for one upload: follow settings, paused, wait for tonight, or go now. */
+export type TransferMode = "auto" | "paused" | "tonight" | "now";
+
+export interface TransferItem {
+  /** Stable id for actions (the file's node id). */
+  id: number;
+  /** Relative to the Drive folder, `/`-separated. */
+  path: string;
+  direction: TransferDirection;
+  state: TransferState;
+  /** Plain-language explanation from the service for waiting / scheduled (and a hint for others). */
+  reason: string | null;
+  bytes_done: number;
+  bytes_total: number;
+  rate_bps: number;
+  eta_secs: number | null;
+  /** Unix ms of the next automatic retry. */
+  retry_at_ms: number | null;
+  /** Progress is kept if Drive restarts or the connection drops. */
+  resumable: boolean;
+  mode: TransferMode;
+}
+
+export interface TransferList {
+  /** Active first, then queued/waiting, then paused/scheduled; at most 200 entries. */
+  items: TransferItem[];
+  /** Total number of transfers (may exceed `items.length`). */
+  total_count: number;
+  upload_rate_bps: number;
+  download_rate_bps: number;
+  /** Bytes still to upload for everything that isn't paused or scheduled. */
+  upload_remaining_bytes: number;
+  upload_eta_secs: number | null;
+  /** Unix ms when the overnight window next opens (night uploads on and the window closed). */
+  night_window_opens_ms: number | null;
+  night_window_open: boolean;
+}
 
 export type ActivityKind =
   | "uploaded"

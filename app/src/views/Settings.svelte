@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import { api, closeWindow, env, errorOf } from "../lib/api";
   import { connect, drive, updateVersion } from "../lib/drive.svelte";
-  import { bytes, GB, plural, relative } from "../lib/format";
+  import { bytes, clockOf, GB, plural, relative } from "../lib/format";
   import Icon, { type IconName } from "../lib/Icon.svelte";
   import ReleaseNotes from "../lib/ReleaseNotes.svelte";
   import type { AppInfo, SettingsPatch } from "../lib/types";
@@ -87,6 +87,31 @@
     ["download_limit_kbps", "Download speed"],
   ] as const;
   let syncRequested = $state(false);
+
+  // Large uploads overnight
+  const MB = 1024 ** 2;
+  const NIGHT_SIZES = [100 * MB, 200 * MB, 500 * MB, GB, 2 * GB];
+  let nightError = $state<string | null>(null);
+  let nightErrorField = $state<"night_start" | "night_end" | null>(null);
+
+  async function saveNight(patch: SettingsPatch, label: string, field: "night_start" | "night_end" | null = null) {
+    nightError = null;
+    nightErrorField = null;
+    if (field && !patch[field]) {
+      nightError = `Enter ${field === "night_start" ? "a start" : "an end"} time, like 01:00.`;
+      nightErrorField = field;
+      return;
+    }
+    try {
+      drive.settings = await api.updateSettings(patch);
+      announce = "";
+      queueMicrotask(() => (announce = label));
+    } catch (e) {
+      // The service checks the times; its message says what to change.
+      nightError = errorOf(e).message;
+      nightErrorField = field;
+    }
+  }
 
   function limitValue(kbps: number) {
     return kbps === 0 ? "" : String(kbps);
@@ -615,6 +640,94 @@
         </div>
         <p class="caption secondary" role="status">{syncRequested ? "Checking uloz.to for changes…" : ""}</p>
       </div>
+
+      <section class="group" aria-labelledby="night-title">
+        <h2 id="night-title" class="body-strong group-title">Large uploads overnight</h2>
+        <label class="card setting">
+          <span class="setting-text">
+            <span id="night-label">Upload large files overnight</span>
+            <span class="caption secondary" id="night-desc">
+              Files of {bytes(s.night_min_bytes)} or more upload between {clockOf(s.night_start)} and {clockOf(s.night_end)}, so
+              they don't slow your connection during the day. You can still upload one right away from the tray.
+            </span>
+          </span>
+          <input
+            type="checkbox"
+            role="switch"
+            class="switch"
+            aria-labelledby="night-label"
+            aria-describedby="night-desc"
+            checked={s.night_uploads}
+            onchange={(e) =>
+              saveNight(
+                { night_uploads: e.currentTarget.checked },
+                e.currentTarget.checked ? "Large files upload overnight" : "Large files upload right away",
+              )}
+          />
+        </label>
+
+        {#if s.night_uploads}
+          <div class="card setting night-window">
+            <div class="setting-text">
+              <p id="night-window-label">Upload window</p>
+              {#if s.night_end < s.night_start}
+                <p class="caption secondary" id="night-window-hint">Ends the next morning.</p>
+              {/if}
+            </div>
+            <div class="limit" role="group" aria-labelledby="night-window-label">
+              <label class="time-label" for="night-start">From</label>
+              <input
+                id="night-start"
+                class="input time"
+                type="time"
+                required
+                value={s.night_start}
+                aria-invalid={nightErrorField === "night_start" ? "true" : undefined}
+                aria-describedby={nightErrorField === "night_start" ? "night-error" : undefined}
+                onchange={(e) => saveNight({ night_start: e.currentTarget.value }, "Start time saved", "night_start")}
+              />
+              <label class="time-label" for="night-end">to</label>
+              <input
+                id="night-end"
+                class="input time"
+                type="time"
+                required
+                value={s.night_end}
+                aria-invalid={nightErrorField === "night_end" ? "true" : undefined}
+                aria-describedby={nightErrorField === "night_end" ? "night-error" : s.night_end < s.night_start ? "night-window-hint" : undefined}
+                onchange={(e) => saveNight({ night_end: e.currentTarget.value }, "End time saved", "night_end")}
+              />
+            </div>
+            {#if nightError}
+              <p class="error-text night-error" id="night-error" role="alert"><Icon name="alert" size={14} />{nightError}</p>
+            {/if}
+          </div>
+
+          <div class="card setting">
+            <div class="setting-text">
+              <label for="night-min">File size</label>
+              <p class="caption secondary" id="night-min-hint">Files this size or bigger wait for the upload window.</p>
+            </div>
+            <select
+              id="night-min"
+              class="input narrow"
+              value={String(s.night_min_bytes)}
+              aria-describedby="night-min-hint"
+              onchange={(e) =>
+                saveNight({ night_min_bytes: Number(e.currentTarget.value) }, `Files of ${bytes(Number(e.currentTarget.value))} or more wait for the window`)}
+            >
+              {#if !NIGHT_SIZES.includes(s.night_min_bytes)}
+                <option value={String(s.night_min_bytes)}>{bytes(s.night_min_bytes)}</option>
+              {/if}
+              {#each NIGHT_SIZES as n}
+                <option value={String(n)}>{bytes(n)}</option>
+              {/each}
+            </select>
+          </div>
+        {:else if nightError}
+          <p class="error-text" role="alert"><Icon name="alert" size={14} />{nightError}</p>
+        {/if}
+      </section>
     {:else if section === "account"}
       <div class="group">
         <div class="card setting">
@@ -796,6 +909,22 @@
     display: grid;
     gap: var(--s1);
     max-width: 720px;
+  }
+  .group-title {
+    margin: var(--s4) var(--s1) var(--s2);
+  }
+  .night-window {
+    flex-wrap: wrap;
+  }
+  .night-error {
+    flex-basis: 100%;
+  }
+  .time-label {
+    color: var(--text-2);
+  }
+  .input.time {
+    width: auto;
+    min-width: 104px;
   }
   .group > .callout {
     margin-block: var(--s2) 0;

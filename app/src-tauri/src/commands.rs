@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use drive_core::ipc::{
     AccountCheck, AccountCredentials, Activity, Call, Issue, IssueAction, RecoveryKit, Settings,
-    SettingsPatch, SetupRequest, SetupResult, Status,
+    SettingsPatch, SetupRequest, SetupResult, Status, TransferList, TransferMode,
 };
 use serde::Serialize;
 use tauri::{AppHandle, State};
@@ -88,6 +88,21 @@ pub async fn resolve_issue(svc: Svc<'_>, id: i64, action: IssueAction) -> Res<()
     svc.call_value(Call::ResolveIssue { id, action }).await?;
     svc.refresh_status().await;
     Ok(())
+}
+
+/// Every upload and download that is running, queued or held.
+#[tauri::command]
+pub async fn transfers(svc: Svc<'_>) -> Res<TransferList> {
+    svc.call(Call::Transfers).await
+}
+
+/// Pause, resume (`auto`), defer to tonight or force one upload. Returns the new list so the
+/// popover can show the change right away.
+#[tauri::command]
+pub async fn set_transfer_mode(svc: Svc<'_>, id: i64, mode: TransferMode) -> Res<TransferList> {
+    svc.call_value(Call::SetTransferMode { id, mode }).await?;
+    svc.refresh_status().await;
+    svc.call(Call::Transfers).await
 }
 
 #[tauri::command]

@@ -47,6 +47,12 @@
     eye: p("M2.75 10S5.5 4.75 10 4.75 17.25 10 17.25 10 14.5 15.25 10 15.25 2.75 10 2.75 10Z") + '<circle cx="10" cy="10" r="2.25"/>',
     "eye-off": p("M2.75 10S5.5 4.75 10 4.75 17.25 10 17.25 10 14.5 15.25 10 15.25 2.75 10 2.75 10Z") + p("M3.5 3.5l13 13"),
     key: '<circle cx="7" cy="12.5" r="3"/>' + p("M9.2 10.3 15.5 4M13.25 6.25l1.75 1.75M11.75 7.75l1.25 1.25"),
+    clock: '<circle cx="10" cy="10" r="7"/>' + p("M10 6.5V10l2.5 1.75"),
+    moon: p("M15.5 12.4A6.25 6.25 0 0 1 7.6 4.5a6.25 6.25 0 1 0 7.9 7.9Z"),
+    more:
+      '<circle cx="5" cy="10" r="1.25" fill="currentColor" stroke="none"/>' +
+      '<circle cx="10" cy="10" r="1.25" fill="currentColor" stroke="none"/>' +
+      '<circle cx="15" cy="10" r="1.25" fill="currentColor" stroke="none"/>',
   } as const;
 
   export type IconName = keyof typeof ICONS;

@@ -13,11 +13,14 @@ pnpm tauri dev           # the real app (Rust backend)
 ```
 
 Browser preview parameters: `?view=popover|settings|onboarding`, `&theme=light|dark`,
-`&scenario=onboarding|massdelete|offline|signedout|paused|error|unavailable|idle`.
+`&scenario=onboarding|massdelete|offline|signedout|paused|error|unavailable|idle`, and
+`transfers|transfers-night|transfers-paused` for the transfer list (every state, uploads held for
+tonight, paused uploads).
 
 The Rust backend falls back to a mock service when `DRIVE_UI_MOCK=1` is set, or in debug
 builds when the service can't be reached. `DRIVE_UI_MOCK=onboarding` starts not set up;
-`DRIVE_UI_MOCK_MASS_DELETE=1` adds a pending mass-delete confirmation. Release builds never
+`DRIVE_UI_MOCK_MASS_DELETE=1` adds a pending mass-delete confirmation;
+`DRIVE_UI_MOCK_TRANSFERS=1` starts with a long transfer list (one item in every state). Release builds never
 use the mock.
 
 ## Sidecar

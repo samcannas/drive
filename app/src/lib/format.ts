@@ -50,3 +50,50 @@ export function dirname(path: string): string {
 }
 
 export const GB = 1024 ** 3;
+
+/** 2_200_000 → "2.1 MB/s". */
+export function rate(bps: number): string {
+  return `${bytes(bps)}/s`;
+}
+
+const num = new Intl.NumberFormat(locale);
+
+/**
+ * Time left, rounded the way people say it: "less than a minute", "12 min", "1 h 10 min",
+ * "2 days". With `about`, estimates over a minute read "about 25 min".
+ */
+export function duration(secs: number, opts: { about?: boolean } = {}): string {
+  if (secs < 60) return "less than a minute";
+  const prefix = opts.about ? "about " : "";
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return `${prefix}${num.format(mins)} min`;
+  if (mins < 48 * 60) {
+    // Past an hour, five-minute steps are as precise as the estimate is.
+    const step = mins < 10 * 60 ? 5 : 60;
+    const rounded = Math.round(mins / step) * step;
+    const h = Math.floor(rounded / 60);
+    const m = rounded % 60;
+    return `${prefix}${num.format(h)} h${m ? ` ${num.format(m)} min` : ""}`;
+  }
+  return `${prefix}${plural(Math.round(mins / (24 * 60)), "day", "days")}`;
+}
+
+const clockFmt = new Intl.DateTimeFormat(locale, { hour: "numeric", minute: "2-digit" });
+
+/** A wall-clock time in the user's format: 1 AM → "01:00" or "1:00 AM". */
+export function clock(ms: number): string {
+  return clockFmt.format(ms);
+}
+
+/** "01:00" (a settings value) → the same time in the user's format. */
+export function clockOf(hhmm: string): string {
+  const [h, m] = hhmm.split(":").map(Number);
+  const d = new Date(2000, 0, 1, h || 0, m || 0);
+  return clockFmt.format(d);
+}
+
+/** When the overnight window opens, as people say it: "Waiting for tonight (01:00)" or "Waiting until 14:00". */
+export function waitingForWindow(opensMs: number): string {
+  const h = new Date(opensMs).getHours();
+  return h >= 18 || h < 6 ? `Waiting for tonight (${clock(opensMs)})` : `Waiting until ${clock(opensMs)}`;
+}

@@ -1,21 +1,30 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
   import { api, env, errorOf, startDragging } from "../lib/api";
-  import { connect, drive, refreshIssues } from "../lib/drive.svelte";
+  import { connect, drive, refreshIssues, refreshTransfers } from "../lib/drive.svelte";
   import { basename, bytes, count, dirname, plural, relative } from "../lib/format";
   import Icon from "../lib/Icon.svelte";
   import StateBadge from "../lib/StateBadge.svelte";
+  import TransferRow from "../lib/TransferRow.svelte";
+  import { ACTION_MODE, actionDone, groupsOf, ordered, summarize, type RowAction } from "../lib/transfers";
   import UpdateButton from "../lib/UpdateButton.svelte";
   import { ACTION_LABEL, ACTIVITY, ISSUE_TITLE, stateVisual } from "../lib/status";
-  import type { Issue, IssueAction } from "../lib/types";
+  import type { Issue, IssueAction, TransferItem } from "../lib/types";
 
   const flyout = env().platform === "windows";
 
-  let panel = $state<"home" | "issues">("home");
+  let panel = $state<"home" | "issues" | "transfers">("home");
   let busy = $state<string | null>(null);
   let actionError = $state<string | null>(null);
   let issuesHeading = $state<HTMLHeadingElement>();
   let issuesButton = $state<HTMLButtonElement>();
+  let transfersHeading = $state<HTMLHeadingElement>();
+  let transfersButton = $state<HTMLButtonElement>();
+  let transfersTitle = $state<HTMLHeadingElement>();
+  /** Polite announcement after a transfer action (the row itself changes silently). */
+  let announce = $state("");
+  /** Shown as rows on the home panel; the rest is behind "Show all". */
+  const ROWS = 3;
 
   const status = $derived(drive.status);
   const connected = $derived(drive.connection.state === "connected");
@@ -26,14 +35,25 @@
   const massDelete = $derived(drive.issues.find((i) => i.kind === "mass_delete") ?? null);
   const issueCount = $derived(status?.issues ?? drive.issues.length);
   const transferring = $derived(status !== null && status.uploading + status.downloading > 0);
+  const transfers = $derived(drive.transfers);
+  const device = flyout ? "PC" : "computer";
+  const fileManager = flyout ? "File Explorer" : "the file manager";
+  const summary = $derived(transfers && transfers.items.length ? summarize(transfers, device) : null);
+  // Ticks every second while something waits to retry, so its countdown stays honest.
+  let clock = $state(Date.now());
+  $effect(() => {
+    if (!transfers?.items.some((t) => t.retry_at_ms)) return;
+    const t = setInterval(() => (clock = Date.now()), 1000);
+    return () => clearInterval(t);
+  });
 
   onMount(() => {
-    connect({ activity: true, issues: true, settings: true });
+    connect({ activity: true, issues: true, settings: true, transfers: true });
     if (flyout) {
       const onKey = (e: KeyboardEvent) => {
         // An open dialog handles Escape itself.
         if (e.key === "Escape" && !e.defaultPrevented && !document.querySelector("dialog[open]")) {
-          if (panel === "issues") showHome();
+          if (panel !== "home") showHome();
           else api.hidePopover();
         }
       };
@@ -62,10 +82,34 @@
     issuesHeading?.focus();
   }
 
+  async function showTransfers() {
+    panel = "transfers";
+    refreshTransfers();
+    await tick();
+    transfersHeading?.focus();
+  }
+
   async function showHome() {
+    const from = panel;
     panel = "home";
     await tick();
-    issuesButton?.focus();
+    if (from === "transfers") (transfersButton ?? transfersTitle)?.focus();
+    else issuesButton?.focus();
+  }
+
+  function transferAction(item: TransferItem, action: RowAction) {
+    if (action === "reveal") return run(`reveal:t${item.id}`, () => api.revealItem(item.path));
+    return run(`t${item.id}:${action}`, async () => {
+      drive.transfers = await api.setTransferMode(item.id, ACTION_MODE[action]);
+      announce = "";
+      queueMicrotask(() => (announce = actionDone(action, item)));
+      // The row may have moved to another group or out of the top rows: keep focus nearby.
+      await tick();
+      if (document.activeElement === document.body) {
+        const again = document.querySelector<HTMLElement>(`[data-transfer-id="${item.id}"] [aria-haspopup="menu"]`);
+        (again ?? (panel === "transfers" ? transfersHeading : transfersTitle))?.focus();
+      }
+    });
   }
 
   function act(issue: Issue, action: IssueAction) {
@@ -120,7 +164,49 @@
   </header>
 
   <main class="body">
-    {#if panel === "issues"}
+    {#if panel === "transfers"}
+      <section class="transfers-panel" aria-labelledby="transfers-panel-title">
+        <div class="section-head top">
+          <button class="btn subtle icon-only" onclick={showHome} aria-label="Back to status">
+            <Icon name="chevron-left" size={16} />
+          </button>
+          <div class="panel-title">
+            <h2 id="transfers-panel-title" class="body-strong" tabindex="-1" bind:this={transfersHeading}>Transfers</h2>
+            {#if summary}
+              <p class="caption secondary">{summary.title}</p>
+              {#if summary.detail}
+                <p class="caption secondary">{summary.detail}</p>
+              {/if}
+            {/if}
+          </div>
+        </div>
+        {#if actionError}
+          <p class="error-text" role="alert"><Icon name="alert" size={16} />{actionError}</p>
+        {/if}
+        {#if !transfers || transfers.items.length === 0}
+          <p class="secondary empty">Nothing is uploading or downloading.</p>
+        {:else}
+          {#each groupsOf(transfers) as group (group.key)}
+            <section aria-labelledby="group-{group.key}">
+              <h3 id="group-{group.key}" class="caption secondary section-label">
+                {group.label} <span class="numeric">· {count(group.items.length)}</span>
+              </h3>
+              <ul class="card transfer-list" role="list">
+                {#each group.items as item (item.id)}
+                  <TransferRow {item} now={clock} {fileManager} onaction={transferAction} full />
+                {/each}
+              </ul>
+            </section>
+          {/each}
+          {#if transfers.total_count > transfers.items.length}
+            <p class="caption secondary panel-note">
+              Showing the first {count(transfers.items.length)} of {count(transfers.total_count)}. The rest appear as these
+              finish.
+            </p>
+          {/if}
+        {/if}
+      </section>
+    {:else if panel === "issues"}
       <section class="issues" aria-labelledby="issues-title">
         <div class="section-head">
           <button class="btn subtle icon-only" onclick={showHome} aria-label="Back to status">
@@ -235,9 +321,31 @@
           <p class="error-text" role="alert"><Icon name="alert" size={16} />{actionError}</p>
         {/if}
 
-        {#if transferring || status.pending > 0}
+        {#if transfers && summary}
+          {@const rows = ordered(transfers.items).slice(0, ROWS)}
+          <section class="card block transfers" aria-labelledby="transfers-title">
+            <div class="transfers-head">
+              <h2 id="transfers-title" class="body-strong" tabindex="-1" bind:this={transfersTitle}>{summary.title}</h2>
+              {#if summary.detail}
+                <p class="caption secondary">{summary.detail}</p>
+              {/if}
+            </div>
+            <ul class="transfer-list" role="list">
+              {#each rows as item (item.id)}
+                <TransferRow {item} now={clock} {fileManager} onaction={transferAction} />
+              {/each}
+            </ul>
+            <!-- Also when every row fits but a name is shortened: the full list shows whole names. -->
+            {#if transfers.total_count > rows.length || rows.some((r) => basename(r.path).length > 32)}
+              <button class="btn subtle show-all" onclick={showTransfers} bind:this={transfersButton}>
+                <span>Show all<span class="visually-hidden"> transfers</span> <span class="numeric">({count(transfers.total_count)})</span></span>
+                <Icon name="chevron-right" size={16} />
+              </button>
+            {/if}
+          </section>
+        {:else if (!transfers && transferring) || status.pending > 0}
           <section class="card block" aria-label="Transfers">
-            {#if transferring}
+            {#if transferring && !transfers}
               {@const total = status.transfer_bytes_total}
               {@const done = Math.min(status.transfer_bytes_done, total)}
               <div class="row">
@@ -321,6 +429,7 @@
         </section>
       {/if}
     {/if}
+    <p class="visually-hidden" role="status">{announce}</p>
   </main>
 
   <footer class="foot">
@@ -461,6 +570,51 @@
   .section-label {
     margin: var(--s2) var(--s1) var(--s1);
     font-weight: 600;
+  }
+
+  .transfers {
+    gap: var(--s3);
+  }
+  .transfers-head {
+    display: grid;
+    gap: 2px;
+  }
+  .transfers-head h2 {
+    overflow-wrap: anywhere;
+  }
+  .transfer-list {
+    display: grid;
+    gap: var(--s4);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  ul.card.transfer-list {
+    padding: var(--s3);
+  }
+  .show-all {
+    justify-self: stretch;
+    justify-content: space-between;
+    margin: calc(-1 * var(--s1)) calc(-1 * var(--s2)) calc(-1 * var(--s2));
+    padding-inline: var(--s2);
+    color: var(--accent-text);
+  }
+  .show-all :global(.icon) {
+    color: var(--text-2);
+  }
+  .transfers-panel {
+    display: grid;
+    gap: var(--s1);
+  }
+  .section-head.top {
+    align-items: start;
+  }
+  .panel-title {
+    display: grid;
+    min-width: 0;
+  }
+  .panel-note {
+    padding-inline: var(--s1);
   }
   .section-head {
     display: flex;

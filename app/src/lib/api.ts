@@ -17,6 +17,8 @@ import type {
   SetupRequest,
   SetupResult,
   Status,
+  TransferList,
+  TransferMode,
   UpdateState,
   View,
 } from "./types";
@@ -27,6 +29,8 @@ export const EVENTS = {
   status: "drive://status",
   activity: "drive://activity",
   issues: "drive://issues",
+  /** The transfer list, about once a second while anything moves; only while the popover is visible. */
+  transfers: "drive://transfers",
   connection: "drive://connection",
   settings: "drive://settings",
   update: "drive://update",
@@ -87,6 +91,9 @@ export const api = {
   recentActivity: (limit = 20) => invoke<Activity[]>("recent_activity", { limit }),
   issues: () => invoke<Issue[]>("list_issues"),
   resolveIssue: (id: number, action: IssueAction) => invoke<void>("resolve_issue", { id, action }),
+  transfers: () => invoke<TransferList>("transfers"),
+  /** Pauses, resumes (`auto`), defers to tonight or forces one upload; resolves to the new list. */
+  setTransferMode: (id: number, mode: TransferMode) => invoke<TransferList>("set_transfer_mode", { id, mode }),
   pause: () => invoke<void>("pause"),
   resume: () => invoke<void>("resume"),
   syncNow: () => invoke<void>("sync_now"),

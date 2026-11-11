@@ -5,11 +5,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use drive_core::ipc::{Call, Event, Hello, Settings, Status, SyncState};
+use drive_core::ipc::{Call, Event, Hello, Settings, Status, SyncState, TransferList};
 use drive_core::ipc_client::{Client, ClientError};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::{Notify, RwLock, broadcast};
 
 use crate::mock::Mock;
@@ -19,6 +19,10 @@ pub const EV_ACTIVITY: &str = "drive://activity";
 pub const EV_ISSUES: &str = "drive://issues";
 pub const EV_CONNECTION: &str = "drive://connection";
 pub const EV_SETTINGS: &str = "drive://settings";
+/// The per-file transfer list. Sent only to the popover, and only while it is visible: the
+/// service pushes it about once a second during transfers, and a hidden popover has no use
+/// for it (it fetches the list once with the `transfers` command when it is shown).
+pub const EV_TRANSFERS: &str = "drive://transfers";
 
 /// Error returned to the webview. `code` is an `ipc::ErrorCode` in snake_case, or
 /// `unavailable` / `timeout` when the service could not be reached.
@@ -343,6 +347,19 @@ impl Backend {
                 let _ = self.app.emit(EV_ISSUES, count);
                 crate::notify::check_issues(self).await;
             }
+            Event::Transfers(list) => self.forward_transfers(&list),
+        }
+    }
+
+    fn forward_transfers(&self, list: &TransferList) {
+        let visible = self
+            .app
+            .get_webview_window(crate::windows::POPOVER)
+            .is_some_and(|w| w.is_visible().unwrap_or(false));
+        if visible {
+            let _ = self
+                .app
+                .emit_to(crate::windows::POPOVER, EV_TRANSFERS, list);
         }
     }
 

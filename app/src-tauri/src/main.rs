@@ -54,6 +54,8 @@ fn main() {
             commands::recent_activity,
             commands::list_issues,
             commands::resolve_issue,
+            commands::transfers,
+            commands::set_transfer_mode,
             commands::pause,
             commands::resume,
             commands::sync_now,
