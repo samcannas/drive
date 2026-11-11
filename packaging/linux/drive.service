@@ -1,0 +1,20 @@
+# Drive background service (systemd user unit).
+# Installed to /usr/lib/systemd/user/drive.service; enable with
+#   systemctl --user enable --now drive.service
+[Unit]
+Description=Drive encrypted cloud drive (uloz.to)
+Documentation=https://github.com/samcannas/drive
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/drive daemon
+Restart=on-failure
+RestartSec=5
+# If the daemon is killed, the FUSE mount is cleaned up on the next start; this also releases
+# it right away for the default mount point (~/Drive).
+ExecStopPost=-/usr/bin/fusermount3 -uz %h/Drive
+
+[Install]
+WantedBy=default.target

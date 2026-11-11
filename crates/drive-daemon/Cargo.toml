@@ -43,7 +43,8 @@ windows = { version = "0.62", features = [
 widestring = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-fuser = { version = "0.15", default-features = false }
+# Pure-Rust FUSE: mounts through the `fusermount3` helper (package fuse3); no libfuse headers.
+fuser = { version = "0.18", default-features = false }
 libc = "0.2"
 
 [dev-dependencies]
