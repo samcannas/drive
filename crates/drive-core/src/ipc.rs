@@ -34,7 +34,9 @@ pub enum Call {
     Status,
     /// Start streaming [`Event`]s on this connection.
     Subscribe,
-    /// Connect an account for the first time (or reconnect after sign-out).
+    /// Connect an account for the first time. Also used to sign in again when the state is
+    /// `signed_out` (same login: new uloz.to password; the stored encryption password is kept
+    /// unless a new one is given).
     Setup(SetupRequest),
     /// Checks credentials without saving anything; returns [`AccountCheck`].
     CheckAccount(AccountCredentials),
@@ -197,7 +199,9 @@ pub struct Settings {
     /// Seconds between remote scans.
     pub poll_interval_secs: u64,
     /// 0 = unlimited.
+    /// KiB/s (kilobytes, not kilobits). 0 = unlimited.
     pub upload_limit_kbps: u64,
+    /// KiB/s. 0 = unlimited.
     pub download_limit_kbps: u64,
     pub max_parallel_transfers: u32,
     /// Start the tray app (and service) when the user signs in.
@@ -239,6 +243,7 @@ pub struct Activity {
     pub id: i64,
     pub at_ms: i64,
     pub kind: ActivityKind,
+    /// Relative to the Drive folder, `/`-separated.
     pub path: String,
     pub bytes: u64,
     pub detail: Option<String>,

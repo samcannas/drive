@@ -63,6 +63,7 @@ pub struct Client {
     pending: Pending,
     next_id: Arc<AtomicU64>,
     events: broadcast::Sender<Event>,
+    closed: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 impl Client {
@@ -73,12 +74,27 @@ impl Client {
         let (recv, send) = stream.split();
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let (events, _) = broadcast::channel(256);
-        tokio::spawn(read_loop(recv, pending.clone(), events.clone()));
-        Ok(Self { writer: Arc::new(Mutex::new(send)), pending, next_id: Arc::new(AtomicU64::new(1)), events })
+        let closed = Arc::new(tokio::sync::watch::Sender::new(false));
+        tokio::spawn(read_loop(recv, pending.clone(), events.clone(), closed.clone()));
+        Ok(Self { writer: Arc::new(Mutex::new(send)), pending, next_id: Arc::new(AtomicU64::new(1)), events, closed })
+    }
+
+    /// Whether the connection to the service has been lost. Calls fail fast afterwards.
+    pub fn is_closed(&self) -> bool {
+        *self.closed.borrow()
+    }
+
+    /// Resolves once the connection to the service is lost.
+    pub async fn closed(&self) {
+        let mut rx = self.closed.subscribe();
+        let _ = rx.wait_for(|c| *c).await;
     }
 
     /// Sends a call and waits for its result.
     pub async fn call_value(&self, call: Call) -> Result<serde_json::Value, ClientError> {
+        if self.is_closed() {
+            return Err(ClientError::Disconnected);
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
@@ -112,7 +128,12 @@ impl Client {
     }
 }
 
-async fn read_loop(recv: RecvHalf, pending: Pending, events: broadcast::Sender<Event>) {
+async fn read_loop(
+    recv: RecvHalf,
+    pending: Pending,
+    events: broadcast::Sender<Event>,
+    closed: Arc<tokio::sync::watch::Sender<bool>>,
+) {
     let mut lines = BufReader::new(recv).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         let value: serde_json::Value = match serde_json::from_str(&line) {
@@ -129,6 +150,7 @@ async fn read_loop(recv: RecvHalf, pending: Pending, events: broadcast::Sender<E
             let _ = tx.send(resp);
         }
     }
-    // Connection closed: fail every waiter.
+    // Connection closed: fail every waiter and every future call.
+    closed.send_replace(true);
     pending.lock().await.clear();
 }
