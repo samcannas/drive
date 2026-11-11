@@ -49,9 +49,47 @@ struct Fixture {
     running: Option<(Arc<Engine>, Box<dyn Platform>)>,
 }
 
+/// Removes test sync roots left behind by earlier test processes that were killed before
+/// their `Drop` ran (they would otherwise linger in Explorer's navigation pane).
+fn sweep_stale_test_roots() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let Ok(roots) = cloud_filter::root::active_roots() else {
+            return;
+        };
+        for info in roots {
+            let id = info.id();
+            let id_str = id.to_os_string().to_string_lossy().into_owned();
+            // Ids look like `Drive!<sid>!test-<name>-<pid>-<rand>`.
+            let Some(rest) = id_str
+                .split("!test-")
+                .nth(1)
+                .filter(|_| id_str.starts_with("Drive!"))
+            else {
+                continue;
+            };
+            let pid = rest.rsplit('-').nth(1).and_then(|p| p.parse::<u32>().ok());
+            let alive = pid.is_some_and(|p| p == std::process::id() || process_running(p));
+            if !alive {
+                let _ = id.unregister();
+            }
+        }
+    });
+}
+
+fn process_running(pid: u32) -> bool {
+    Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
+        .unwrap_or(true)
+}
+
 impl Fixture {
     fn new(name: &str) -> Self {
         init_logging();
+        sweep_stale_test_roots();
         let unique = format!("{name}-{}-{}", std::process::id(), rand::random::<u32>());
         let base = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/cfapi-tests")
