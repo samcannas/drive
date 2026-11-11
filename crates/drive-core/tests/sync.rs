@@ -221,7 +221,7 @@ impl Device {
         self.local.fs.lock().unwrap().keys().cloned().collect()
     }
     async fn idle(&self) {
-        for _ in 0..400 {
+        for _ in 0..1500 {
             self.engine.sync_now();
             tokio::time::sleep(Duration::from_millis(10)).await;
             let st = self.engine.status();

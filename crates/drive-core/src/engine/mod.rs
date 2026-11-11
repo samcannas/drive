@@ -1769,7 +1769,7 @@ impl Engine {
                     }
                     RemoteError::NotFound(_) => {
                         self.wake_scanner.notify_one();
-                        (10_000, true)
+                        (3_000, true)
                     }
                     _ => (backoff_ms(n.attempts), true),
                 }
@@ -1882,7 +1882,7 @@ impl Engine {
             self.db.write(|tx| {
                 tx.execute(
                     "UPDATE node SET retry_at_ms = ?2 WHERE id = ?1",
-                    params![n.id, now_ms() + 2_000],
+                    params![n.id, now_ms() + 500],
                 )
                 .map(|_| ())
             })?;
@@ -2133,7 +2133,7 @@ fn recompute_move(tx: &rusqlite::Connection, id: NodeId) -> rusqlite::Result<()>
 }
 
 fn backoff_ms(attempts: i64) -> i64 {
-    let base = 5_000i64.saturating_mul(1 << attempts.clamp(0, 8));
+    let base = 2_000i64.saturating_mul(1 << attempts.clamp(0, 8));
     base.min(15 * 60_000)
 }
 
