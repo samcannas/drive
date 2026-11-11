@@ -2,6 +2,7 @@ name: Release
 
 # Every merge to main ships a release v0.1.<run number>: a Windows installer, Linux .deb and
 # AppImage, an Arch package, SHA256SUMS and the updater manifest latest.json.
+# Run it by hand (Actions → Release → Run workflow) to release another branch or retry.
 on:
   push:
     branches: [main]
