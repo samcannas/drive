@@ -83,6 +83,18 @@ jobs:
       - name: clippy (drive-core, drive-daemon)
         run: cargo clippy --locked -p drive-core -p drive-daemon --all-targets -- -D warnings
 
+      # Some Windows runner images don't have the Cloud Files filter attached to the work
+      # volume, so registering a sync root there fails with ERROR_INVALID_FUNCTION.
+      - name: Attach the Cloud Files filter to the work volume
+        if: runner.os == 'Windows'
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $vol = $env:GITHUB_WORKSPACE.Substring(0, 2)
+          fltmc load CldFlt 2>$null
+          fltmc attach CldFlt $vol
+          fltmc instances -f CldFlt
+
       - name: Tests (drive-core, drive-daemon)
         shell: bash
         run: |

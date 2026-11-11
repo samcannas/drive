@@ -6,6 +6,11 @@ name: Release
 on:
   push:
     branches: [main]
+    # Changes that can't affect what users install don't ship an (empty) update.
+    paths-ignore:
+      - ".github/workflows/ci.yml"
+      - "docs/**"
+      - "**/*.md"
   workflow_dispatch:
 
 concurrency:
