@@ -46,7 +46,7 @@ jobs:
           apt() { for i in 1 2 3; do sudo timeout 240 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 "$@" && return 0; echo "apt-get $1 failed (attempt $i), retrying"; sleep 10; done; return 1; }
           # GitHub's Azure Ubuntu mirror is sometimes unreachable from its own runners;
           # use the official archive instead.
-          sudo sed -i 's#http://azure.archive.ubuntu.com#http://archive.ubuntu.com#g' \n            /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+          sudo sed -i 's#http://azure.archive.ubuntu.com#http://archive.ubuntu.com#g' /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
           apt update
           apt install -y --no-install-recommends \
             fuse3 libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
