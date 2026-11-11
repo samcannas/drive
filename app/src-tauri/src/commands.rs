@@ -318,6 +318,24 @@ pub fn hide_popover(app: AppHandle) {
     windows::hide_popover(&app);
 }
 
+/// The window's close (X) button: hide to the tray, or quit, as set in Settings.
+#[tauri::command]
+pub async fn close_main(app: AppHandle, svc: Svc<'_>) -> Res<()> {
+    close_main_window(&app, svc.inner()).await;
+    Ok(())
+}
+
+pub async fn close_main_window(app: &AppHandle, svc: &Arc<Backend>) {
+    let action = svc
+        .cached_settings()
+        .map(|s| s.close_action)
+        .unwrap_or_default();
+    match action {
+        drive_core::ipc::CloseAction::Minimize => windows::hide_popover(app),
+        drive_core::ipc::CloseAction::Quit => quit_now(app, svc).await,
+    }
+}
+
 #[tauri::command]
 pub fn reconnect(svc: Svc<'_>) {
     svc.reconnect_now();

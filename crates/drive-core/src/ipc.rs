@@ -224,6 +224,20 @@ pub struct Settings {
     pub notifications: bool,
     pub device_name: String,
     pub app_token_custom: bool,
+    /// What the window's close (X) button does.
+    #[serde(default)]
+    pub close_action: CloseAction,
+}
+
+/// What closing the Drive window does.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CloseAction {
+    /// Hide the window; Drive keeps running (and syncing) in the tray.
+    #[default]
+    Minimize,
+    /// Quit Drive, which also stops syncing.
+    Quit,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -238,6 +252,7 @@ pub struct SettingsPatch {
     pub device_name: Option<String>,
     /// `Some("")` resets to the shared default key.
     pub app_token: Option<String>,
+    pub close_action: Option<CloseAction>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

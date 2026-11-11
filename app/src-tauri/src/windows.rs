@@ -35,6 +35,22 @@ pub struct PopoverState {
     hidden_at: Mutex<Option<Instant>>,
     generation: AtomicU64,
     last_rect: Mutex<Option<TrayRect>>,
+    /// Where the user dragged the popover to; it reopens there for the rest of the session.
+    dragged_to: Mutex<Option<PhysicalPosition<i32>>>,
+    /// When we last positioned the window ourselves (those moves aren't user drags).
+    placed_at: Mutex<Option<Instant>>,
+}
+
+impl PopoverState {
+    fn mark_placed(&self) {
+        *self.placed_at.lock().unwrap() = Some(Instant::now());
+    }
+    fn recently_placed(&self) -> bool {
+        self.placed_at
+            .lock()
+            .unwrap()
+            .is_some_and(|t| t.elapsed() < Duration::from_millis(500))
+    }
 }
 
 /// Popover is a frameless flyout on Windows. Elsewhere tray clicks aren't reliably delivered
@@ -102,14 +118,30 @@ fn popover(app: &AppHandle) -> tauri::Result<WebviewWindow> {
         b.resizable(true).min_inner_size(340.0, 420.0).center()
     };
     let win = b.build()?;
-    if FLYOUT {
-        let handle = app.clone();
-        win.on_window_event(move |e| {
-            if let WindowEvent::Focused(false) = e {
-                hide_popover(&handle);
+    let handle = app.clone();
+    win.on_window_event(move |e| match e {
+        WindowEvent::Focused(false) if FLYOUT => hide_popover(&handle),
+        WindowEvent::Moved(pos) => {
+            let state = handle.state::<PopoverState>();
+            let visible = handle
+                .get_webview_window(POPOVER)
+                .and_then(|w| w.is_visible().ok())
+                .unwrap_or(false);
+            if visible && !state.recently_placed() {
+                *state.dragged_to.lock().unwrap() = Some(*pos);
             }
-        });
-    }
+        }
+        WindowEvent::CloseRequested { api, .. } => {
+            // The native close button (Linux window) follows the same setting as our X.
+            api.prevent_close();
+            let handle = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                let svc = handle.state::<std::sync::Arc<crate::backend::Backend>>();
+                crate::commands::close_main_window(&handle, svc.inner()).await;
+            });
+        }
+        _ => {}
+    });
     Ok(win)
 }
 
@@ -129,12 +161,12 @@ pub fn show_main(app: &AppHandle, rect: Option<TrayRect>) {
     };
     state.generation.fetch_add(1, Ordering::SeqCst);
     if FLYOUT {
-        place_near_tray(app, &win, rect);
+        place(app, &win, rect);
     }
     let _ = win.show();
     if FLYOUT {
         // The first show of a new window can override the position set while hidden.
-        place_near_tray(app, &win, rect);
+        place(app, &win, rect);
         tracing::debug!(pos = ?win.outer_position().ok(), size = ?win.outer_size().ok(), "popover shown");
     }
     let _ = win.unminimize();
@@ -189,6 +221,25 @@ pub fn hide_popover(app: &AppHandle) {
             let _ = w.destroy();
         }
     });
+}
+
+/// Puts the popover where the user last dragged it, or next to the tray icon.
+fn place(app: &AppHandle, win: &WebviewWindow, rect: Option<TrayRect>) {
+    let state = app.state::<PopoverState>();
+    state.mark_placed();
+    let dragged = *state.dragged_to.lock().unwrap();
+    // Only reuse a dragged position that is still on a connected monitor.
+    if let Some(pos) = dragged
+        && app
+            .monitor_from_point(pos.x as f64 + 40.0, pos.y as f64 + 20.0)
+            .ok()
+            .flatten()
+            .is_some()
+    {
+        let _ = win.set_position(pos);
+        return;
+    }
+    place_near_tray(app, win, rect);
 }
 
 fn place_near_tray(app: &AppHandle, win: &WebviewWindow, rect: Option<TrayRect>) {

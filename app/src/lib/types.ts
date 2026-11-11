@@ -33,7 +33,11 @@ export interface Settings {
   notifications: boolean;
   device_name: string;
   app_token_custom: boolean;
+  close_action: CloseAction;
 }
+
+/** What the window's close (X) button does: hide to the tray, or quit Drive. */
+export type CloseAction = "minimize" | "quit";
 
 export type SettingsPatch = Partial<Omit<Settings, "folder" | "app_token_custom">> & { app_token?: string };
 

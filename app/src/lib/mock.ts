@@ -39,6 +39,7 @@ const state = {
     notifications: true,
     device_name: "ALEX-DESKTOP",
     app_token_custom: false,
+    close_action: "minimize",
   } as Settings,
   activity: [
     { id: 5, at_ms: now - 2 * 60_000, kind: "uploaded", path: "Documents/Meeting notes.docx", bytes: 48_000, detail: null },

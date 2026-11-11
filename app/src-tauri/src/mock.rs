@@ -153,6 +153,7 @@ impl Mock {
                 notifications: true,
                 device_name: std::env::var("COMPUTERNAME").unwrap_or_else(|_| "This PC".into()),
                 app_token_custom: false,
+                close_action: Default::default(),
             },
             activity,
             issues,
@@ -289,6 +290,7 @@ impl Mock {
                 if let Some(v) = p.max_parallel_transfers { s.max_parallel_transfers = v }
                 if let Some(v) = p.launch_at_login { s.launch_at_login = v }
                 if let Some(v) = p.notifications { s.notifications = v }
+                if let Some(v) = p.close_action { s.close_action = v }
                 if let Some(v) = p.device_name { s.device_name = v }
                 if let Some(v) = p.app_token { s.app_token_custom = !v.is_empty() }
                 json!(st.settings)

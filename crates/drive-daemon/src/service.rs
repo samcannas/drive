@@ -642,6 +642,9 @@ impl Service {
         if let Some(v) = patch.launch_at_login {
             c.launch_at_login = v;
         }
+        if let Some(v) = patch.close_action {
+            c.close_action = v;
+        }
         if let Some(v) = patch.notifications {
             c.notifications = v;
         }

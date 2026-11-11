@@ -69,6 +69,7 @@ fn main() {
             commands::show_window,
             commands::finish_onboarding,
             commands::hide_popover,
+            commands::close_main,
             commands::reconnect,
             commands::quit,
         ])

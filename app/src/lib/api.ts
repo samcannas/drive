@@ -99,9 +99,18 @@ export const api = {
   showWindow: (name: View) => invoke<void>("show_window", { name }),
   finishOnboarding: () => invoke<void>("finish_onboarding"),
   hidePopover: () => invoke<void>("hide_popover"),
+  /** The X button: hides Drive to the tray or quits, depending on Settings. */
+  closeMain: () => invoke<void>("close_main"),
   reconnect: () => invoke<void>("reconnect"),
   quit: () => invoke<void>("quit"),
 };
+
+/** Starts moving the current window with the mouse (for frameless windows). */
+export async function startDragging(): Promise<void> {
+  if (!inTauri) return;
+  const { getCurrentWindow } = await import("@tauri-apps/api/window");
+  await getCurrentWindow().startDragging();
+}
 
 /** Closes the current window (settings, onboarding). */
 export async function closeWindow(): Promise<void> {

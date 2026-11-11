@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use drive_core::ipc::Settings;
+use drive_core::ipc::{CloseAction, Settings};
 use serde::{Deserialize, Serialize};
 
 pub const APP_DIR: &str = "Drive";
@@ -83,6 +83,7 @@ pub struct Config {
     pub max_parallel_transfers: u32,
     pub launch_at_login: bool,
     pub notifications: bool,
+    pub close_action: CloseAction,
     /// A dedicated uloz.to API key; `None` uses the shared default.
     pub app_token: Option<String>,
 }
@@ -110,6 +111,7 @@ impl Default for Config {
             max_parallel_transfers: 3,
             launch_at_login: true,
             notifications: true,
+            close_action: CloseAction::Minimize,
             app_token: None,
         }
     }
@@ -183,6 +185,7 @@ impl Config {
             notifications: self.notifications,
             device_name: self.device_name.clone(),
             app_token_custom: self.app_token.is_some(),
+            close_action: self.close_action,
         }
     }
 }

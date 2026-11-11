@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
-  import { api, env, errorOf } from "../lib/api";
+  import { api, env, errorOf, startDragging } from "../lib/api";
   import { connect, drive, refreshIssues } from "../lib/drive.svelte";
   import { basename, bytes, count, dirname, plural, relative } from "../lib/format";
   import Icon from "../lib/Icon.svelte";
@@ -27,7 +27,7 @@
   const transferring = $derived(status !== null && status.uploading + status.downloading > 0);
 
   onMount(() => {
-    connect({ activity: true, issues: true });
+    connect({ activity: true, issues: true, settings: true });
     if (flyout) {
       const onKey = (e: KeyboardEvent) => {
         if (e.key === "Escape" && !e.defaultPrevented) {
@@ -75,6 +75,14 @@
     });
   }
 
+  // The header doubles as the title bar: press and drag anywhere on it except its buttons.
+  function dragHeader(e: MouseEvent) {
+    if (e.button !== 0 || e.detail > 1) return;
+    if ((e.target as HTMLElement).closest("button, a, input, select, textarea")) return;
+    e.preventDefault();
+    startDragging();
+  }
+
   function transferLine(up: number, down: number): string {
     const parts: string[] = [];
     if (up) parts.push(`Uploading ${plural(up, "file", "files")}`);
@@ -84,7 +92,8 @@
 </script>
 
 <div class="popover" class:flyout>
-  <header class="head">
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <header class="head" onmousedown={dragHeader}>
     <StateBadge {visual} />
     <div class="head-text">
       <h1 class="headline">{visual.headline}</h1>
@@ -97,6 +106,14 @@
     {#if drive.connection.mock}
       <span class="mock caption" title="The app is showing made-up data from the development mock.">Mock data</span>
     {/if}
+    <button
+      class="btn subtle icon-only close"
+      onclick={() => api.closeMain()}
+      aria-label={drive.settings?.close_action === "quit" ? "Quit Drive" : "Close"}
+      title={drive.settings?.close_action === "quit" ? "Quit Drive" : "Close (Drive keeps syncing in the tray)"}
+    >
+      <Icon name="x" size={16} />
+    </button>
   </header>
 
   <main class="body">
@@ -339,7 +356,14 @@
     display: flex;
     align-items: center;
     gap: var(--s3);
-    padding: var(--s4) var(--s4) var(--s3);
+    padding: var(--s4) var(--s3) var(--s3) var(--s4);
+    cursor: default;
+    user-select: none;
+  }
+  .close {
+    align-self: flex-start;
+    margin-top: calc(-1 * var(--s1));
+    flex: none;
   }
   .head-text {
     display: grid;

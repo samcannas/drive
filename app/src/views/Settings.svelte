@@ -252,6 +252,26 @@
 
         <label class="card setting">
           <span class="setting-text">
+            <span id="close-label">Quit Drive when you close its window</span>
+            <span class="caption secondary" id="close-desc">
+              {s.close_action === "quit"
+                ? "The X button quits Drive and syncing stops until you open it again."
+                : "The X button hides Drive in the tray and your files keep syncing."}
+            </span>
+          </span>
+          <input
+            type="checkbox"
+            role="switch"
+            class="switch"
+            aria-labelledby="close-label"
+            aria-describedby="close-desc"
+            checked={s.close_action === "quit"}
+            onchange={(e) => save({ close_action: e.currentTarget.checked ? "quit" : "minimize" })}
+          />
+        </label>
+
+        <label class="card setting">
+          <span class="setting-text">
             <span id="notifications-label">Show notifications</span>
             <span class="caption secondary" id="notifications-desc">
               Only when something needs you, like signing in again or confirming a large delete.
