@@ -328,6 +328,13 @@ p {
 .btn:has(.icon:first-child) {
   padding-inline-start: 10px;
 }
+/* Square icon buttons (close, update, row menus): the icon sits dead center. */
+.btn.icon-only,
+.btn.icon-only:has(.icon:first-child) {
+  width: 32px;
+  min-width: 32px;
+  padding: 0;
+}
 @media (hover: hover) {
   .btn:not(:disabled, [aria-disabled="true"]):hover {
     background: color-mix(in srgb, var(--surface-raised), var(--text) 4%);

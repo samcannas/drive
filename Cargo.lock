@@ -1181,6 +1181,7 @@ dependencies = [
  "tauri-plugin-updater",
  "tokio",
  "tracing",
+ "tracing-appender",
  "tracing-subscriber",
  "windows-registry 0.5.3",
 ]

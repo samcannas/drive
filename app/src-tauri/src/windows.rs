@@ -18,9 +18,6 @@ pub const ONBOARDING: &str = "onboarding";
 
 pub const EV_POPOVER_SHOWN: &str = "drive://popover-shown";
 
-/// The popover is destroyed after staying hidden this long, to give the webview's memory back.
-const DESTROY_HIDDEN_AFTER: Duration = Duration::from_secs(90);
-
 /// Tray icon rectangle in physical pixels: x, y, width, height.
 #[derive(Debug, Clone, Copy)]
 pub struct TrayRect {
@@ -119,8 +116,12 @@ fn popover(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     };
     let win = b.build()?;
     let handle = app.clone();
+    // Debug builds can keep the flyout open when it loses focus (UI work, automated checks).
+    let hide_on_blur =
+        FLYOUT && !(cfg!(debug_assertions) && std::env::var_os("DRIVE_UI_KEEP_OPEN").is_some());
+    let this = win.clone();
     win.on_window_event(move |e| match e {
-        WindowEvent::Focused(false) if FLYOUT => hide_popover(&handle),
+        WindowEvent::Focused(false) if hide_on_blur => hide_window(&handle, &this),
         WindowEvent::Moved(pos) => {
             let state = handle.state::<PopoverState>();
             let visible = handle
@@ -135,9 +136,10 @@ fn popover(app: &AppHandle) -> tauri::Result<WebviewWindow> {
             // The native close button (Linux window) follows the same setting as our X.
             api.prevent_close();
             let handle = handle.clone();
+            let this = this.clone();
             tauri::async_runtime::spawn(async move {
                 let svc = handle.state::<std::sync::Arc<crate::backend::Backend>>();
-                crate::commands::close_main_window(&handle, svc.inner()).await;
+                crate::commands::close_main_window(&handle, svc.inner(), Some(&this)).await;
             });
         }
         _ => {}
@@ -165,6 +167,9 @@ pub fn show_main(app: &AppHandle, rect: Option<TrayRect>) {
     }
     let _ = win.show();
     if FLYOUT {
+        // A window created hidden with a backdrop effect loses its "skip taskbar" flag on
+        // Windows, so set it again whenever the flyout appears.
+        let _ = win.set_skip_taskbar(true);
         // The first show of a new window can override the position set while hidden.
         place(app, &win, rect);
         tracing::debug!(pos = ?win.outer_position().ok(), size = ?win.outer_size().ok(), "popover shown");
@@ -198,29 +203,26 @@ pub fn toggle_popover(app: &AppHandle, rect: Option<TrayRect>) {
 }
 
 pub fn hide_popover(app: &AppHandle) {
-    let Some(win) = app.get_webview_window(POPOVER) else {
-        return;
-    };
-    if !win.is_visible().unwrap_or(false) {
+    if let Some(win) = app.get_webview_window(POPOVER) {
+        hide_window(app, &win);
+    }
+}
+
+/// Hides this popover window. The window is kept (not destroyed) so it can never end up on
+/// screen without the app tracking it; a hidden webview costs a little memory, nothing else.
+pub fn hide_window(app: &AppHandle, win: &WebviewWindow) {
+    if !win.is_visible().unwrap_or(true) {
         return;
     }
-    let _ = win.hide();
+    if let Err(e) = win.hide() {
+        tracing::warn!("hiding the popover failed: {e}");
+        // Last resort: at least get it out of the way.
+        let _ = win.minimize();
+    }
     let state = app.state::<PopoverState>();
     *state.hidden_at.lock().unwrap() = Some(Instant::now());
-    let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
-    let handle = app.clone();
-    tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(DESTROY_HIDDEN_AFTER).await;
-        let state = handle.state::<PopoverState>();
-        if state.generation.load(Ordering::SeqCst) != generation {
-            return;
-        }
-        if let Some(w) = handle.get_webview_window(POPOVER)
-            && !w.is_visible().unwrap_or(true)
-        {
-            let _ = w.destroy();
-        }
-    });
+    state.generation.fetch_add(1, Ordering::SeqCst);
+    tracing::debug!("popover hidden");
 }
 
 /// Puts the popover where the user last dragged it, or next to the tray icon.

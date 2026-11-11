@@ -23,12 +23,7 @@ use tauri::Manager;
 use crate::backend::Backend;
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "drive_app=info,warn".into()),
-        )
-        .init();
+    let _log = init_logging();
 
     let autostarted = std::env::args().any(|a| a == "--autostart");
 
@@ -100,4 +95,44 @@ fn main() {
                 api.prevent_exit();
             }
         });
+}
+
+/// Logs to the console and, in release builds (which have no console), to
+/// `%LOCALAPPDATA%\Drive\logs\app.*.log` / `~/.local/share/Drive/logs/app.*.log` next to the
+/// service's logs, kept for a week.
+fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    use tracing_subscriber::prelude::*;
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "drive_app=info,warn".into());
+    let dir = dirs::data_local_dir().map(|d| d.join("Drive").join("logs"));
+    let file = dir.and_then(|d| {
+        std::fs::create_dir_all(&d).ok()?;
+        tracing_appender::rolling::Builder::new()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix("app")
+            .filename_suffix("log")
+            .max_log_files(7)
+            .build(d)
+            .ok()
+    });
+    let (layer, guard) = match file {
+        Some(f) => {
+            let (w, g) = tracing_appender::non_blocking(f);
+            (
+                Some(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(w)
+                        .with_ansi(false),
+                ),
+                Some(g),
+            )
+        }
+        None => (None, None),
+    };
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer())
+        .with(layer)
+        .init();
+    guard
 }
