@@ -17,7 +17,8 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: short
-  RCLONE_VERSION: v1.76.0
+  # Not RCLONE_*: rclone reads every RCLONE_<FLAG> variable as a command-line flag.
+  RCLONE_RELEASE: v1.76.0
 
 jobs:
   rust:
@@ -57,15 +58,15 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
 
-      - name: Download rclone ${{ env.RCLONE_VERSION }}
+      - name: Download rclone ${{ env.RCLONE_RELEASE }}
         shell: bash
         run: |
           if [ "$RUNNER_OS" = Windows ]; then plat=windows-amd64; exe=rclone.exe; else plat=linux-amd64; exe=rclone; fi
           dir="$(cd "$RUNNER_TEMP" && pwd)"
           curl -fsSL --retry 3 -o "$dir/rclone.zip" \
-            "https://downloads.rclone.org/$RCLONE_VERSION/rclone-$RCLONE_VERSION-$plat.zip"
+            "https://downloads.rclone.org/$RCLONE_RELEASE/rclone-$RCLONE_RELEASE-$plat.zip"
           unzip -q "$dir/rclone.zip" -d "$dir"
-          bin="$dir/rclone-$RCLONE_VERSION-$plat/$exe"
+          bin="$dir/rclone-$RCLONE_RELEASE-$plat/$exe"
           "$bin" version
           if [ "$RUNNER_OS" = Windows ]; then bin="$(cygpath -w "$bin")"; fi
           echo "RCLONE_BIN=$bin" >> "$GITHUB_ENV"
