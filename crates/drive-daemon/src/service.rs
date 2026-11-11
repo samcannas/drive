@@ -645,6 +645,9 @@ impl Service {
         if let Some(v) = patch.close_action {
             c.close_action = v;
         }
+        if let Some(v) = patch.auto_update {
+            c.auto_update = v;
+        }
         if let Some(v) = patch.notifications {
             c.notifications = v;
         }

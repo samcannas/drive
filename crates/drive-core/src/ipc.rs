@@ -227,6 +227,14 @@ pub struct Settings {
     /// What the window's close (X) button does.
     #[serde(default)]
     pub close_action: CloseAction,
+    /// Download updates in the background and offer "Restart to update". When off, the app
+    /// still checks for updates but only tells the user about them.
+    #[serde(default = "default_true")]
+    pub auto_update: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// What closing the Drive window does.
@@ -253,6 +261,7 @@ pub struct SettingsPatch {
     /// `Some("")` resets to the shared default key.
     pub app_token: Option<String>,
     pub close_action: Option<CloseAction>,
+    pub auto_update: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

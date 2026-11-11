@@ -11,11 +11,13 @@ import type {
   Issue,
   IssueAction,
   Material,
+  Release,
   Settings,
   SettingsPatch,
   SetupRequest,
   SetupResult,
   Status,
+  UpdateState,
   View,
 } from "./types";
 
@@ -27,6 +29,7 @@ export const EVENTS = {
   issues: "drive://issues",
   connection: "drive://connection",
   settings: "drive://settings",
+  update: "drive://update",
   popoverShown: "drive://popover-shown",
 } as const;
 
@@ -102,6 +105,13 @@ export const api = {
   /** The X button: hides Drive to the tray or quits, depending on Settings. */
   closeMain: () => invoke<void>("close_main"),
   reconnect: () => invoke<void>("reconnect"),
+  updateState: () => invoke<UpdateState>("update_state"),
+  /** Checks now; resolves to the state afterwards. Progress also arrives as `drive://update`. */
+  checkForUpdates: () => invoke<UpdateState>("check_for_updates"),
+  /** Downloads if needed, installs and restarts Drive. Only resolves in the mock or on failure. */
+  installUpdate: () => invoke<void>("install_update"),
+  /** Releases newer than this version, newest first. */
+  updateChangelog: () => invoke<Release[]>("update_changelog"),
   quit: () => invoke<void>("quit"),
 };
 

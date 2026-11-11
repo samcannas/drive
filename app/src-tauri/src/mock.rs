@@ -7,6 +7,8 @@
 //! Optional knobs (debug builds only):
 //! * `DRIVE_UI_MOCK=onboarding` starts in the not-set-up state.
 //! * `DRIVE_UI_MOCK_MASS_DELETE=1` starts with a pending mass-delete confirmation.
+//! * `DRIVE_UI_MOCK_UPDATE=1` offers a made-up update (see `updater`); installing it only
+//!   pretends. Works with or without the mock service.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -26,6 +28,11 @@ const MB: u64 = 1024 * 1024;
 pub fn forced() -> bool {
     cfg!(debug_assertions)
         && std::env::var("DRIVE_UI_MOCK").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Whether the update UI should be fed a made-up update. Always false in release builds.
+pub fn update_forced() -> bool {
+    cfg!(debug_assertions) && std::env::var("DRIVE_UI_MOCK_UPDATE").is_ok_and(|v| v == "1")
 }
 
 struct State {
@@ -154,6 +161,7 @@ impl Mock {
                 device_name: std::env::var("COMPUTERNAME").unwrap_or_else(|_| "This PC".into()),
                 app_token_custom: false,
                 close_action: Default::default(),
+                auto_update: true,
             },
             activity,
             issues,
@@ -291,6 +299,7 @@ impl Mock {
                 if let Some(v) = p.launch_at_login { s.launch_at_login = v }
                 if let Some(v) = p.notifications { s.notifications = v }
                 if let Some(v) = p.close_action { s.close_action = v }
+                if let Some(v) = p.auto_update { s.auto_update = v }
                 if let Some(v) = p.device_name { s.device_name = v }
                 if let Some(v) = p.app_token { s.app_token_custom = !v.is_empty() }
                 json!(st.settings)

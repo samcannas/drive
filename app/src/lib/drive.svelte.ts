@@ -2,7 +2,7 @@
 // kept current from backend events.
 
 import { api, EVENTS, listen } from "./api";
-import type { Activity, ConnectionInfo, Issue, Settings, Status } from "./types";
+import type { Activity, ConnectionInfo, Issue, Release, Settings, Status, UpdateState } from "./types";
 
 export const drive = $state({
   status: null as Status | null,
@@ -10,6 +10,9 @@ export const drive = $state({
   issues: [] as Issue[],
   activity: [] as Activity[],
   settings: null as Settings | null,
+  update: null as UpdateState | null,
+  /** Newer releases for the version on offer (see `updateVersion`). */
+  changelog: [] as Release[],
   /** Ticks every 30 s so relative times stay fresh. */
   now: Date.now(),
 });
@@ -33,6 +36,40 @@ export async function refreshActivity() {
 export async function refreshSettings() {
   try {
     drive.settings = await api.settings();
+  } catch {
+    /* as above */
+  }
+}
+
+/** The version an update state is about, if any. */
+export function updateVersion(u: UpdateState | null): string | null {
+  if (!u) return null;
+  if ("version" in u) return u.version;
+  return null;
+}
+
+let changelogFor: string | null = null;
+
+function setUpdate(u: UpdateState) {
+  drive.update = u;
+  const v = updateVersion(u);
+  if (v && v !== changelogFor) {
+    changelogFor = v;
+    api
+      .updateChangelog()
+      .then((r) => {
+        if (changelogFor === v) drive.changelog = r;
+      })
+      .catch(() => {});
+  } else if (!v && u.state !== "checking") {
+    changelogFor = null;
+    drive.changelog = [];
+  }
+}
+
+export async function refreshUpdate() {
+  try {
+    setUpdate(await api.updateState());
   } catch {
     /* as above */
   }
@@ -72,7 +109,12 @@ export async function connect(opts: { activity?: boolean; issues?: boolean; sett
   }
   if (opts.issues) await listen<number>(EVENTS.issues, () => refreshIssues());
   if (opts.settings) await listen<Settings>(EVENTS.settings, (s) => (drive.settings = s));
-  await listen(EVENTS.popoverShown, () => refreshAll(opts));
+  await listen<UpdateState>(EVENTS.update, setUpdate);
+  await listen(EVENTS.popoverShown, () => {
+    refreshAll(opts);
+    refreshUpdate();
+  });
+  refreshUpdate();
 
   try {
     drive.connection = await api.connection();

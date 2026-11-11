@@ -393,6 +393,13 @@ async fn run_client(cmd: Command) -> Result<()> {
                     "parallel" => patch.max_parallel_transfers = Some(num()? as u32),
                     "device-name" => patch.device_name = Some(v.to_string()),
                     "api-key" => patch.app_token = Some(v.to_string()),
+                    "auto-update" => {
+                        patch.auto_update = Some(match v {
+                            "on" | "true" | "yes" | "1" => true,
+                            "off" | "false" | "no" | "0" => false,
+                            _ => bail!("auto-update needs on or off"),
+                        })
+                    }
                     other => bail!("unknown setting {other}"),
                 }
             }

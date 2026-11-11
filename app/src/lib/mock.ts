@@ -2,8 +2,10 @@
 // Mirrors app/src-tauri/src/mock.rs closely enough to develop and screenshot every view.
 //
 // ?scenario= onboarding | massdelete | offline | signedout | paused | error | unavailable | idle
+//            update (an update is available, automatic updates off) | update-ready (downloaded)
+//            update-error | update-off (this installation doesn't update itself)
 
-import type { Activity, Issue, Settings, Status } from "./types";
+import type { Activity, Issue, Release, Settings, Status, UpdateState } from "./types";
 
 const GB = 1024 ** 3;
 const MB = 1024 ** 2;
@@ -40,6 +42,7 @@ const state = {
     device_name: "ALEX-DESKTOP",
     app_token_custom: false,
     close_action: "minimize",
+    auto_update: scenario !== "update",
   } as Settings,
   activity: [
     { id: 5, at_ms: now - 2 * 60_000, kind: "uploaded", path: "Documents/Meeting notes.docx", bytes: 48_000, detail: null },
@@ -76,6 +79,63 @@ if (scenario === "signedout") {
   state.issues = [
     { id: 3, kind: "auth", path: null, message: "uloz.to stopped accepting your password. Sign in again to keep syncing.", created_ms: now - 600_000, actions: ["sign_in"] },
   ];
+}
+
+// ----- Updates
+
+const MOCK_RELEASES: Release[] = [
+  {
+    version: "0.1.2",
+    date: new Date(now - 2 * 86_400_000).toISOString(),
+    url: "https://github.com/samcannas/drive/releases/tag/v0.1.2",
+    notes: [
+      "Update Drive from the status window or Settings",
+      "Choose whether updates download automatically",
+      "Faster retries for uploads that had to wait",
+    ],
+  },
+  {
+    version: "0.1.1",
+    date: new Date(now - 5 * 86_400_000).toISOString(),
+    url: "https://github.com/samcannas/drive/releases/tag/v0.1.1",
+    notes: ["Drag the status window anywhere, and close it with the X button", "Choose what closing the window does"],
+  },
+];
+const latest = MOCK_RELEASES[0];
+const offered = { version: latest.version, date: latest.date, notes: latest.notes };
+
+let update: UpdateState = (() => {
+  switch (scenario) {
+    case "update":
+      return { state: "available", ...offered };
+    case "update-ready":
+      return { state: "ready", ...offered };
+    case "update-error":
+      return {
+        state: "error",
+        message: "The download stopped. Check your internet connection and try again.",
+        version: latest.version,
+      };
+    case "update-off":
+      return { state: "disabled", reason: "Drive was installed by your package manager, which keeps it up to date." };
+    default:
+      return { state: "up_to_date", checked_ms: now - 3 * 60_000 };
+  }
+})();
+const offersUpdate = scenario.startsWith("update") && scenario !== "update-off";
+
+function setUpdate(u: UpdateState) {
+  update = u;
+  emit("drive://update", u);
+}
+
+async function downloadUpdate() {
+  const total = 18 * MB;
+  for (let i = 0; i <= 30; i++) {
+    setUpdate({ state: "downloading", version: latest.version, done_bytes: Math.round((total * i) / 30), total_bytes: total });
+    await sleep(100);
+  }
+  setUpdate({ state: "ready", ...offered });
 }
 
 function status(): Status {
@@ -181,6 +241,7 @@ async function handle(cmd: string, a: Record<string, unknown>): Promise<unknown>
         else (state.settings as unknown as Record<string, unknown>)[k] = v;
       }
       emit("drive://settings", { ...state.settings });
+      if (p.auto_update === true && update.state === "available") void downloadUpdate();
       return { ...state.settings };
     }
     case "recent_activity":
@@ -231,6 +292,30 @@ async function handle(cmd: string, a: Record<string, unknown>): Promise<unknown>
       state.setUp = false;
       emit("drive://status", status());
       return null;
+    case "update_state":
+      return update;
+    case "check_for_updates": {
+      if (update.state === "disabled" || update.state === "downloading" || update.state === "installing") return update;
+      setUpdate({ state: "checking" });
+      await sleep(800);
+      if (!offersUpdate) {
+        setUpdate({ state: "up_to_date", checked_ms: Date.now() });
+        return update;
+      }
+      setUpdate({ state: "available", ...offered });
+      if (state.settings.auto_update) void downloadUpdate();
+      return update;
+    }
+    case "install_update": {
+      if (update.state !== "ready") await downloadUpdate();
+      setUpdate({ state: "installing", version: latest.version });
+      await sleep(1500);
+      console.info("[mock] Drive would restart now");
+      setUpdate({ state: "up_to_date", checked_ms: Date.now() });
+      return null;
+    }
+    case "update_changelog":
+      return offersUpdate ? MOCK_RELEASES : [];
     default:
       console.info(`[mock] ${cmd}`, a);
       return null;

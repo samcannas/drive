@@ -65,6 +65,8 @@
   --focus-inner: #ffffff;
   --icon-knockout: #ffffff;
   --shadow-dialog: 0 8px 32px rgb(0 0 0 / 0.18), 0 2px 8px rgb(0 0 0 / 0.1);
+  /* Opaque surface for content floating over the window (flyout cards), even on Mica/Acrylic. */
+  --bg-overlay: #ffffff;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -102,6 +104,7 @@
     --focus-inner: #000000;
     --icon-knockout: #000000;
     --shadow-dialog: 0 8px 32px rgb(0 0 0 / 0.5), 0 2px 8px rgb(0 0 0 / 0.3);
+    --bg-overlay: #2b2b2b;
   }
 }
 
@@ -139,6 +142,7 @@
   --focus-inner: #000000;
   --icon-knockout: #000000;
   --shadow-dialog: 0 8px 32px rgb(0 0 0 / 0.5), 0 2px 8px rgb(0 0 0 / 0.3);
+  --bg-overlay: #2b2b2b;
   color-scheme: dark;
 }
 

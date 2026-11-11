@@ -5,6 +5,7 @@
   import { basename, bytes, count, dirname, plural, relative } from "../lib/format";
   import Icon from "../lib/Icon.svelte";
   import StateBadge from "../lib/StateBadge.svelte";
+  import UpdateButton from "../lib/UpdateButton.svelte";
   import { ACTION_LABEL, ACTIVITY, ISSUE_TITLE, stateVisual } from "../lib/status";
   import type { Issue, IssueAction } from "../lib/types";
 
@@ -30,7 +31,8 @@
     connect({ activity: true, issues: true, settings: true });
     if (flyout) {
       const onKey = (e: KeyboardEvent) => {
-        if (e.key === "Escape" && !e.defaultPrevented) {
+        // An open dialog handles Escape itself.
+        if (e.key === "Escape" && !e.defaultPrevented && !document.querySelector("dialog[open]")) {
           if (panel === "issues") showHome();
           else api.hidePopover();
         }
@@ -78,7 +80,7 @@
   // The header doubles as the title bar: press and drag anywhere on it except its buttons.
   function dragHeader(e: MouseEvent) {
     if (e.button !== 0 || e.detail > 1) return;
-    if ((e.target as HTMLElement).closest("button, a, input, select, textarea")) return;
+    if ((e.target as HTMLElement).closest("button, a, input, select, textarea, [data-no-drag]")) return;
     e.preventDefault();
     startDragging();
   }
@@ -106,6 +108,7 @@
     {#if drive.connection.mock}
       <span class="mock caption" title="The app is showing made-up data from the development mock.">Mock data</span>
     {/if}
+    <UpdateButton />
     <button
       class="btn subtle icon-only close"
       onclick={() => api.closeMain()}
@@ -353,6 +356,7 @@
   }
 
   .head {
+    position: relative;
     display: flex;
     align-items: center;
     gap: var(--s3);

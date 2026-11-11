@@ -172,6 +172,12 @@ impl Backend {
         self.stopping.store(true, Ordering::SeqCst);
     }
 
+    /// Start (and keep) the service running again, e.g. after an update failed to install.
+    pub fn resume_supervising(&self) {
+        self.stopping.store(false, Ordering::SeqCst);
+        self.wake.notify_one();
+    }
+
     /// Skip the current backoff and try to connect now.
     pub fn reconnect_now(&self) {
         self.wake.notify_one();
@@ -353,16 +359,20 @@ impl Backend {
     }
 
     pub fn set_settings(&self, s: Settings) {
-        let changed_autostart = {
+        let (changed_autostart, changed_auto_update) = {
             let mut cur = self.settings.lock().unwrap();
-            let changed = cur
+            let autostart = cur
                 .as_ref()
                 .is_none_or(|c| c.launch_at_login != s.launch_at_login);
+            let auto_update = cur.as_ref().is_none_or(|c| c.auto_update != s.auto_update);
             *cur = Some(s.clone());
-            changed
+            (autostart, auto_update)
         };
         if changed_autostart && !self.connection().mock {
             crate::platform::apply_autostart(&self.app, s.launch_at_login);
+        }
+        if changed_auto_update {
+            crate::updater::settings_changed(&self.app, s.auto_update);
         }
         let _ = self.app.emit(EV_SETTINGS, s);
     }

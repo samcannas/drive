@@ -13,6 +13,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::backend::{Backend, ConnectionInfo, Link};
 use crate::tray_icon::{Glyph, SYNC_FRAMES, render};
+use crate::updater::UpdateStatus;
 use crate::windows::{self, TrayRect};
 
 const TRAY_ID: &str = "main";
@@ -22,9 +23,11 @@ struct Items {
     status: MenuItem<tauri::Wry>,
     pause: MenuItem<tauri::Wry>,
     menu: Menu<tauri::Wry>,
-    /// "Restart to update", added to the menu once an update has been downloaded.
+    /// The update item ("Restart to update to …"), in the menu while an update is on offer.
     update: MenuItem<tauri::Wry>,
     update_shown: AtomicBool,
+    /// Label and enabled state last applied to `update`, to skip redundant menu calls.
+    update_label: Mutex<Option<(String, bool)>>,
 }
 
 #[derive(Default)]
@@ -114,6 +117,7 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
         menu,
         update,
         update_shown: AtomicBool::new(false),
+        update_label: Mutex::new(None),
     });
     Ok(())
 }
@@ -142,7 +146,7 @@ fn on_menu(app: &AppHandle, id: &str) {
         "update" => {
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
-                crate::updater::restart_to_update(&app, &backend).await
+                crate::updater::install_from_tray(&app, &backend).await
             });
         }
         "quit" => {
@@ -155,14 +159,45 @@ fn on_menu(app: &AppHandle, id: &str) {
     }
 }
 
-/// Offers "Restart to update" for a downloaded update: just above "Quit Drive".
-pub fn show_update(app: &AppHandle, version: &str) {
+/// The tray menu's update item for an update state: label and whether it can be clicked.
+fn update_item(status: &UpdateStatus) -> Option<(String, bool)> {
+    match status {
+        UpdateStatus::Available { version, .. }
+        | UpdateStatus::Error {
+            version: Some(version),
+            ..
+        } => Some((format!("Update to {version} and restart"), true)),
+        UpdateStatus::Downloading { .. } => Some(("Downloading update…".into(), false)),
+        UpdateStatus::Ready { version, .. } => {
+            Some((format!("Restart to update to {version}"), true))
+        }
+        UpdateStatus::Installing { .. } => Some(("Installing update…".into(), false)),
+        _ => None,
+    }
+}
+
+/// Keeps the update item in step with the update state: just above "Quit Drive" while an
+/// update is on offer, gone otherwise.
+pub fn show_update(app: &AppHandle, status: &UpdateStatus) {
     let Some(items) = app.try_state::<Items>() else {
         return;
     };
-    let _ = items
-        .update
-        .set_text(format!("Restart to update to {version}"));
+    let want = update_item(status);
+    {
+        let mut last = items.update_label.lock().unwrap();
+        if *last == want {
+            return;
+        }
+        *last = want.clone();
+    }
+    let Some((label, enabled)) = want else {
+        if items.update_shown.swap(false, Ordering::SeqCst) {
+            let _ = items.menu.remove(&items.update);
+        }
+        return;
+    };
+    let _ = items.update.set_text(label);
+    let _ = items.update.set_enabled(enabled);
     if !items.update_shown.swap(true, Ordering::SeqCst) {
         let quit_at = items
             .menu
@@ -174,6 +209,13 @@ pub fn show_update(app: &AppHandle, version: &str) {
             tracing::debug!("could not add the update menu item: {e}");
             items.update_shown.store(false, Ordering::SeqCst);
         }
+    }
+}
+
+/// Hides the tray icon right away (the Windows installer exits Drive without cleanup).
+pub fn hide(app: &AppHandle) {
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        let _ = tray.set_visible(false);
     }
 }
 

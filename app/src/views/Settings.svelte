@@ -1,18 +1,20 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { api, closeWindow, env, errorOf } from "../lib/api";
-  import { connect, drive } from "../lib/drive.svelte";
-  import { bytes, GB, plural } from "../lib/format";
+  import { connect, drive, updateVersion } from "../lib/drive.svelte";
+  import { bytes, GB, plural, relative } from "../lib/format";
   import Icon, { type IconName } from "../lib/Icon.svelte";
+  import ReleaseNotes from "../lib/ReleaseNotes.svelte";
   import type { AppInfo, SettingsPatch } from "../lib/types";
 
-  type Section = "general" | "storage" | "network" | "account" | "recovery" | "about";
+  type Section = "general" | "storage" | "network" | "account" | "recovery" | "updates" | "about";
   const SECTIONS: { id: Section; label: string; icon: IconName }[] = [
     { id: "general", label: "General", icon: "gear" },
     { id: "storage", label: "Storage", icon: "storage" },
     { id: "network", label: "Network", icon: "network" },
     { id: "account", label: "Account", icon: "user" },
     { id: "recovery", label: "Recovery", icon: "key" },
+    { id: "updates", label: "Updates", icon: "arrow-up-circle" },
     { id: "about", label: "About", icon: "info" },
   ];
   const windows = env().platform === "windows";
@@ -128,6 +130,40 @@
     }
   }
 
+  // ----- Updates
+  const upd = $derived(drive.update);
+  const offered = $derived(updateVersion(upd));
+  let updating = $state(false);
+  let updateError = $state<string | null>(null);
+  const updateBusy = $derived(
+    updating || upd?.state === "checking" || upd?.state === "downloading" || upd?.state === "installing",
+  );
+
+  async function checkUpdates() {
+    if (updateBusy) return;
+    updateError = null;
+    try {
+      await api.checkForUpdates();
+    } catch (e) {
+      // The state carries the message too; this covers a failed call.
+      if (drive.update?.state !== "error") updateError = errorOf(e).message;
+    }
+  }
+
+  async function installUpdate() {
+    if (updateBusy) return;
+    updating = true;
+    updateError = null;
+    try {
+      // Drive restarts once the update is installed; this only returns in the mock or on failure.
+      await api.installUpdate();
+    } catch (e) {
+      if (drive.update?.state !== "error") updateError = errorOf(e).message;
+    } finally {
+      updating = false;
+    }
+  }
+
   // ----- Recovery
   let kitSaving = $state(false);
   let kitResult = $state<{ ok: boolean; text: string } | null>(null);
@@ -171,7 +207,113 @@
       <p class="error-text" role="alert"><Icon name="alert" size={16} />{saveError}</p>
     {/if}
 
-    {#if section === "about"}
+    {#if section === "updates"}
+      <div class="group">
+        <div class="card setting update-status">
+          <span class="avatar" class:accent={offered !== null} aria-hidden="true"><Icon name="arrow-up-circle" /></span>
+          <div class="setting-text">
+            <p class="body-strong numeric">Drive {info?.version ?? "…"}</p>
+            <!-- Only the phase is live; the byte count would be re-announced several times a second. -->
+            <p class="caption secondary numeric">
+              <span role="status">{#if !upd || upd.state === "idle"}
+                Drive checks for updates every few hours.
+              {:else if upd.state === "disabled"}
+                Updates aren't available for this installation.
+              {:else if upd.state === "checking"}
+                Checking for updates…
+              {:else if upd.state === "up_to_date"}
+                Up to date · checked {relative(upd.checked_ms, drive.now)}
+              {:else if upd.state === "available"}
+                Version {upd.version} is available
+              {:else if upd.state === "downloading"}
+                Downloading version {upd.version}…
+              {:else if upd.state === "ready"}
+                Version {upd.version} is ready to install
+              {:else if upd.state === "installing"}
+                Installing version {upd.version}… Drive restarts in a moment.
+              {:else if upd.state === "error"}
+                {upd.version ? `Version ${upd.version} is available` : "Couldn't check for updates"}
+              {/if}</span>{#if upd?.state === "downloading" && upd.total_bytes}
+                {` ${bytes(upd.done_bytes)} of ${bytes(upd.total_bytes)}`}
+              {/if}
+            </p>
+          </div>
+          {#if upd && upd.state !== "disabled"}
+            {#if offered}
+              <button class="btn primary" aria-disabled={updateBusy} onclick={installUpdate}>
+                {upd.state === "installing" || updating ? "Updating…" : "Update and restart"}
+              </button>
+            {:else}
+              <button class="btn" aria-disabled={updateBusy} onclick={checkUpdates}>
+                {upd.state === "checking" ? "Checking…" : "Check for updates"}
+              </button>
+            {/if}
+          {/if}
+          {#if upd?.state === "downloading" && upd.total_bytes}
+            <div
+              class="meter update-meter"
+              role="progressbar"
+              aria-label="Download progress"
+              aria-valuemin="0"
+              aria-valuemax="100"
+              aria-valuenow={Math.round((Math.min(upd.done_bytes, upd.total_bytes) / upd.total_bytes) * 100)}
+            >
+              <span style:width="{(Math.min(upd.done_bytes, upd.total_bytes) / upd.total_bytes) * 100}%"></span>
+            </div>
+          {/if}
+        </div>
+
+        {#if upd?.state === "disabled"}
+          <div class="callout info">
+            <Icon name="info" size={18} />
+            <p>{upd.reason}</p>
+          </div>
+        {/if}
+
+        {#if (upd?.state === "error" && !updateBusy) || updateError}
+          <div class="callout danger" role="alert">
+            <Icon name="alert" size={18} />
+            <p>{updateError ?? (upd?.state === "error" ? upd.message : "")}</p>
+            <div class="actions">
+              <button class="btn" onclick={offered ? installUpdate : checkUpdates}>Try again</button>
+            </div>
+          </div>
+        {/if}
+
+        {#if offered && drive.changelog.length}
+          <section class="card changelog" aria-labelledby="changelog-title">
+            <h2 id="changelog-title" class="body-strong">What's new</h2>
+            <ReleaseNotes releases={drive.changelog} />
+          </section>
+        {/if}
+
+        {#if upd?.state !== "disabled"}
+          {#if s}
+            <label class="card setting">
+              <span class="setting-text">
+                <span id="auto_update-label">Download updates automatically</span>
+                <span class="caption secondary" id="auto_update-desc">
+                  {s.auto_update
+                    ? "New versions download in the background. Drive installs them when you choose to restart."
+                    : "Drive tells you when a new version is out and downloads it only when you choose to update."}
+                </span>
+              </span>
+              <input
+                type="checkbox"
+                role="switch"
+                class="switch"
+                aria-labelledby="auto_update-label"
+                aria-describedby="auto_update-desc"
+                checked={s.auto_update}
+                onchange={(e) => save({ auto_update: e.currentTarget.checked })}
+              />
+            </label>
+          {:else}
+            <p class="caption secondary">The automatic download setting appears when Drive is running.</p>
+          {/if}
+        {/if}
+      </div>
+    {:else if section === "about"}
       <div class="group">
         <div class="card about">
           <img src="/app-icon.svg" alt="" width="56" height="56" />
@@ -754,6 +896,22 @@
   .token-row .input {
     flex: 1;
     min-width: 200px;
+  }
+
+  .update-status {
+    flex-wrap: wrap;
+  }
+  .update-meter {
+    flex-basis: 100%;
+  }
+  .avatar.accent {
+    background: var(--accent-soft);
+    color: var(--accent-text);
+  }
+  .changelog {
+    display: grid;
+    gap: var(--s3);
+    padding: var(--s4);
   }
 
   .about {

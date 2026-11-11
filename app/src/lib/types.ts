@@ -34,6 +34,8 @@ export interface Settings {
   device_name: string;
   app_token_custom: boolean;
   close_action: CloseAction;
+  /** Download updates in the background and offer to restart; when off, only notify. */
+  auto_update: boolean;
 }
 
 /** What the window's close (X) button does: hide to the tray, or quit Drive. */
@@ -115,6 +117,27 @@ export interface AppInfo {
   platform: string;
   repository: string;
   connection: ConnectionInfo;
+}
+
+/** The in-app updater's state (app/src-tauri/src/updater.rs `UpdateStatus`). Dates are RFC 3339. */
+export type UpdateState =
+  | { state: "disabled"; reason: string }
+  | { state: "idle" }
+  | { state: "checking" }
+  | { state: "up_to_date"; checked_ms: number }
+  | { state: "available"; version: string; date: string | null; notes: string[] }
+  | { state: "downloading"; version: string; done_bytes: number; total_bytes: number | null }
+  | { state: "ready"; version: string; date: string | null; notes: string[] }
+  | { state: "installing"; version: string }
+  /** `version` is set while an update is still on offer: retrying installs it. */
+  | { state: "error"; message: string; version: string | null };
+
+/** A release newer than the running version, from the release changelog. */
+export interface Release {
+  version: string;
+  date: string | null;
+  url: string | null;
+  notes: string[];
 }
 
 /** Error shape returned by every command. `code` is an ipc ErrorCode, or unavailable / timeout. */

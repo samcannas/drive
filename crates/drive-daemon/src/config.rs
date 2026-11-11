@@ -84,6 +84,8 @@ pub struct Config {
     pub launch_at_login: bool,
     pub notifications: bool,
     pub close_action: CloseAction,
+    /// Install app updates automatically (the tray app reads this; the service only stores it).
+    pub auto_update: bool,
     /// A dedicated uloz.to API key; `None` uses the shared default.
     pub app_token: Option<String>,
 }
@@ -112,6 +114,7 @@ impl Default for Config {
             launch_at_login: true,
             notifications: true,
             close_action: CloseAction::Minimize,
+            auto_update: true,
             app_token: None,
         }
     }
@@ -186,6 +189,7 @@ impl Config {
             device_name: self.device_name.clone(),
             app_token_custom: self.app_token.is_some(),
             close_action: self.close_action,
+            auto_update: self.auto_update,
         }
     }
 }

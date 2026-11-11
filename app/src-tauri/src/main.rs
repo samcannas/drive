@@ -72,6 +72,10 @@ fn main() {
             commands::close_main,
             commands::reconnect,
             commands::quit,
+            updater::update_state,
+            updater::check_for_updates,
+            updater::install_update,
+            updater::update_changelog,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
