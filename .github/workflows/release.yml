@@ -109,7 +109,7 @@ jobs:
         run: .github/release/set-version.sh "$VERSION"
 
       - name: Build the service (sidecar)
-        run: scripts/prepare-sidecar.sh
+        run: bash scripts/prepare-sidecar.sh
 
       - name: Build the bundles
         working-directory: app
