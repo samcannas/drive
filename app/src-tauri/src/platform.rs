@@ -116,3 +116,86 @@ pub fn supports_backdrop() -> bool {
         false
     }
 }
+
+/// Makes the popover a tool window, as Windows' own tray flyouts are: never in the taskbar or
+/// Alt+Tab, and left alone by tiling window managers (GlazeWM, komorebi), which otherwise
+/// manage it like an app window and center it each time it appears. Tauri rewrites a
+/// window's extended styles whenever it shows it, so a subclass keeps the tool-window style
+/// through every change. Also asks for the standard Windows 11 rounded corners, which tool
+/// windows don't get by default.
+#[cfg(windows)]
+pub fn make_flyout(win: &tauri::WebviewWindow) {
+    let Ok(handle) = win.hwnd() else { return };
+    // Raw value: HWND isn't Send, and the subclass must be installed on the window's thread.
+    let raw = handle.0 as isize;
+    let _ = win.run_on_main_thread(move || flyout::install(raw));
+}
+
+#[cfg(windows)]
+mod flyout {
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::Graphics::Dwm::{
+        DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
+    };
+    use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GetWindowLongPtrW, STYLESTRUCT, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+        SWP_NOSIZE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, WM_STYLECHANGING,
+        WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    };
+
+    const SUBCLASS_ID: usize = 0x4452_5631; // "DRV1"
+
+    fn flyout_style(ex: u32) -> u32 {
+        (ex | WS_EX_TOOLWINDOW.0) & !WS_EX_APPWINDOW.0
+    }
+
+    unsafe extern "system" fn proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+        _id: usize,
+        _data: usize,
+    ) -> LRESULT {
+        if msg == WM_STYLECHANGING && wparam.0 as i32 == GWL_EXSTYLE.0 {
+            // SAFETY: for WM_STYLECHANGING, lparam points to a STYLESTRUCT we may change.
+            let s = unsafe { &mut *(lparam.0 as *mut STYLESTRUCT) };
+            s.styleNew = flyout_style(s.styleNew);
+        }
+        // SAFETY: forwarding the message unchanged to the next window procedure.
+        unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+    }
+
+    pub fn install(raw: isize) {
+        let hwnd = HWND(raw as *mut _);
+        // SAFETY: `hwnd` is this process's live window and we're on its thread; the calls
+        // only change its styles and add a window procedure that lives as long as the program.
+        unsafe {
+            let _ = SetWindowSubclass(hwnd, Some(proc), SUBCLASS_ID, 0);
+            let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+            if flyout_style(ex) != ex {
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, flyout_style(ex) as isize);
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                );
+            }
+            let round = DWMWCP_ROUND;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                (&raw const round).cast(),
+                size_of_val(&round) as u32,
+            );
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn make_flyout(_win: &tauri::WebviewWindow) {}

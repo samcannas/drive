@@ -80,6 +80,7 @@ fn main() {
             app.manage(backend.clone());
             app.manage(windows::PopoverState::default());
             tray::create(&handle)?;
+            windows::prepare_popover(&handle);
             backend.start(autostarted);
             updater::start(&handle);
             Ok(())
@@ -109,7 +110,12 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
         std::fs::create_dir_all(&d).ok()?;
         tracing_appender::rolling::Builder::new()
             .rotation(tracing_appender::rolling::Rotation::DAILY)
-            .filename_prefix("app")
+            // Development builds keep their own log so test runs never mix into a real install's.
+            .filename_prefix(if cfg!(debug_assertions) {
+                "app-dev"
+            } else {
+                "app"
+            })
             .filename_suffix("log")
             .max_log_files(7)
             .build(d)

@@ -1183,6 +1183,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "windows",
  "windows-registry 0.5.3",
 ]
 

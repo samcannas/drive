@@ -54,6 +54,9 @@ impl PopoverState {
 /// and there's no tray rectangle to anchor to, so it's an ordinary small window.
 const FLYOUT: bool = cfg!(windows);
 
+/// How long a lost focus must last before the flyout hides.
+const BLUR_GRACE: Duration = Duration::from_millis(150);
+
 fn env_script(view: &str, material: &str) -> String {
     format!(
         "window.__DRIVE_ENV__ = {};",
@@ -115,34 +118,40 @@ fn popover(app: &AppHandle) -> tauri::Result<WebviewWindow> {
         b.resizable(true).min_inner_size(340.0, 420.0).center()
     };
     let win = b.build()?;
+    if FLYOUT {
+        crate::platform::make_flyout(&win);
+    }
     let handle = app.clone();
     // Debug builds can keep the flyout open when it loses focus (UI work, automated checks).
     let hide_on_blur =
         FLYOUT && !(cfg!(debug_assertions) && std::env::var_os("DRIVE_UI_KEEP_OPEN").is_some());
     let this = win.clone();
-    win.on_window_event(move |e| match e {
-        WindowEvent::Focused(false) if hide_on_blur => hide_window(&handle, &this),
-        WindowEvent::Moved(pos) => {
-            let state = handle.state::<PopoverState>();
-            let visible = handle
-                .get_webview_window(POPOVER)
-                .and_then(|w| w.is_visible().ok())
-                .unwrap_or(false);
-            if visible && !state.recently_placed() {
-                *state.dragged_to.lock().unwrap() = Some(*pos);
+    win.on_window_event(move |e| {
+        tracing::trace!(event = ?e, "popover window event");
+        match e {
+            WindowEvent::Focused(false) if hide_on_blur => hide_after_blur(&handle, &this),
+            WindowEvent::Moved(pos) => {
+                let state = handle.state::<PopoverState>();
+                let visible = handle
+                    .get_webview_window(POPOVER)
+                    .and_then(|w| w.is_visible().ok())
+                    .unwrap_or(false);
+                if visible && !state.recently_placed() {
+                    *state.dragged_to.lock().unwrap() = Some(*pos);
+                }
             }
+            WindowEvent::CloseRequested { api, .. } => {
+                // The native close button (Linux window) follows the same setting as our X.
+                api.prevent_close();
+                let handle = handle.clone();
+                let this = this.clone();
+                tauri::async_runtime::spawn(async move {
+                    let svc = handle.state::<std::sync::Arc<crate::backend::Backend>>();
+                    crate::commands::close_main_window(&handle, svc.inner(), Some(&this)).await;
+                });
+            }
+            _ => {}
         }
-        WindowEvent::CloseRequested { api, .. } => {
-            // The native close button (Linux window) follows the same setting as our X.
-            api.prevent_close();
-            let handle = handle.clone();
-            let this = this.clone();
-            tauri::async_runtime::spawn(async move {
-                let svc = handle.state::<std::sync::Arc<crate::backend::Backend>>();
-                crate::commands::close_main_window(&handle, svc.inner(), Some(&this)).await;
-            });
-        }
-        _ => {}
     });
     Ok(win)
 }
@@ -163,21 +172,49 @@ pub fn show_main(app: &AppHandle, rect: Option<TrayRect>) {
     };
     state.generation.fetch_add(1, Ordering::SeqCst);
     if FLYOUT {
+        // Positioned while hidden, so it appears in place. (It's a tool window, so window
+        // managers don't move it afterwards; see `platform::make_flyout`.)
         place(app, &win, rect);
     }
     let _ = win.show();
     if FLYOUT {
-        // A window created hidden with a backdrop effect loses its "skip taskbar" flag on
-        // Windows, so set it again whenever the flyout appears.
-        let _ = win.set_skip_taskbar(true);
-        // The first show of a new window can override the position set while hidden.
-        place(app, &win, rect);
         tracing::debug!(pos = ?win.outer_position().ok(), size = ?win.outer_size().ok(), "popover shown");
+    } else {
+        let _ = win.unminimize();
     }
-    let _ = win.unminimize();
     let _ = win.set_focus();
     let _ = win.emit_to(POPOVER, EV_POPOVER_SHOWN, ());
     crate::updater::popover_opened(app);
+}
+
+/// Creates the popover hidden at startup, so the first click shows a window that has already
+/// loaded and drawn its content.
+pub fn prepare_popover(app: &AppHandle) {
+    if let Err(e) = popover(app) {
+        tracing::warn!("could not prepare the popover: {e}");
+    }
+}
+
+/// The popover lost focus: hide it if it is still unfocused a moment later. Focus moving
+/// into the popover's own web content (on the first show of a new window, for one) reports a
+/// blur followed at once by focus; hiding on that made the first click open and close it.
+fn hide_after_blur(app: &AppHandle, win: &WebviewWindow) {
+    let generation = app
+        .state::<PopoverState>()
+        .generation
+        .load(Ordering::SeqCst);
+    let (app, win) = (app.clone(), win.clone());
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(BLUR_GRACE).await;
+        let state = app.state::<PopoverState>();
+        // Shown again or hidden meanwhile: that decided it.
+        if state.generation.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        if !win.is_focused().unwrap_or(false) {
+            hide_window(&app, &win);
+        }
+    });
 }
 
 /// Left click on the tray icon.
