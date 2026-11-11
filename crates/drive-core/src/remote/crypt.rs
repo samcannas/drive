@@ -258,6 +258,11 @@ impl<R: Remote> Remote for CryptRemote<R> {
         let raw = self.inner_entry(entry)?;
         self.inner.trash(&raw).await
     }
+
+    async fn exists(&self, entry: &RemoteEntry) -> Result<bool, RemoteError> {
+        let raw = self.inner_entry(entry)?;
+        self.inner.exists(&raw).await
+    }
 }
 
 #[cfg(test)]

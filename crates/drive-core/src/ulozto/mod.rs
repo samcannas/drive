@@ -453,6 +453,15 @@ impl UlozClient {
         Ok(f)
     }
 
+    /// Whether a file exists and is not in the trash.
+    pub async fn file_exists(&self, slug: &str) -> Result<bool, RemoteError> {
+        match self.call::<api::File, ()>(Method::GET, &format!("/v7/file/{slug}/private"), &[], None).await {
+            Ok(f) => Ok(!f.is_in_trash && f.status.as_deref().is_none_or(|s| s == "ok")),
+            Err(RemoteError::NotFound(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     pub async fn update_file(&self, slug: &str, req: &api::UpdateFileRequest<'_>) -> Result<api::File, RemoteError> {
         self.call(Method::PATCH, &format!("/v8/file/{slug}/private"), &[], Some(req)).await
     }
@@ -824,6 +833,13 @@ impl Remote for UlozRemote {
         match r {
             Err(RemoteError::NotFound(_)) => Ok(()), // already gone
             other => other,
+        }
+    }
+
+    async fn exists(&self, entry: &RemoteEntry) -> Result<bool, RemoteError> {
+        match entry.kind {
+            Kind::File => self.client.file_exists(&entry.id).await,
+            Kind::Folder => Ok(true),
         }
     }
 }

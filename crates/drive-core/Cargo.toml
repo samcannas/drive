@@ -35,6 +35,8 @@ data-encoding = "2"
 hex = "0.4"
 zeroize = "1"
 url = "2"
+fs4 = { version = "0.13", features = ["sync"] }
+tokio-stream = "0.1"
 
 [dev-dependencies]
 tempfile.workspace = true

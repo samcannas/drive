@@ -156,6 +156,17 @@ impl MemRemote {
         out
     }
 
+    /// Live items directly under the root, as `(id, name)`.
+    pub fn snapshot_ids(&self) -> Vec<(String, String)> {
+        self.items
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, i)| i.parent == ROOT && !i.trashed)
+            .map(|(id, i)| (id.clone(), i.name.clone()))
+            .collect()
+    }
+
     pub fn trashed_names(&self) -> Vec<String> {
         self.items.lock().unwrap().values().filter(|i| i.trashed).map(|i| i.name.clone()).collect()
     }
@@ -237,10 +248,15 @@ impl Remote for MemRemote {
 
     async fn trash(&self, entry: &RemoteEntry) -> Result<(), RemoteError> {
         self.check(format!("trash {}", entry.name))?;
-        if !self.items.lock().unwrap().contains_key(&entry.id) {
+        if !self.items.lock().unwrap().get(&entry.id).is_some_and(|i| !i.trashed) {
             return Err(RemoteError::NotFound(entry.id.clone()));
         }
         self.remove(&entry.id);
         Ok(())
+    }
+
+    async fn exists(&self, entry: &RemoteEntry) -> Result<bool, RemoteError> {
+        self.check(String::new())?;
+        Ok(self.items.lock().unwrap().get(&entry.id).is_some_and(|i| !i.trashed))
     }
 }

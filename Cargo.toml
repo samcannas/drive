@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/drive-core", "crates/drive-daemon"]
+members = ["crates/drive-core", "crates/drive-daemon", "app/src-tauri"]
 default-members = ["crates/drive-core", "crates/drive-daemon"]
 
 [workspace.package]

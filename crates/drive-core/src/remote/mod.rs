@@ -112,6 +112,9 @@ pub trait Remote: Send + Sync + 'static {
     async fn rename(&self, entry: &RemoteEntry, new_parent_id: &str, new_name: &str) -> Result<RemoteEntry, RemoteError>;
     /// Moves to the provider's trash (recoverable), or deletes if there is no trash.
     async fn trash(&self, entry: &RemoteEntry) -> Result<(), RemoteError>;
+    /// Whether a file still exists (not deleted or trashed). Used before uploading an edit to
+    /// make sure the version it was based on is still the current one.
+    async fn exists(&self, entry: &RemoteEntry) -> Result<bool, RemoteError>;
 }
 
 /// Collects a stream into memory (tests and small reads).

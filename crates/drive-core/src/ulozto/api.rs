@@ -54,6 +54,8 @@ pub struct File {
     #[serde(default)]
     pub is_in_trash: bool,
     #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
     pub is_incomplete: bool,
     #[serde(default)]
     pub content_status: Option<String>,
