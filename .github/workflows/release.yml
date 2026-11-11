@@ -18,6 +18,9 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  # Pinned to the toolchain the team develops with, so clippy/rustfmt in CI match local runs.
+  # Bump it deliberately (and fix the new lints) rather than following `stable`.
+  RUST_TOOLCHAIN: 1.94.1
   VERSION: 0.1.${{ github.run_number }}
 
 jobs:
@@ -26,7 +29,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release
@@ -78,7 +83,9 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release

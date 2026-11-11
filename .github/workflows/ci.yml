@@ -16,6 +16,9 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  # Pinned to the toolchain the team develops with, so clippy/rustfmt in CI match local runs.
+  # Bump it deliberately (and fix the new lints) rather than following `stable`.
+  RUST_TOOLCHAIN: 1.94.1
   RUST_BACKTRACE: short
   # Not RCLONE_*: rclone reads every RCLONE_<FLAG> variable as a command-line flag.
   RCLONE_RELEASE: v1.76.0
@@ -31,8 +34,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt, clippy
 
       - name: Install Linux packages (FUSE, WebKitGTK 4.1, appindicator)
