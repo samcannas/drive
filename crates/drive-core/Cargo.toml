@@ -1,0 +1,41 @@
+[package]
+name = "drive-core"
+description = "Sync engine, uloz.to client and rclone-compatible encryption for Drive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+rusqlite.workspace = true
+reqwest.workspace = true
+rand.workspace = true
+base64.workspace = true
+dirs.workspace = true
+interprocess.workspace = true
+# Crypto, pinned to the RustCrypto releases whose APIs match rclone's primitives.
+crypto_secretbox = "0.1"
+scrypt = { version = "0.11", default-features = false }
+aes = "0.8"
+ctr = "0.9"
+sha2 = "0.10"
+md-5 = "0.10"
+data-encoding = "2"
+hex = "0.4"
+zeroize = "1"
+url = "2"
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

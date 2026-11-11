@@ -1,0 +1,48 @@
+[workspace]
+resolver = "3"
+members = ["crates/drive-core", "crates/drive-daemon"]
+default-members = ["crates/drive-core", "crates/drive-daemon"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/samcannas/drive"
+rust-version = "1.93"
+
+[workspace.dependencies]
+drive-core = { path = "crates/drive-core" }
+anyhow = "1"
+thiserror = "2"
+async-trait = "0.1"
+bytes = "1"
+futures = "0.3"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io", "compat"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock", "std"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls", "http2"] }
+interprocess = { version = "2", features = ["tokio"] }
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+rand = "0.8"
+base64 = "0.22"
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true
+
+[profile.dev]
+# Keep debug builds small: this machine is short on disk space.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+opt-level = 1
