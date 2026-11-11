@@ -110,21 +110,6 @@ fn same_path(a: &Path, b: &Path) -> bool {
     norm(a) == norm(b)
 }
 
-#[cfg(test)]
-mod path_tests {
-    use super::same_path;
-    use std::path::Path;
-
-    #[test]
-    fn spellings_of_one_folder_match() {
-        let reg = Path::new(r"C:\Users\me\Drive");
-        assert!(same_path(reg, Path::new("C:/Users/me/Drive")));
-        assert!(same_path(reg, Path::new(r"c:\users\ME\Drive\")));
-        assert!(same_path(reg, Path::new(r"\\?\C:\Users\me\Drive")));
-        assert!(!same_path(reg, Path::new(r"C:\Users\me\Drive2")));
-    }
-}
-
 /// Icon shown in the navigation pane: the tray app's icon when it is installed next to us
 /// (drive.exe itself has no icon resource), else a system icon.
 fn icon_resource() -> String {
@@ -314,4 +299,19 @@ pub fn is_sync_root(folder: &Path) -> bool {
         .ok()
         .and_then(|f| f.sync_root_info().ok().flatten())
         .is_some()
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::same_path;
+    use std::path::Path;
+
+    #[test]
+    fn spellings_of_one_folder_match() {
+        let reg = Path::new(r"C:\Users\me\Drive");
+        assert!(same_path(reg, Path::new("C:/Users/me/Drive")));
+        assert!(same_path(reg, Path::new(r"c:\users\ME\Drive\")));
+        assert!(same_path(reg, Path::new(r"\\?\C:\Users\me\Drive")));
+        assert!(!same_path(reg, Path::new(r"C:\Users\me\Drive2")));
+    }
 }
