@@ -752,6 +752,38 @@ mod tests {
         assert_eq!(db.issue_count().unwrap(), 0);
     }
 
+    /// Every hot query must be served by an index (no full scans of `node`).
+    #[test]
+    fn hot_queries_use_indexes() {
+        let db = Db::open_in_memory().unwrap();
+        let plan = |sql: &str| -> String {
+            db.read(|c| {
+                let mut st = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                let rows: Vec<String> = st.query_map([], |r| r.get::<_, String>(3))?.collect::<Result<_, _>>()?;
+                Ok(rows.join(" | "))
+            })
+            .unwrap()
+        };
+        let cases = [
+            ("SELECT id FROM node WHERE parent_id = 1 AND name_key = 'a' AND deleted = 0", "node_parent_name_key_idx"),
+            ("SELECT id FROM node WHERE parent_id = 1", "node_parent_id_idx"),
+            ("SELECT id FROM node WHERE pending != 0 AND retry_at_ms <= 5 ORDER BY retry_at_ms LIMIT 10", "node_pending_idx"),
+            (
+                "SELECT id FROM node WHERE hydrated = 1 AND pinned = 0 AND kind = 0 AND dirty = 0 ORDER BY accessed_ms LIMIT 10",
+                "node_lru_idx",
+            ),
+            ("SELECT id FROM node WHERE remote_id = 'x'", "sqlite_autoindex_node_1"),
+            ("SELECT id FROM activity WHERE id < 100 ORDER BY id DESC LIMIT 10", "INTEGER PRIMARY KEY"),
+        ];
+        for (sql, index) in cases {
+            let p = plan(sql);
+            assert!(p.contains(index), "{sql}
+  plan: {p}");
+            assert!(!p.contains("SCAN node") || p.contains("USING"), "{sql}
+  full scan: {p}");
+        }
+    }
+
     #[test]
     fn file_db_reopens() {
         let dir = tempfile::tempdir().unwrap();
