@@ -342,12 +342,17 @@ async fn concurrent_edits_keep_both_versions() {
     );
     assert_eq!(a.read("notes.txt").await, b.read("notes.txt").await);
     assert_eq!(a.read(&copy).await, b.read(&copy).await);
-    assert!(
-        b.engine
+    // The device that resolves the collision reports it; the other just receives the copy.
+    let reported = |d: &Device| {
+        d.engine
             .issues()
             .unwrap()
             .iter()
             .any(|i| i.kind == IssueKind::Conflict)
+    };
+    assert!(
+        reported(&a) || reported(&b),
+        "no device reported the conflict"
     );
 }
 

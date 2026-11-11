@@ -78,7 +78,11 @@ enum Command {
     /// Print an rclone configuration that opens the vault without Drive.
     Recovery,
     /// Disconnect the account from this device.
-    SignOut,
+    SignOut {
+        /// Don't ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Stop the background service.
     Stop,
 }
@@ -199,8 +203,19 @@ fn human_bytes(b: u64) -> String {
     }
 }
 
+/// Reads a secret from the terminal without echo, or one line from stdin when there is no
+/// terminal (scripts, headless servers: `echo "$PW" | drive setup ...`).
 fn prompt_secret(label: &str) -> Result<String> {
-    rpassword::prompt_password(label).context("reading password")
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        return rpassword::prompt_password(label).context("reading password");
+    }
+    let mut line = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .context("reading password from stdin")?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
 }
 
 async fn run_client(cmd: Command) -> Result<()> {
@@ -396,7 +411,12 @@ async fn run_client(cmd: Command) -> Result<()> {
                 kit.encryption_password, kit.encryption_salt, kit.instructions
             );
         }
-        Command::SignOut => {
+        Command::SignOut { yes } => {
+            if yes {
+                client.call_value(Call::SignOut).await?;
+                println!("Signed out.");
+                return Ok(());
+            }
             print!(
                 "Disconnect this device from uloz.to? Files that only exist in the cloud disappear from this device (they stay in the cloud). [y/N] "
             );

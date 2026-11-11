@@ -192,6 +192,14 @@ pub fn open_read_deny_write(path: &Path, write_attrs: bool) -> io::Result<File> 
         .open(path)
 }
 
+/// Opens for reading while letting other apps keep writing, renaming and deleting.
+pub fn open_read_shared(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .access_mode(windows::Win32::Foundation::GENERIC_READ.0)
+        .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0)
+        .open(path)
+}
+
 pub fn is_sharing_violation(e: &io::Error) -> bool {
     // ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
     matches!(e.raw_os_error(), Some(32) | Some(33))

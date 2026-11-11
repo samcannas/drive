@@ -278,7 +278,11 @@ impl LocalSide for WinLocal {
 
     fn open_for_upload(&self, item: &LocalItem) -> io::Result<UploadSource> {
         let abs = self.shared.abs(&item.path);
-        let file = open_read_deny_write(&abs, false).map_err(|e| {
+        // Probe with writers denied: if an app still has the file open for writing, wait
+        // until it's done. The probe is released straight away so the upload itself never
+        // blocks an app from saving; a save during the upload is caught by `uploaded()`
+        // (size/mtime changed) and uploaded again.
+        drop(open_read_deny_write(&abs, false).map_err(|e| {
             if is_sharing_violation(&e) {
                 io::Error::new(
                     io::ErrorKind::WouldBlock,
@@ -287,7 +291,8 @@ impl LocalSide for WinLocal {
             } else {
                 e
             }
-        })?;
+        })?);
+        let file = util::open_read_shared(&abs)?;
         let meta = file.metadata()?;
         if meta.is_dir() {
             return Err(io::Error::new(

@@ -100,6 +100,10 @@ pub struct PlanInput<'a> {
     pub stamp: &'a str,
     /// Apply large remote deletions without holding them back.
     pub allow_mass_removal: bool,
+    /// Nodes with a transfer or remote operation in flight. Their remote state is about to
+    /// change, so the listing can't be compared with them yet (an upload that finished
+    /// between the listing and now would otherwise look like a conflict).
+    pub busy: &'a HashSet<NodeId>,
 }
 
 #[derive(Debug, Clone)]
@@ -365,6 +369,7 @@ pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
             **id > 0
                 && **id != ROOT_ID
                 && n.op_seq <= input.scan_seq
+                && !input.busy.contains(id)
                 && n.remote_id
                     .as_deref()
                     .is_some_and(|r| !remote.contains_key(r))
@@ -451,7 +456,7 @@ fn place(
 ) -> Option<NodeId> {
     if let Some(&id) = m.by_remote.get(&e.id) {
         let n = m.nodes[&id].clone();
-        if n.op_seq > input.scan_seq || n.kind != e.kind {
+        if n.op_seq > input.scan_seq || n.kind != e.kind || input.busy.contains(&id) {
             return Some(id);
         }
         let moved = n.base_parent.as_deref() != Some(e.parent_id.as_str())
@@ -505,6 +510,10 @@ fn place(
     let pinned = m.nodes.get(&parent).is_some_and(|p| p.pinned);
     let mut needs_move = false;
     if let Some(&x) = m.by_name.get(&(parent, name_key(&e.name))) {
+        if input.busy.contains(&x) {
+            // Most likely our own upload/mkdir that just finished; decide on the next scan.
+            return None;
+        }
         let xn = m.nodes[&x].clone();
         let old_gone = xn
             .remote_id
@@ -711,6 +720,7 @@ mod tests {
             device_name: "PC",
             stamp: "2026-11-10 1200",
             allow_mass_removal: false,
+            busy: &HashSet::new(),
         })
         .unwrap()
     }
@@ -939,6 +949,7 @@ mod tests {
             device_name: "PC",
             stamp: "x",
             allow_mass_removal: false,
+            busy: &HashSet::new(),
         });
         assert_eq!(r.unwrap_err(), PlanError::WrongPassword(1));
     }
@@ -948,6 +959,35 @@ mod tests {
         let p = run(&[root()], vec![entry("a", "R", "bad:name", Kind::File)]);
         assert!(p.changes.is_empty());
         assert_eq!(p.invalid_names.len(), 1);
+    }
+
+    #[test]
+    fn in_flight_upload_is_not_a_conflict() {
+        // Our upload finished remotely but the row doesn't have the remote id yet.
+        let mut n = node(3, 1, "a.txt", Kind::File, None);
+        n.dirty = true;
+        n.pending = pending::PUSH;
+        let tree = RemoteTree {
+            root_id: "R".into(),
+            entries: vec![entry("new", "R", "a.txt", Kind::File)],
+            skipped: vec![],
+        };
+        let orphans = HashSet::new();
+        let busy: HashSet<NodeId> = [3].into();
+        let p = plan(&PlanInput {
+            nodes: &[root(), n],
+            tree: &tree,
+            scan_seq: 10,
+            orphans: &orphans,
+            valid_name: &crate::engine::local::valid_portable_name,
+            device_name: "PC",
+            stamp: "x",
+            allow_mass_removal: false,
+            busy: &busy,
+        })
+        .unwrap();
+        assert!(p.changes.is_empty(), "{:?}", p.changes);
+        assert!(p.conflicts.is_empty());
     }
 
     #[test]

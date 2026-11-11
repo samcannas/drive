@@ -107,6 +107,8 @@ pub struct Engine {
     db: Arc<Db>,
     remote: Arc<dyn Remote>,
     local: OnceLock<Arc<dyn LocalSide>>,
+    /// Handle to ourselves for spawning work from `&self` methods; set by `start()`.
+    me: OnceLock<std::sync::Weak<Engine>>,
     cfg: RwLock<EngineConfig>,
     status_tx: watch::Sender<Status>,
     events: broadcast::Sender<Event>,
@@ -160,6 +162,7 @@ impl Engine {
             db,
             remote,
             local: OnceLock::new(),
+            me: OnceLock::new(),
             cfg: RwLock::new(cfg),
             status_tx,
             events,
@@ -226,6 +229,7 @@ impl Engine {
 
     /// Spawns the background loops on the current Tokio runtime.
     pub fn start(self: &Arc<Self>) {
+        let _ = self.me.set(Arc::downgrade(self));
         assert!(
             self.local.get().is_some(),
             "Engine::set_local must be called before start"
@@ -1130,6 +1134,9 @@ impl Engine {
     }
 
     fn apply_scan(&self, tree: crate::remote::RemoteTree, scan_seq: i64) -> Result<()> {
+        // Snapshot in-flight work *before* reading the rows: anything that finishes in
+        // between is then either still marked busy or already recorded in its row.
+        let busy: HashSet<NodeId> = self.in_flight.lock().unwrap().clone();
         let nodes = self.db.all_nodes()?;
         let mut orphans = self.db.orphan_ids()?;
         orphans.extend(
@@ -1153,6 +1160,7 @@ impl Engine {
             device_name: &cfg.device_name,
             stamp: &stamp,
             allow_mass_removal: now_ms() < self.allow_remote_removal_until.load(Ordering::Relaxed),
+            busy: &busy,
         });
         let plan = match plan {
             Ok(p) => {
@@ -1235,6 +1243,10 @@ impl Engine {
                 Some(&e.name),
                 &format!("\"{}\" can't be shown on this device because its name isn't allowed here. Rename it on another device.", e.name),
             );
+        }
+        // New or replaced files inside pinned folders: download them now.
+        if let Some(me) = self.me.get().and_then(|w| w.upgrade()) {
+            me.resume_pins();
         }
         let now = now_ms();
         self.last_sync_ms.store(now, Ordering::Relaxed);
