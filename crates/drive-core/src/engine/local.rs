@@ -76,7 +76,9 @@ pub fn valid_portable_name(name: &str) -> bool {
     if name.is_empty() || name == "." || name == ".." || name.len() > 255 {
         return false;
     }
-    if name.chars().any(|c| matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || (c as u32) < 32) {
+    if name.chars().any(|c| {
+        matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || (c as u32) < 32
+    }) {
         return false;
     }
     if name.ends_with(' ') || name.ends_with('.') {
@@ -85,14 +87,39 @@ pub fn valid_portable_name(name: &str) -> bool {
     let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
     !matches!(
         stem.as_str(),
-        "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9"
-            | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9"
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
     )
 }
 
 /// Names only invalid on Unix (`/` and NUL). Used by the Linux layer.
 pub fn valid_unix_name(name: &str) -> bool {
-    !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0') && name.len() <= 255
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\0')
+        && name.len() <= 255
 }
 
 /// Temporary/lock files that should never be uploaded.

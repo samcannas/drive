@@ -144,7 +144,11 @@ impl Node {
             id: r.get(0)?,
             parent_id: r.get(1)?,
             name: r.get(2)?,
-            kind: if r.get::<_, i64>(3)? == 1 { Kind::Folder } else { Kind::File },
+            kind: if r.get::<_, i64>(3)? == 1 {
+                Kind::Folder
+            } else {
+                Kind::File
+            },
             size: r.get::<_, i64>(4)? as u64,
             mtime_ms: r.get(5)?,
             remote_id: r.get(6)?,
@@ -242,11 +246,15 @@ fn issue_kind_parse(s: &str) -> IssueKind {
 
 pub fn issue_actions(kind: IssueKind) -> Vec<IssueAction> {
     match kind {
-        IssueKind::TransferFailed | IssueKind::FileLocked => vec![IssueAction::Retry, IssueAction::Dismiss],
+        IssueKind::TransferFailed | IssueKind::FileLocked => {
+            vec![IssueAction::Retry, IssueAction::Dismiss]
+        }
         IssueKind::MassDelete => vec![IssueAction::ConfirmDelete, IssueAction::RestoreDeleted],
         IssueKind::Auth | IssueKind::WrongPassword => vec![IssueAction::SignIn],
         IssueKind::DiskFull => vec![IssueAction::Retry],
-        IssueKind::InvalidName | IssueKind::Conflict | IssueKind::Other => vec![IssueAction::Dismiss],
+        IssueKind::InvalidName | IssueKind::Conflict | IssueKind::Other => {
+            vec![IssueAction::Dismiss]
+        }
     }
 }
 
@@ -287,7 +295,11 @@ impl Db {
         migrate(&writer)?;
         let reader = Connection::open(path)?;
         configure(&reader)?;
-        Ok(Self { writer: Mutex::new(writer), reader: Mutex::new(reader), temp_path: None })
+        Ok(Self {
+            writer: Mutex::new(writer),
+            reader: Mutex::new(reader),
+            temp_path: None,
+        })
     }
 
     /// A throwaway database in a temporary file (deleted on drop), for tests and previews.
@@ -300,7 +312,10 @@ impl Db {
     }
 
     /// Runs `f` inside a write transaction.
-    pub fn write<T>(&self, f: impl FnOnce(&rusqlite::Transaction<'_>) -> rusqlite::Result<T>) -> rusqlite::Result<T> {
+    pub fn write<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Transaction<'_>) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T> {
         let mut conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let out = f(&tx)?;
@@ -309,7 +324,10 @@ impl Db {
     }
 
     /// Runs `f` on the read connection.
-    pub fn read<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> rusqlite::Result<T> {
+    pub fn read<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T> {
         let conn = self.reader.lock().unwrap_or_else(|e| e.into_inner());
         f(&conn)
     }
@@ -323,7 +341,10 @@ impl Db {
     // ---- key/value -----------------------------------------------------------------------
 
     pub fn kv_get(&self, key: &str) -> rusqlite::Result<Option<String>> {
-        self.read(|c| c.query_row("SELECT value FROM kv WHERE key = ?1", [key], |r| r.get(0)).optional())
+        self.read(|c| {
+            c.query_row("SELECT value FROM kv WHERE key = ?1", [key], |r| r.get(0))
+                .optional()
+        })
     }
 
     pub fn kv_set(&self, key: &str, value: &str) -> rusqlite::Result<()> {
@@ -386,13 +407,22 @@ impl Db {
 
     pub fn node_by_remote_id(&self, remote_id: &str) -> rusqlite::Result<Option<Node>> {
         self.read(|c| {
-            c.query_row(&format!("SELECT {NODE_COLUMNS} FROM node WHERE remote_id = ?1"), [remote_id], Node::from_row)
-                .optional()
+            c.query_row(
+                &format!("SELECT {NODE_COLUMNS} FROM node WHERE remote_id = ?1"),
+                [remote_id],
+                Node::from_row,
+            )
+            .optional()
         })
     }
 
     /// Nodes with pending work that is due, oldest change first.
-    pub fn due_work(&self, now: i64, debounce_before: i64, limit: u32) -> rusqlite::Result<Vec<Node>> {
+    pub fn due_work(
+        &self,
+        now: i64,
+        debounce_before: i64,
+        limit: u32,
+    ) -> rusqlite::Result<Vec<Node>> {
         self.read(|c| {
             let mut st = c.prepare_cached(&format!(
                 "SELECT {NODE_COLUMNS} FROM node
@@ -405,17 +435,31 @@ impl Db {
 
     /// Earliest time any pending work becomes due (for the worker's sleep).
     pub fn next_work_at(&self) -> rusqlite::Result<Option<i64>> {
-        self.read(|c| c.query_row("SELECT MIN(MAX(retry_at_ms, changed_ms)) FROM node WHERE pending != 0", [], |r| r.get(0)))
+        self.read(|c| {
+            c.query_row(
+                "SELECT MIN(MAX(retry_at_ms, changed_ms)) FROM node WHERE pending != 0",
+                [],
+                |r| r.get(0),
+            )
+        })
     }
 
     pub fn pending_count(&self) -> rusqlite::Result<u32> {
-        self.read(|c| c.query_row("SELECT COUNT(*) FROM node WHERE pending != 0", [], |r| r.get(0)))
+        self.read(|c| {
+            c.query_row("SELECT COUNT(*) FROM node WHERE pending != 0", [], |r| {
+                r.get(0)
+            })
+        })
     }
 
     /// Files deleted locally and waiting to be trashed remotely.
     pub fn pending_trash_files(&self) -> rusqlite::Result<u32> {
         self.read(|c| {
-            c.query_row("SELECT COUNT(*) FROM node WHERE pending & 4 != 0 AND kind = 0", [], |r| r.get(0))
+            c.query_row(
+                "SELECT COUNT(*) FROM node WHERE pending & 4 != 0 AND kind = 0",
+                [],
+                |r| r.get(0),
+            )
         })
     }
 
@@ -458,7 +502,9 @@ impl Db {
             return Ok(());
         }
         self.write(|tx| {
-            let mut st = tx.prepare_cached("UPDATE node SET accessed_ms = MAX(accessed_ms, ?2) WHERE id = ?1")?;
+            let mut st = tx.prepare_cached(
+                "UPDATE node SET accessed_ms = MAX(accessed_ms, ?2) WHERE id = ?1",
+            )?;
             for (id, at) in items {
                 st.execute(params![id, at])?;
             }
@@ -478,7 +524,13 @@ impl Db {
 
     // ---- activity ------------------------------------------------------------------------
 
-    pub fn add_activity(&self, kind: ActivityKind, path: &str, bytes: u64, detail: Option<&str>) -> rusqlite::Result<Activity> {
+    pub fn add_activity(
+        &self,
+        kind: ActivityKind,
+        path: &str,
+        bytes: u64,
+        detail: Option<&str>,
+    ) -> rusqlite::Result<Activity> {
         let at = now_ms();
         self.write(|tx| {
             tx.execute(
@@ -495,7 +547,11 @@ impl Db {
     }
 
     /// Newest first; pass the smallest id seen so far as `before_id` to page (keyset pagination).
-    pub fn recent_activity(&self, limit: u32, before_id: Option<i64>) -> rusqlite::Result<Vec<Activity>> {
+    pub fn recent_activity(
+        &self,
+        limit: u32,
+        before_id: Option<i64>,
+    ) -> rusqlite::Result<Vec<Activity>> {
         self.read(|c| {
             let mut st = c.prepare_cached(
                 "SELECT id, at_ms, kind, path, bytes, detail FROM activity WHERE id < ?1 ORDER BY id DESC LIMIT ?2",
@@ -539,12 +595,18 @@ impl Db {
 
     /// Returns true if an issue was removed.
     pub fn clear_issue(&self, dedupe_key: &str) -> rusqlite::Result<bool> {
-        self.write(|tx| tx.execute("DELETE FROM issue WHERE dedupe_key = ?1", [dedupe_key]).map(|n| n > 0))
+        self.write(|tx| {
+            tx.execute("DELETE FROM issue WHERE dedupe_key = ?1", [dedupe_key])
+                .map(|n| n > 0)
+        })
     }
 
     pub fn clear_issues_with_prefix(&self, prefix: &str) -> rusqlite::Result<usize> {
         self.write(|tx| {
-            tx.execute("DELETE FROM issue WHERE substr(dedupe_key, 1, length(?1)) = ?1", [prefix])
+            tx.execute(
+                "DELETE FROM issue WHERE substr(dedupe_key, 1, length(?1)) = ?1",
+                [prefix],
+            )
         })
     }
 
@@ -588,7 +650,11 @@ impl Db {
         })
     }
 
-    pub fn due_orphans(&self, now: i64, limit: u32) -> rusqlite::Result<Vec<crate::remote::RemoteEntry>> {
+    pub fn due_orphans(
+        &self,
+        now: i64,
+        limit: u32,
+    ) -> rusqlite::Result<Vec<crate::remote::RemoteEntry>> {
         self.read(|c| {
             let mut st = c.prepare_cached(
                 "SELECT remote_id, kind, name, remote_parent_id, size FROM orphan WHERE retry_at_ms <= ?1 LIMIT ?2",
@@ -618,7 +684,10 @@ impl Db {
     }
 
     pub fn remove_orphan(&self, remote_id: &str) -> rusqlite::Result<()> {
-        self.write(|tx| tx.execute("DELETE FROM orphan WHERE remote_id = ?1", [remote_id]).map(|_| ()))
+        self.write(|tx| {
+            tx.execute("DELETE FROM orphan WHERE remote_id = ?1", [remote_id])
+                .map(|_| ())
+        })
     }
 
     pub fn issue_count(&self) -> rusqlite::Result<u32> {
@@ -643,13 +712,17 @@ pub fn add_orphan(tx: &Connection, e: &crate::remote::RemoteEntry) -> rusqlite::
 }
 
 pub fn get_node(c: &Connection, id: NodeId) -> rusqlite::Result<Option<Node>> {
-    c.prepare_cached(&format!("SELECT {NODE_COLUMNS} FROM node WHERE id = ?1"))?.query_row([id], Node::from_row).optional()
+    c.prepare_cached(&format!("SELECT {NODE_COLUMNS} FROM node WHERE id = ?1"))?
+        .query_row([id], Node::from_row)
+        .optional()
 }
 
 pub fn get_child(c: &Connection, parent: NodeId, name: &str) -> rusqlite::Result<Option<Node>> {
-    c.prepare_cached(&format!("SELECT {NODE_COLUMNS} FROM node WHERE parent_id = ?1 AND name_key = ?2 AND deleted = 0"))?
-        .query_row(params![parent, name_key(name)], Node::from_row)
-        .optional()
+    c.prepare_cached(&format!(
+        "SELECT {NODE_COLUMNS} FROM node WHERE parent_id = ?1 AND name_key = ?2 AND deleted = 0"
+    ))?
+    .query_row(params![parent, name_key(name)], Node::from_row)
+    .optional()
 }
 
 pub fn path_of(c: &Connection, id: NodeId) -> rusqlite::Result<Option<String>> {
@@ -661,7 +734,9 @@ pub fn path_of(c: &Connection, id: NodeId) -> rusqlite::Result<Option<String>> {
          )
          SELECT name, parent_id FROM up ORDER BY depth DESC",
     )?;
-    let rows: Vec<(String, Option<NodeId>)> = st.query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+    let rows: Vec<(String, Option<NodeId>)> = st
+        .query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
     if rows.is_empty() {
         return Ok(None);
     }
@@ -669,7 +744,13 @@ pub fn path_of(c: &Connection, id: NodeId) -> rusqlite::Result<Option<String>> {
     if rows[0].1.is_some() {
         return Ok(None);
     }
-    Ok(Some(rows.iter().skip(1).map(|(n, _)| n.as_str()).collect::<Vec<_>>().join("/")))
+    Ok(Some(
+        rows.iter()
+            .skip(1)
+            .map(|(n, _)| n.as_str())
+            .collect::<Vec<_>>()
+            .join("/"),
+    ))
 }
 
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
@@ -737,15 +818,25 @@ mod tests {
     fn activity_and_issues() {
         let db = Db::open_in_memory().unwrap();
         for i in 0..5 {
-            db.add_activity(ActivityKind::Uploaded, &format!("f{i}"), 10, None).unwrap();
+            db.add_activity(ActivityKind::Uploaded, &format!("f{i}"), 10, None)
+                .unwrap();
         }
         let page1 = db.recent_activity(2, None).unwrap();
-        assert_eq!(page1.iter().map(|a| a.path.as_str()).collect::<Vec<_>>(), ["f4", "f3"]);
+        assert_eq!(
+            page1.iter().map(|a| a.path.as_str()).collect::<Vec<_>>(),
+            ["f4", "f3"]
+        );
         let page2 = db.recent_activity(2, Some(page1[1].id)).unwrap();
         assert_eq!(page2[0].path, "f2");
 
-        assert!(db.raise_issue(IssueKind::Auth, "auth", None, None, "Sign in again").unwrap());
-        assert!(!db.raise_issue(IssueKind::Auth, "auth", None, None, "Sign in again!").unwrap());
+        assert!(
+            db.raise_issue(IssueKind::Auth, "auth", None, None, "Sign in again")
+                .unwrap()
+        );
+        assert!(
+            !db.raise_issue(IssueKind::Auth, "auth", None, None, "Sign in again!")
+                .unwrap()
+        );
         assert_eq!(db.issue_count().unwrap(), 1);
         assert_eq!(db.issues().unwrap()[0].message, "Sign in again!");
         assert!(db.clear_issue("auth").unwrap());
@@ -759,28 +850,51 @@ mod tests {
         let plan = |sql: &str| -> String {
             db.read(|c| {
                 let mut st = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
-                let rows: Vec<String> = st.query_map([], |r| r.get::<_, String>(3))?.collect::<Result<_, _>>()?;
+                let rows: Vec<String> = st
+                    .query_map([], |r| r.get::<_, String>(3))?
+                    .collect::<Result<_, _>>()?;
                 Ok(rows.join(" | "))
             })
             .unwrap()
         };
         let cases = [
-            ("SELECT id FROM node WHERE parent_id = 1 AND name_key = 'a' AND deleted = 0", "node_parent_name_key_idx"),
-            ("SELECT id FROM node WHERE parent_id = 1", "node_parent_id_idx"),
-            ("SELECT id FROM node WHERE pending != 0 AND retry_at_ms <= 5 ORDER BY retry_at_ms LIMIT 10", "node_pending_idx"),
+            (
+                "SELECT id FROM node WHERE parent_id = 1 AND name_key = 'a' AND deleted = 0",
+                "node_parent_name_key_idx",
+            ),
+            (
+                "SELECT id FROM node WHERE parent_id = 1",
+                "node_parent_id_idx",
+            ),
+            (
+                "SELECT id FROM node WHERE pending != 0 AND retry_at_ms <= 5 ORDER BY retry_at_ms LIMIT 10",
+                "node_pending_idx",
+            ),
             (
                 "SELECT id FROM node WHERE hydrated = 1 AND pinned = 0 AND kind = 0 AND dirty = 0 ORDER BY accessed_ms LIMIT 10",
                 "node_lru_idx",
             ),
-            ("SELECT id FROM node WHERE remote_id = 'x'", "sqlite_autoindex_node_1"),
-            ("SELECT id FROM activity WHERE id < 100 ORDER BY id DESC LIMIT 10", "INTEGER PRIMARY KEY"),
+            (
+                "SELECT id FROM node WHERE remote_id = 'x'",
+                "sqlite_autoindex_node_1",
+            ),
+            (
+                "SELECT id FROM activity WHERE id < 100 ORDER BY id DESC LIMIT 10",
+                "INTEGER PRIMARY KEY",
+            ),
         ];
         for (sql, index) in cases {
             let p = plan(sql);
-            assert!(p.contains(index), "{sql}
-  plan: {p}");
-            assert!(!p.contains("SCAN node") || p.contains("USING"), "{sql}
-  full scan: {p}");
+            assert!(
+                p.contains(index),
+                "{sql}
+  plan: {p}"
+            );
+            assert!(
+                !p.contains("SCAN node") || p.contains("USING"),
+                "{sql}
+  full scan: {p}"
+            );
         }
     }
 

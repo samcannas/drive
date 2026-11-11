@@ -137,8 +137,13 @@ impl Cipher {
     pub fn new(password: &str, salt: &str) -> Result<Self, CryptError> {
         let mut key = [0u8; 80];
         if !password.is_empty() {
-            let salt_bytes: &[u8] = if salt.is_empty() { &DEFAULT_SALT } else { salt.as_bytes() };
-            let params = scrypt::Params::new(14, 8, 1, scrypt::Params::RECOMMENDED_LEN).map_err(|_| CryptError::Kdf)?;
+            let salt_bytes: &[u8] = if salt.is_empty() {
+                &DEFAULT_SALT
+            } else {
+                salt.as_bytes()
+            };
+            let params = scrypt::Params::new(14, 8, 1, scrypt::Params::RECOMMENDED_LEN)
+                .map_err(|_| CryptError::Kdf)?;
             scrypt::scrypt(password.as_bytes(), salt_bytes, &params, &mut key)
                 .map_err(|_| CryptError::Kdf)?;
         }
@@ -149,9 +154,17 @@ impl Cipher {
         name_key.copy_from_slice(&key[32..64]);
         name_tweak.copy_from_slice(&key[64..80]);
         key.zeroize();
-        let name_block = Aes256::new(aes::cipher::generic_array::GenericArray::from_slice(&name_key));
+        let name_block = Aes256::new(aes::cipher::generic_array::GenericArray::from_slice(
+            &name_key,
+        ));
         let box_cipher = XSalsa20Poly1305::new(&data_key.into());
-        Ok(Self { data_key, name_key, name_tweak, name_block, box_cipher })
+        Ok(Self {
+            data_key,
+            name_key,
+            name_tweak,
+            name_block,
+            box_cipher,
+        })
     }
 
     // ---- names -------------------------------------------------------------------------
@@ -169,7 +182,12 @@ impl Cipher {
         if padded.len() / 16 > eme::MAX_BLOCKS {
             return Err(CryptError::NameTooLong);
         }
-        let ct = eme::transform(&self.name_block, &self.name_tweak, &padded, eme::Direction::Encrypt);
+        let ct = eme::transform(
+            &self.name_block,
+            &self.name_tweak,
+            &padded,
+            eme::Direction::Encrypt,
+        );
         Ok(base32_encode(&ct))
     }
 
@@ -188,12 +206,20 @@ impl Cipher {
         if raw.len() > 2048 {
             return Err(CryptError::TooLong);
         }
-        let padded = eme::transform(&self.name_block, &self.name_tweak, &raw, eme::Direction::Decrypt);
+        let padded = eme::transform(
+            &self.name_block,
+            &self.name_tweak,
+            &raw,
+            eme::Direction::Decrypt,
+        );
         let pad = *padded.last().ok_or(CryptError::BadPadding)? as usize;
         if pad == 0 || pad > 16 || pad > padded.len() {
             return Err(CryptError::BadPadding);
         }
-        if padded[padded.len() - pad..].iter().any(|&b| b as usize != pad) {
+        if padded[padded.len() - pad..]
+            .iter()
+            .any(|&b| b as usize != pad)
+        {
             return Err(CryptError::BadPadding);
         }
         String::from_utf8(padded[..padded.len() - pad].to_vec()).map_err(|_| CryptError::BadUtf8)
@@ -201,11 +227,17 @@ impl Cipher {
 
     /// Encrypts a `/`-separated relative path segment by segment (directory names included).
     pub fn encrypt_path(&self, path: &str) -> Result<String, CryptError> {
-        path.split('/').map(|s| self.encrypt_name(s)).collect::<Result<Vec<_>, _>>().map(|v| v.join("/"))
+        path.split('/')
+            .map(|s| self.encrypt_name(s))
+            .collect::<Result<Vec<_>, _>>()
+            .map(|v| v.join("/"))
     }
 
     pub fn decrypt_path(&self, path: &str) -> Result<String, CryptError> {
-        path.split('/').map(|s| self.decrypt_name(s)).collect::<Result<Vec<_>, _>>().map(|v| v.join("/"))
+        path.split('/')
+            .map(|s| self.decrypt_name(s))
+            .collect::<Result<Vec<_>, _>>()
+            .map(|v| v.join("/"))
     }
 
     // ---- content -----------------------------------------------------------------------
@@ -224,7 +256,12 @@ impl Cipher {
     }
 
     /// Opens one sealed block (`tag || ciphertext`), appending the plaintext to `out`.
-    pub fn open_block(&self, nonce: &Nonce, sealed: &[u8], out: &mut Vec<u8>) -> Result<(), CryptError> {
+    pub fn open_block(
+        &self,
+        nonce: &Nonce,
+        sealed: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), CryptError> {
         if sealed.len() <= BLOCK_HEADER_SIZE {
             return Err(CryptError::TruncatedBlock);
         }
@@ -264,11 +301,16 @@ pub fn encrypted_size(size: u64) -> u64 {
 
 /// Plaintext size of an encrypted object of `size` bytes.
 pub fn decrypted_size(size: u64) -> Result<u64, CryptError> {
-    let size = size.checked_sub(HEADER_SIZE as u64).ok_or(CryptError::FileTooShort)?;
+    let size = size
+        .checked_sub(HEADER_SIZE as u64)
+        .ok_or(CryptError::FileTooShort)?;
     let blocks = size / BLOCK_SIZE as u64;
     let mut residue = size % BLOCK_SIZE as u64;
     if residue != 0 {
-        residue = residue.checked_sub(BLOCK_HEADER_SIZE as u64).filter(|r| *r > 0).ok_or(CryptError::TruncatedBlock)?;
+        residue = residue
+            .checked_sub(BLOCK_HEADER_SIZE as u64)
+            .filter(|r| *r > 0)
+            .ok_or(CryptError::TruncatedBlock)?;
     }
     Ok(blocks * BLOCK_DATA_SIZE as u64 + residue)
 }
@@ -313,7 +355,11 @@ impl Encryptor {
         let mut header = [0u8; HEADER_SIZE];
         header[..8].copy_from_slice(FILE_MAGIC);
         header[8..].copy_from_slice(&nonce.0);
-        Self { cipher, nonce, header }
+        Self {
+            cipher,
+            nonce,
+            header,
+        }
     }
 
     pub fn header(&self) -> &[u8; HEADER_SIZE] {
@@ -337,12 +383,20 @@ pub struct Decryptor {
 impl Decryptor {
     /// Decrypts an object read from its very beginning (header included).
     pub fn from_start(cipher: Cipher) -> Self {
-        Self { cipher, nonce: None, pending: Vec::with_capacity(BLOCK_SIZE) }
+        Self {
+            cipher,
+            nonce: None,
+            pending: Vec::with_capacity(BLOCK_SIZE),
+        }
     }
 
     /// Decrypts an object read from the start of block `block_index` (no header in the stream).
     pub fn at_block(cipher: Cipher, file_nonce: Nonce, block_index: u64) -> Self {
-        Self { cipher, nonce: Some(file_nonce.plus(block_index)), pending: Vec::with_capacity(BLOCK_SIZE) }
+        Self {
+            cipher,
+            nonce: Some(file_nonce.plus(block_index)),
+            pending: Vec::with_capacity(BLOCK_SIZE),
+        }
     }
 
     /// Parses an object header, returning the file nonce.
@@ -429,14 +483,18 @@ pub fn decrypt_bytes(cipher: &Cipher, data: &[u8]) -> Result<Vec<u8>, CryptError
 }
 
 fn base32_encode(data: &[u8]) -> String {
-    data_encoding::BASE32HEX_NOPAD.encode(data).to_ascii_lowercase()
+    data_encoding::BASE32HEX_NOPAD
+        .encode(data)
+        .to_ascii_lowercase()
 }
 
 fn base32_decode(s: &str) -> Result<Vec<u8>, CryptError> {
     if s.ends_with('=') {
         return Err(CryptError::BadBase32);
     }
-    data_encoding::BASE32HEX_NOPAD.decode(s.to_ascii_uppercase().as_bytes()).map_err(|_| CryptError::BadBase32)
+    data_encoding::BASE32HEX_NOPAD
+        .decode(s.to_ascii_uppercase().as_bytes())
+        .map_err(|_| CryptError::BadBase32)
 }
 
 /// Generates a strong random secret suitable for a crypt password or salt.
@@ -460,7 +518,10 @@ mod tests {
         let c = zero_cipher();
         let cases = [
             ("1", "p0e52nreeaj0a5ea7s64m4j72s"),
-            ("1/12", "p0e52nreeaj0a5ea7s64m4j72s/l42g6771hnv3an9cgc8cr2n1ng"),
+            (
+                "1/12",
+                "p0e52nreeaj0a5ea7s64m4j72s/l42g6771hnv3an9cgc8cr2n1ng",
+            ),
             (
                 "1/12/123",
                 "p0e52nreeaj0a5ea7s64m4j72s/l42g6771hnv3an9cgc8cr2n1ng/qgm4avr35m5loi1th53ato71v0",
@@ -495,7 +556,9 @@ mod tests {
     #[test]
     fn content_roundtrip_and_seek() {
         let c = Cipher::new("pw", "salt").unwrap();
-        let plain: Vec<u8> = (0..(3 * BLOCK_DATA_SIZE + 1234)).map(|i| (i * 31 % 251) as u8).collect();
+        let plain: Vec<u8> = (0..(3 * BLOCK_DATA_SIZE + 1234))
+            .map(|i| (i * 31 % 251) as u8)
+            .collect();
         let nonce = Nonce::random();
         let enc = encrypt_bytes(&c, nonce, &plain);
         assert_eq!(enc.len() as u64, encrypted_size(plain.len() as u64));

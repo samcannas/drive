@@ -25,12 +25,26 @@ impl Paths {
         if let Some(dir) = std::env::var_os("DRIVE_HOME") {
             // Used by tests and for running several isolated instances.
             let base = PathBuf::from(dir);
-            return Ok(Self { config_dir: base.join("config"), data_dir: base.join("data"), cache_dir: base.join("cache") });
+            return Ok(Self {
+                config_dir: base.join("config"),
+                data_dir: base.join("data"),
+                cache_dir: base.join("cache"),
+            });
         }
-        let config_dir = dirs::config_dir().context("no config directory")?.join(APP_DIR);
-        let data_dir = dirs::data_local_dir().context("no data directory")?.join(APP_DIR);
-        let cache_dir = dirs::cache_dir().context("no cache directory")?.join(APP_DIR);
-        Ok(Self { config_dir, data_dir, cache_dir })
+        let config_dir = dirs::config_dir()
+            .context("no config directory")?
+            .join(APP_DIR);
+        let data_dir = dirs::data_local_dir()
+            .context("no data directory")?
+            .join(APP_DIR);
+        let cache_dir = dirs::cache_dir()
+            .context("no cache directory")?
+            .join(APP_DIR);
+        Ok(Self {
+            config_dir,
+            data_dir,
+            cache_dir,
+        })
     }
 
     pub fn ensure(&self) -> Result<()> {
@@ -105,7 +119,11 @@ fn default_device_name() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .ok()
-        .or_else(|| std::fs::read_to_string("/etc/hostname").ok().map(|s| s.trim().to_string()))
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+        })
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "This PC".into())
 }
@@ -128,7 +146,8 @@ impl Config {
     pub fn load(paths: &Paths) -> Result<Self> {
         let file = paths.config_file();
         match std::fs::read(&file) {
-            Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| format!("reading {}", file.display())),
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .with_context(|| format!("reading {}", file.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let cfg = Config::default();
                 cfg.save(paths)?;
@@ -147,7 +166,9 @@ impl Config {
     }
 
     pub fn folder_or_default(&self) -> PathBuf {
-        self.folder.clone().unwrap_or_else(crate::platform::default_folder)
+        self.folder
+            .clone()
+            .unwrap_or_else(crate::platform::default_folder)
     }
 
     pub fn settings(&self) -> Settings {
@@ -208,7 +229,12 @@ fn write_private(file: &Path, data: &[u8]) -> Result<()> {
     {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
         f.write_all(data)?;
         f.sync_all()?;
     }
@@ -229,7 +255,10 @@ mod protect {
     const ENTROPY: &[u8] = b"com.samcannas.drive/secrets/v1";
 
     fn blob(data: &[u8]) -> CRYPT_INTEGER_BLOB {
-        CRYPT_INTEGER_BLOB { cbData: data.len() as u32, pbData: data.as_ptr() as *mut u8 }
+        CRYPT_INTEGER_BLOB {
+            cbData: data.len() as u32,
+            pbData: data.as_ptr() as *mut u8,
+        }
     }
 
     pub fn protect(data: &[u8]) -> Result<Vec<u8>> {
@@ -237,7 +266,15 @@ mod protect {
         let entropy = blob(ENTROPY);
         let mut out = CRYPT_INTEGER_BLOB::default();
         unsafe {
-            CryptProtectData(&input, None, Some(&entropy), None, None, CRYPTPROTECT_UI_FORBIDDEN, &mut out)?;
+            CryptProtectData(
+                &input,
+                None,
+                Some(&entropy),
+                None,
+                None,
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut out,
+            )?;
             let bytes = std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec();
             let _ = LocalFree(Some(HLOCAL(out.pbData as _)));
             Ok(bytes)
@@ -249,7 +286,17 @@ mod protect {
         let entropy = blob(ENTROPY);
         let mut out = CRYPT_INTEGER_BLOB::default();
         unsafe {
-            if CryptUnprotectData(&input, None, Some(&entropy), None, None, CRYPTPROTECT_UI_FORBIDDEN, &mut out).is_err() {
+            if CryptUnprotectData(
+                &input,
+                None,
+                Some(&entropy),
+                None,
+                None,
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut out,
+            )
+            .is_err()
+            {
                 bail!("secrets were saved by another Windows user or machine");
             }
             let bytes = std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec();
@@ -279,13 +326,23 @@ mod tests {
     #[test]
     fn secrets_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = Paths { config_dir: dir.path().into(), data_dir: dir.path().into(), cache_dir: dir.path().into() };
+        let paths = Paths {
+            config_dir: dir.path().into(),
+            data_dir: dir.path().into(),
+            cache_dir: dir.path().into(),
+        };
         assert!(Secrets::load(&paths).unwrap().is_none());
-        let s = Secrets { uloz_password: "a".into(), encryption_password: "b".into() };
+        let s = Secrets {
+            uloz_password: "a".into(),
+            encryption_password: "b".into(),
+        };
         s.save(&paths).unwrap();
         let raw = std::fs::read(paths.secrets_file()).unwrap();
         if cfg!(windows) {
-            assert!(!String::from_utf8_lossy(&raw).contains("\"b\""), "secrets must not be stored in plain text on Windows");
+            assert!(
+                !String::from_utf8_lossy(&raw).contains("\"b\""),
+                "secrets must not be stored in plain text on Windows"
+            );
         }
         let back = Secrets::load(&paths).unwrap().unwrap();
         assert_eq!(back.encryption_password, "b");
@@ -294,7 +351,11 @@ mod tests {
     #[test]
     fn config_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = Paths { config_dir: dir.path().into(), data_dir: dir.path().into(), cache_dir: dir.path().into() };
+        let paths = Paths {
+            config_dir: dir.path().into(),
+            data_dir: dir.path().into(),
+            cache_dir: dir.path().into(),
+        };
         let mut c = Config::load(&paths).unwrap();
         c.cache_limit_bytes = 123;
         c.save(&paths).unwrap();

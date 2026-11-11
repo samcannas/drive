@@ -227,7 +227,9 @@ mod tests {
 
     #[test]
     fn parses_error() {
-        let e: ApiError = serde_json::from_str(r#"{"error":70001,"code":401,"message":"Invalid user token."}"#).unwrap();
+        let e: ApiError =
+            serde_json::from_str(r#"{"error":70001,"code":401,"message":"Invalid user token."}"#)
+                .unwrap();
         assert_eq!(e.error_code, 70001);
     }
 }

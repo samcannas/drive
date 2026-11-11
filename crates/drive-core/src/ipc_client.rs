@@ -20,16 +20,22 @@ use crate::ipc::{Call, ErrorCode, Event, Request, Response, RpcError};
 
 /// Filesystem path of the socket on Unix (inside `$XDG_RUNTIME_DIR`, which only the user can read).
 pub fn unix_socket_path() -> PathBuf {
-    let dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
     dir.join(crate::ipc::socket_name())
 }
 
 /// Platform socket name: a named pipe on Windows, a Unix socket path elsewhere.
 pub fn socket_name() -> io::Result<Name<'static>> {
     if cfg!(windows) {
-        crate::ipc::socket_name().to_ns_name::<GenericNamespaced>().map(|n| n.into_owned())
+        crate::ipc::socket_name()
+            .to_ns_name::<GenericNamespaced>()
+            .map(|n| n.into_owned())
     } else {
-        unix_socket_path().to_fs_name::<GenericFilePath>().map(|n| n.into_owned())
+        unix_socket_path()
+            .to_fs_name::<GenericFilePath>()
+            .map(|n| n.into_owned())
     }
 }
 
@@ -75,8 +81,19 @@ impl Client {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let (events, _) = broadcast::channel(256);
         let closed = Arc::new(tokio::sync::watch::Sender::new(false));
-        tokio::spawn(read_loop(recv, pending.clone(), events.clone(), closed.clone()));
-        Ok(Self { writer: Arc::new(Mutex::new(send)), pending, next_id: Arc::new(AtomicU64::new(1)), events, closed })
+        tokio::spawn(read_loop(
+            recv,
+            pending.clone(),
+            events.clone(),
+            closed.clone(),
+        ));
+        Ok(Self {
+            writer: Arc::new(Mutex::new(send)),
+            pending,
+            next_id: Arc::new(AtomicU64::new(1)),
+            events,
+            closed,
+        })
     }
 
     /// Whether the connection to the service has been lost. Calls fail fast afterwards.
@@ -98,7 +115,8 @@ impl Client {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
-        let mut line = serde_json::to_vec(&Request { id, call }).map_err(|e| ClientError::Decode(e.to_string()))?;
+        let mut line = serde_json::to_vec(&Request { id, call })
+            .map_err(|e| ClientError::Decode(e.to_string()))?;
         line.push(b'\n');
         {
             let mut w = self.writer.lock().await;

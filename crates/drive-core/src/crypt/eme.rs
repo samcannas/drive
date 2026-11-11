@@ -53,10 +53,21 @@ fn tabulate_l(cipher: &Aes256, m: usize) -> Vec<[u8; BLOCK]> {
 /// Encrypts or decrypts `data` (a multiple of 16 bytes, 1..=128 blocks) with tweak `tweak`.
 ///
 /// Panics if the length preconditions are violated; callers validate lengths first.
-pub fn transform(cipher: &Aes256, tweak: &[u8; BLOCK], data: &[u8], direction: Direction) -> Vec<u8> {
-    assert!(data.len() % BLOCK == 0, "EME input must be a multiple of 16 bytes");
+pub fn transform(
+    cipher: &Aes256,
+    tweak: &[u8; BLOCK],
+    data: &[u8],
+    direction: Direction,
+) -> Vec<u8> {
+    assert!(
+        data.len().is_multiple_of(BLOCK),
+        "EME input must be a multiple of 16 bytes"
+    );
     let m = data.len() / BLOCK;
-    assert!((1..=MAX_BLOCKS).contains(&m), "EME operates on 1 to 128 blocks");
+    assert!(
+        (1..=MAX_BLOCKS).contains(&m),
+        "EME operates on 1 to 128 blocks"
+    );
 
     let l_table = tabulate_l(cipher, m);
     let mut c = data.to_vec();

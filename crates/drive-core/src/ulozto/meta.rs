@@ -44,7 +44,11 @@ fn put_uint(out: &mut Vec<u8>, v: u64) {
 }
 
 fn put_int(out: &mut Vec<u8>, v: i64) {
-    let u = if v < 0 { ((!v as u64) << 1) | 1 } else { (v as u64) << 1 };
+    let u = if v < 0 {
+        ((!v as u64) << 1) | 1
+    } else {
+        (v as u64) << 1
+    };
     put_uint(out, u);
 }
 
@@ -68,7 +72,11 @@ fn get_uint(buf: &[u8], pos: &mut usize) -> Option<u64> {
 
 fn get_int(buf: &[u8], pos: &mut usize) -> Option<i64> {
     let u = get_uint(buf, pos)?;
-    Some(if u & 1 == 1 { !((u >> 1) as i64) } else { (u >> 1) as i64 })
+    Some(if u & 1 == 1 {
+        !((u >> 1) as i64)
+    } else {
+        (u >> 1) as i64
+    })
 }
 
 /// Encodes metadata as an rclone-compatible description string (`1;<base64 gob>`).
@@ -166,19 +174,50 @@ mod tests {
 
     #[test]
     fn matches_go_encoder() {
-        let full = RcloneMeta { md5: md5(), sha256: sha(), mtime_micros: 1731234567123456 };
+        let full = RcloneMeta {
+            md5: md5(),
+            sha256: sha(),
+            mtime_micros: 1731234567123456,
+        };
         assert_eq!(encode(&full), FULL);
-        assert_eq!(encode(&RcloneMeta { mtime_micros: -5, ..Default::default() }), NEG);
+        assert_eq!(
+            encode(&RcloneMeta {
+                mtime_micros: -5,
+                ..Default::default()
+            }),
+            NEG
+        );
         assert_eq!(encode(&RcloneMeta::default()), EMPTY);
-        assert_eq!(encode(&RcloneMeta { md5: md5(), sha256: vec![], mtime_micros: 300 }), SKIP);
+        assert_eq!(
+            encode(&RcloneMeta {
+                md5: md5(),
+                sha256: vec![],
+                mtime_micros: 300
+            }),
+            SKIP
+        );
     }
 
     #[test]
     fn decodes_go_output() {
-        assert_eq!(decode(FULL).unwrap(), RcloneMeta { md5: md5(), sha256: sha(), mtime_micros: 1731234567123456 });
+        assert_eq!(
+            decode(FULL).unwrap(),
+            RcloneMeta {
+                md5: md5(),
+                sha256: sha(),
+                mtime_micros: 1731234567123456
+            }
+        );
         assert_eq!(decode(NEG).unwrap().mtime_micros, -5);
         assert_eq!(decode(EMPTY).unwrap(), RcloneMeta::default());
-        assert_eq!(decode(SKIP).unwrap(), RcloneMeta { md5: md5(), sha256: vec![], mtime_micros: 300 });
+        assert_eq!(
+            decode(SKIP).unwrap(),
+            RcloneMeta {
+                md5: md5(),
+                sha256: vec![],
+                mtime_micros: 300
+            }
+        );
         assert!(decode("my holiday photos").is_none());
         assert!(decode("1;!!!").is_none());
     }

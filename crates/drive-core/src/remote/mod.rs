@@ -57,7 +57,11 @@ impl UploadBody {
     pub fn from_bytes(data: impl Into<Bytes>, mtime_ms: i64) -> Self {
         let data: Bytes = data.into();
         let size = data.len() as u64;
-        Self { stream: Box::pin(futures::stream::once(async move { Ok(data) })), size, mtime_ms }
+        Self {
+            stream: Box::pin(futures::stream::once(async move { Ok(data) })),
+            size,
+            mtime_ms,
+        }
     }
 }
 
@@ -88,7 +92,13 @@ pub enum RemoteError {
 impl RemoteError {
     /// Whether retrying the same operation later may succeed.
     pub fn is_transient(&self) -> bool {
-        matches!(self, RemoteError::RateLimited | RemoteError::Network(_) | RemoteError::Server(_) | RemoteError::Integrity(_))
+        matches!(
+            self,
+            RemoteError::RateLimited
+                | RemoteError::Network(_)
+                | RemoteError::Server(_)
+                | RemoteError::Integrity(_)
+        )
     }
 }
 
@@ -105,11 +115,26 @@ pub trait Remote: Send + Sync + 'static {
     async fn create_folder(&self, parent_id: &str, name: &str) -> Result<RemoteEntry, RemoteError>;
     /// Creates a new file. Existing files with the same name are left alone (the engine
     /// trashes the previous version itself once the upload succeeded).
-    async fn upload(&self, parent_id: &str, name: &str, body: UploadBody) -> Result<RemoteEntry, RemoteError>;
+    async fn upload(
+        &self,
+        parent_id: &str,
+        name: &str,
+        body: UploadBody,
+    ) -> Result<RemoteEntry, RemoteError>;
     /// Reads `len` bytes (or to EOF) starting at `offset`.
-    async fn read(&self, file: &RemoteEntry, offset: u64, len: Option<u64>) -> Result<ByteStream, RemoteError>;
+    async fn read(
+        &self,
+        file: &RemoteEntry,
+        offset: u64,
+        len: Option<u64>,
+    ) -> Result<ByteStream, RemoteError>;
     /// Moves and/or renames. Returns the entry as it is afterwards.
-    async fn rename(&self, entry: &RemoteEntry, new_parent_id: &str, new_name: &str) -> Result<RemoteEntry, RemoteError>;
+    async fn rename(
+        &self,
+        entry: &RemoteEntry,
+        new_parent_id: &str,
+        new_name: &str,
+    ) -> Result<RemoteEntry, RemoteError>;
     /// Moves to the provider's trash (recoverable), or deletes if there is no trash.
     async fn trash(&self, entry: &RemoteEntry) -> Result<(), RemoteError>;
     /// Whether a file still exists (not deleted or trashed). Used before uploading an edit to

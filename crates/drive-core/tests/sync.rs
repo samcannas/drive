@@ -21,7 +21,10 @@ use drive_core::remote::{Kind, Remote, read_all};
 enum Entry {
     Folder,
     /// `None` = cloud-only placeholder.
-    File { data: Option<Vec<u8>>, size: u64 },
+    File {
+        data: Option<Vec<u8>>,
+        size: u64,
+    },
 }
 
 #[derive(Default)]
@@ -34,7 +37,11 @@ struct FakeLocal {
 impl FakeLocal {
     fn move_tree(&self, from: &str, to: &str) {
         let mut fs = self.fs.lock().unwrap();
-        let keys: Vec<String> = fs.keys().filter(|k| *k == from || k.starts_with(&format!("{from}/"))).cloned().collect();
+        let keys: Vec<String> = fs
+            .keys()
+            .filter(|k| *k == from || k.starts_with(&format!("{from}/")))
+            .cloned()
+            .collect();
         for k in keys {
             let v = fs.remove(&k).unwrap();
             fs.insert(format!("{to}{}", &k[from.len()..]), v);
@@ -46,17 +53,29 @@ impl LocalSide for FakeLocal {
     fn create(&self, item: &LocalItem) -> std::io::Result<()> {
         let mut fs = self.fs.lock().unwrap();
         if fs.contains_key(&item.path) {
-            return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, item.path.clone()));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                item.path.clone(),
+            ));
         }
         let e = match item.kind {
             Kind::Folder => Entry::Folder,
-            Kind::File => Entry::File { data: None, size: item.size },
+            Kind::File => Entry::File {
+                data: None,
+                size: item.size,
+            },
         };
         fs.insert(item.path.clone(), e);
         Ok(())
     }
     fn replace(&self, item: &LocalItem) -> std::io::Result<()> {
-        self.fs.lock().unwrap().insert(item.path.clone(), Entry::File { data: None, size: item.size });
+        self.fs.lock().unwrap().insert(
+            item.path.clone(),
+            Entry::File {
+                data: None,
+                size: item.size,
+            },
+        );
         Ok(())
     }
     fn rename(&self, from: &str, item: &LocalItem) -> std::io::Result<()> {
@@ -71,12 +90,19 @@ impl LocalSide for FakeLocal {
     fn open_for_upload(&self, item: &LocalItem) -> std::io::Result<UploadSource> {
         let fs = self.fs.lock().unwrap();
         let Some(Entry::File { data: Some(d), .. }) = fs.get(&item.path) else {
-            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, item.path.clone()));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                item.path.clone(),
+            ));
         };
         let mut f = tempfile::tempfile()?;
         f.write_all(d)?;
         f.rewind()?;
-        Ok(UploadSource { file: f, size: d.len() as u64, mtime_ms: 1 })
+        Ok(UploadSource {
+            file: f,
+            size: d.len() as u64,
+            mtime_ms: 1,
+        })
     }
     fn uploaded(&self, _item: &LocalItem, _size: u64, _mtime_ms: i64) -> std::io::Result<bool> {
         Ok(true)
@@ -96,7 +122,13 @@ impl LocalSide for FakeLocal {
         let id = item.id;
         let data = tokio::runtime::Handle::current()
             .block_on(async move { read_all(engine.read(id, 0, None).await?).await })?;
-        self.fs.lock().unwrap().insert(item.path.clone(), Entry::File { size: data.len() as u64, data: Some(data) });
+        self.fs.lock().unwrap().insert(
+            item.path.clone(),
+            Entry::File {
+                size: data.len() as u64,
+                data: Some(data),
+            },
+        );
         Ok(())
     }
 }
@@ -129,19 +161,37 @@ fn device(remote: Arc<dyn Remote>, name: &str) -> Device {
 
 impl Device {
     fn write(&self, path: &str, data: &[u8]) {
-        self.local.fs.lock().unwrap().insert(path.into(), Entry::File { data: Some(data.to_vec()), size: data.len() as u64 });
-        self.engine.local_modified(path, data.len() as u64, now_ms()).unwrap();
+        self.local.fs.lock().unwrap().insert(
+            path.into(),
+            Entry::File {
+                data: Some(data.to_vec()),
+                size: data.len() as u64,
+            },
+        );
+        self.engine
+            .local_modified(path, data.len() as u64, now_ms())
+            .unwrap();
     }
     fn mkdir(&self, path: &str) {
-        self.local.fs.lock().unwrap().insert(path.into(), Entry::Folder);
-        self.engine.local_create(path, Kind::Folder, 0, now_ms()).unwrap();
+        self.local
+            .fs
+            .lock()
+            .unwrap()
+            .insert(path.into(), Entry::Folder);
+        self.engine
+            .local_create(path, Kind::Folder, 0, now_ms())
+            .unwrap();
     }
     fn rename(&self, from: &str, to: &str) {
         self.local.move_tree(from, to);
         self.engine.local_rename(from, to).unwrap();
     }
     fn delete(&self, path: &str) {
-        self.local.fs.lock().unwrap().retain(|k, _| k != path && !k.starts_with(&format!("{path}/")));
+        self.local
+            .fs
+            .lock()
+            .unwrap()
+            .retain(|k, _| k != path && !k.starts_with(&format!("{path}/")));
         self.engine.local_delete(path).unwrap();
     }
     /// Opens a file like an app would: hydrates placeholders on demand.
@@ -151,8 +201,16 @@ impl Device {
             Some(Entry::File { data: Some(d), .. }) => d,
             Some(Entry::File { data: None, .. }) => {
                 let n = self.engine.node_by_path(path).unwrap().expect("node");
-                let data = read_all(self.engine.read(n.id, 0, None).await.unwrap()).await.unwrap();
-                self.local.fs.lock().unwrap().insert(path.into(), Entry::File { size: data.len() as u64, data: Some(data.clone()) });
+                let data = read_all(self.engine.read(n.id, 0, None).await.unwrap())
+                    .await
+                    .unwrap();
+                self.local.fs.lock().unwrap().insert(
+                    path.into(),
+                    Entry::File {
+                        size: data.len() as u64,
+                        data: Some(data.clone()),
+                    },
+                );
                 self.engine.mark_hydrated(n.id, true);
                 data
             }
@@ -168,14 +226,21 @@ impl Device {
             tokio::time::sleep(Duration::from_millis(10)).await;
             let st = self.engine.status();
             let orphans = self.engine.db().orphan_ids().unwrap().len();
-            if self.engine.db().pending_count().unwrap() == 0 && orphans == 0 && st.uploading == 0 && st.downloading == 0 {
+            if self.engine.db().pending_count().unwrap() == 0
+                && orphans == 0
+                && st.uploading == 0
+                && st.downloading == 0
+            {
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 if self.engine.db().pending_count().unwrap() == 0 {
                     return;
                 }
             }
         }
-        panic!("device did not become idle: {:?}", self.engine.db().all_nodes().unwrap());
+        panic!(
+            "device did not become idle: {:?}",
+            self.engine.db().all_nodes().unwrap()
+        );
     }
     async fn sync(&self) {
         self.idle().await;
@@ -186,7 +251,10 @@ impl Device {
 
 fn vault() -> (Arc<MemRemote>, Arc<dyn Remote>) {
     let mem = Arc::new(MemRemote::new());
-    let crypt: Arc<dyn Remote> = Arc::new(CryptRemote::new(mem.clone(), Cipher::new("pw", "salt").unwrap()));
+    let crypt: Arc<dyn Remote> = Arc::new(CryptRemote::new(
+        mem.clone(),
+        Cipher::new("pw", "salt").unwrap(),
+    ));
     (mem, crypt)
 }
 
@@ -203,7 +271,13 @@ async fn files_flow_between_devices() {
     b.sync().await;
     assert_eq!(b.paths(), vec!["Docs", "Docs/plan.txt", "photo.jpg"]);
     // B sees placeholders until something opens them.
-    assert!(matches!(b.local.fs.lock().unwrap()["photo.jpg"], Entry::File { data: None, size: 300_000 }));
+    assert!(matches!(
+        b.local.fs.lock().unwrap()["photo.jpg"],
+        Entry::File {
+            data: None,
+            size: 300_000
+        }
+    ));
     assert_eq!(b.read("Docs/plan.txt").await, b"version 1");
     assert_eq!(b.read("photo.jpg").await, vec![7u8; 300_000]);
 
@@ -218,7 +292,10 @@ async fn files_flow_between_devices() {
     a.rename("Docs/plan.txt", "Archive/plan-final.txt");
     a.sync().await;
     b.sync().await;
-    assert_eq!(b.paths(), vec!["Archive", "Archive/plan-final.txt", "Docs", "photo.jpg"]);
+    assert_eq!(
+        b.paths(),
+        vec!["Archive", "Archive/plan-final.txt", "Docs", "photo.jpg"]
+    );
     assert_eq!(b.read("Archive/plan-final.txt").await, b"version 2 from B");
 
     // Delete on B.
@@ -251,14 +328,27 @@ async fn concurrent_edits_keep_both_versions() {
     let names = b.paths();
     assert_eq!(names.len(), 2, "{names:?}");
     assert!(names.contains(&"notes.txt".to_string()));
-    let copy = names.iter().find(|n| n.contains("conflict")).unwrap_or_else(|| panic!("no conflicted copy in {names:?}")).clone();
+    let copy = names
+        .iter()
+        .find(|n| n.contains("conflict"))
+        .unwrap_or_else(|| panic!("no conflicted copy in {names:?}"))
+        .clone();
     assert_eq!(a.paths(), names);
     let mut contents = vec![b.read("notes.txt").await, b.read(&copy).await];
     contents.sort();
-    assert_eq!(contents, vec![b"edit from A".to_vec(), b"edit from B".to_vec()]);
+    assert_eq!(
+        contents,
+        vec![b"edit from A".to_vec(), b"edit from B".to_vec()]
+    );
     assert_eq!(a.read("notes.txt").await, b.read("notes.txt").await);
     assert_eq!(a.read(&copy).await, b.read(&copy).await);
-    assert!(b.engine.issues().unwrap().iter().any(|i| i.kind == IssueKind::Conflict));
+    assert!(
+        b.engine
+            .issues()
+            .unwrap()
+            .iter()
+            .any(|i| i.kind == IssueKind::Conflict)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -289,10 +379,22 @@ async fn retries_after_failures_and_offline() {
     assert_eq!(a.engine.status().state, SyncState::Offline);
     mem.set_offline(false);
     // Retry timers are long; make the work due again as "Retry" would.
-    a.engine.db().write(|tx| tx.execute("UPDATE node SET retry_at_ms = 0", []).map(|_| ())).unwrap();
+    a.engine
+        .db()
+        .write(|tx| {
+            tx.execute("UPDATE node SET retry_at_ms = 0", [])
+                .map(|_| ())
+        })
+        .unwrap();
     mem.fail_next(2);
     for _ in 0..3 {
-        a.engine.db().write(|tx| tx.execute("UPDATE node SET retry_at_ms = 0", []).map(|_| ())).unwrap();
+        a.engine
+            .db()
+            .write(|tx| {
+                tx.execute("UPDATE node SET retry_at_ms = 0", [])
+                    .map(|_| ())
+            })
+            .unwrap();
         a.engine.sync_now();
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -318,9 +420,17 @@ async fn remote_mass_deletion_needs_confirmation() {
     }
     a.sync().await;
     assert_eq!(a.paths().len(), 120, "nothing removed without confirmation");
-    let issue = a.engine.issues().unwrap().into_iter().find(|i| i.kind == IssueKind::MassDelete).expect("guard issue");
+    let issue = a
+        .engine
+        .issues()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.kind == IssueKind::MassDelete)
+        .expect("guard issue");
     assert_eq!(a.engine.status().pending_delete_confirmation, Some(120));
-    a.engine.resolve_issue(issue.id, IssueAction::ConfirmDelete).unwrap();
+    a.engine
+        .resolve_issue(issue.id, IssueAction::ConfirmDelete)
+        .unwrap();
     a.sync().await;
     assert!(a.paths().is_empty());
 }
@@ -331,12 +441,21 @@ async fn wrong_password_never_deletes() {
     let a = device(remote, "A");
     a.write("secret.txt", b"x");
     a.sync().await;
-    let wrong: Arc<dyn Remote> = Arc::new(CryptRemote::new(mem.clone(), Cipher::new("other", "salt").unwrap()));
+    let wrong: Arc<dyn Remote> = Arc::new(CryptRemote::new(
+        mem.clone(),
+        Cipher::new("other", "salt").unwrap(),
+    ));
     let b = device(wrong, "B");
     b.engine.scan_once().await.unwrap();
     assert!(b.paths().is_empty());
     assert_eq!(b.engine.status().state, SyncState::Error);
-    assert!(b.engine.issues().unwrap().iter().any(|i| i.kind == IssueKind::WrongPassword));
+    assert!(
+        b.engine
+            .issues()
+            .unwrap()
+            .iter()
+            .any(|i| i.kind == IssueKind::WrongPassword)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -363,7 +482,13 @@ async fn eviction_respects_limit_and_pins() {
     let totals = b.engine.db().storage_totals().unwrap();
     assert!(totals.cache_bytes <= 2000, "{totals:?}");
     assert_eq!(totals.pinned_bytes, 1000);
-    assert!(matches!(b.local.fs.lock().unwrap()["f0.bin"], Entry::File { data: Some(_), .. }), "pinned file kept");
+    assert!(
+        matches!(
+            b.local.fs.lock().unwrap()["f0.bin"],
+            Entry::File { data: Some(_), .. }
+        ),
+        "pinned file kept"
+    );
     // Evicted files still open on demand.
     assert_eq!(b.read("f1.bin").await, vec![1u8; 1000]);
 }

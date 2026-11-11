@@ -67,5 +67,7 @@ pub fn teardown(folder: &Path, cache_dir: &Path) -> Result<()> {
 
 /// `~/Drive` (Windows: `%USERPROFILE%\Drive`).
 pub fn default_folder() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join("Drive")
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Drive")
 }

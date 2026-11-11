@@ -20,17 +20,27 @@ use crate::service::Service;
 pub async fn bind() -> Result<Listener> {
     // A live service answers; a stale Unix socket file doesn't and can be replaced.
     if Stream::connect(socket_name()?).await.is_ok() {
-        return Err(io::Error::new(io::ErrorKind::AddrInUse, "the Drive service is already running").into());
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "the Drive service is already running",
+        )
+        .into());
     }
     #[cfg(unix)]
     {
         let _ = std::fs::remove_file(drive_core::ipc_client::unix_socket_path());
     }
-    let listener = ListenerOptions::new().name(socket_name()?).create_tokio().context("binding the service socket")?;
+    let listener = ListenerOptions::new()
+        .name(socket_name()?)
+        .create_tokio()
+        .context("binding the service socket")?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(drive_core::ipc_client::unix_socket_path(), std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::set_permissions(
+            drive_core::ipc_client::unix_socket_path(),
+            std::fs::Permissions::from_mode(0o600),
+        );
     }
     Ok(listener)
 }
@@ -72,8 +82,15 @@ async fn handle_conn(stream: Stream, service: Arc<Service>) -> io::Result<()> {
         let req: Request = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
-                let id = serde_json::from_str::<serde_json::Value>(&line).ok().and_then(|v| v.get("id")?.as_u64()).unwrap_or(0);
-                write_line(&writer, &Response::err(id, ErrorCode::BadRequest, format!("bad request: {e}"))).await?;
+                let id = serde_json::from_str::<serde_json::Value>(&line)
+                    .ok()
+                    .and_then(|v| v.get("id")?.as_u64())
+                    .unwrap_or(0);
+                write_line(
+                    &writer,
+                    &Response::err(id, ErrorCode::BadRequest, format!("bad request: {e}")),
+                )
+                .await?;
                 continue;
             }
         };
@@ -100,8 +117,16 @@ async fn handle_conn(stream: Stream, service: Arc<Service>) -> io::Result<()> {
         tokio::spawn(async move {
             let id = req.id;
             let resp = match svc.handle(req.call).await {
-                Ok(v) => Response { id, result: Some(v), error: None },
-                Err(e) => Response { id, result: None, error: Some(e) },
+                Ok(v) => Response {
+                    id,
+                    result: Some(v),
+                    error: None,
+                },
+                Err(e) => Response {
+                    id,
+                    result: None,
+                    error: Some(e),
+                },
             };
             let _ = write_line(&w, &resp).await;
         });

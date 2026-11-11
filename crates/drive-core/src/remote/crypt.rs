@@ -9,7 +9,9 @@ use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 
 use super::{ByteStream, Kind, Remote, RemoteEntry, RemoteError, RemoteTree, UploadBody};
-use crate::crypt::{self, BLOCK_DATA_SIZE, Cipher, CryptError, Decryptor, Encryptor, HEADER_SIZE, Nonce};
+use crate::crypt::{
+    self, BLOCK_DATA_SIZE, Cipher, CryptError, Decryptor, Encryptor, HEADER_SIZE, Nonce,
+};
 
 /// Max plaintext name length that still fits uloz.to's 255-character limit once encrypted.
 /// 143 bytes → 144 padded → 9 blocks → 144 bytes → 231 base32 chars; 159 would be 256.
@@ -24,7 +26,11 @@ pub struct CryptRemote<R: Remote> {
 
 impl<R: Remote> CryptRemote<R> {
     pub fn new(inner: Arc<R>, cipher: Cipher) -> Self {
-        Self { inner, cipher, nonces: Mutex::new(HashMap::new()) }
+        Self {
+            inner,
+            cipher,
+            nonces: Mutex::new(HashMap::new()),
+        }
     }
 
     pub fn inner(&self) -> &Arc<R> {
@@ -42,7 +48,9 @@ impl<R: Remote> CryptRemote<R> {
                 name.len()
             )));
         }
-        self.cipher.encrypt_name(name).map_err(|e| RemoteError::InvalidName(e.to_string()))
+        self.cipher
+            .encrypt_name(name)
+            .map_err(|e| RemoteError::InvalidName(e.to_string()))
     }
 
     /// Converts an inner entry to plaintext, or `None` if its name doesn't decrypt.
@@ -54,7 +62,12 @@ impl<R: Remote> CryptRemote<R> {
         Some(e)
     }
 
-    fn map_entry(&self, mut e: RemoteEntry, plain_name: &str, plain_size: Option<u64>) -> RemoteEntry {
+    fn map_entry(
+        &self,
+        mut e: RemoteEntry,
+        plain_name: &str,
+        plain_size: Option<u64>,
+    ) -> RemoteEntry {
         e.name = plain_name.to_string();
         if e.kind == Kind::File {
             e.size = plain_size.unwrap_or_else(|| crypt::decrypted_size(e.size).unwrap_or(0));
@@ -78,7 +91,8 @@ impl<R: Remote> CryptRemote<R> {
         let header = super::read_all(self.inner.read(raw, 0, Some(HEADER_SIZE as u64)).await?)
             .await
             .map_err(|e| RemoteError::Network(e.to_string()))?;
-        let nonce = Decryptor::parse_header(&header).map_err(|e| RemoteError::Integrity(e.to_string()))?;
+        let nonce =
+            Decryptor::parse_header(&header).map_err(|e| RemoteError::Integrity(e.to_string()))?;
         let mut cache = self.nonces.lock().unwrap();
         if cache.len() > 4096 {
             cache.clear();
@@ -101,7 +115,13 @@ pub fn encrypt_stream(cipher: Cipher, input: ByteStream) -> ByteStream {
         header_sent: bool,
         done: bool,
     }
-    let state = State { input, enc: Encryptor::new(cipher, Nonce::random()), buf: BytesMut::new(), header_sent: false, done: false };
+    let state = State {
+        input,
+        enc: Encryptor::new(cipher, Nonce::random()),
+        buf: BytesMut::new(),
+        header_sent: false,
+        done: false,
+    };
     Box::pin(futures::stream::unfold(state, |mut st| async move {
         if !st.header_sent {
             st.header_sent = true;
@@ -139,7 +159,13 @@ pub fn encrypt_stream(cipher: Cipher, input: ByteStream) -> ByteStream {
 
 /// Decrypts an encrypted stream that starts either at the header (`nonce == None`) or at the
 /// start of block `first_block`, dropping `discard` leading bytes and stopping after `limit`.
-fn decrypt_stream(cipher: Cipher, input: ByteStream, start: Option<(Nonce, u64)>, discard: u64, limit: Option<u64>) -> ByteStream {
+fn decrypt_stream(
+    cipher: Cipher,
+    input: ByteStream,
+    start: Option<(Nonce, u64)>,
+    discard: u64,
+    limit: Option<u64>,
+) -> ByteStream {
     struct State {
         input: ByteStream,
         dec: Decryptor,
@@ -151,7 +177,13 @@ fn decrypt_stream(cipher: Cipher, input: ByteStream, start: Option<(Nonce, u64)>
         Some((nonce, block)) => Decryptor::at_block(cipher, nonce, block),
         None => Decryptor::from_start(cipher),
     };
-    let state = State { input, dec, discard, remaining: limit, finished: false };
+    let state = State {
+        input,
+        dec,
+        discard,
+        remaining: limit,
+        finished: false,
+    };
     Box::pin(futures::stream::unfold(state, |mut st| async move {
         loop {
             if st.finished || st.remaining == Some(0) {
@@ -199,7 +231,11 @@ fn decrypt_stream(cipher: Cipher, input: ByteStream, start: Option<(Nonce, u64)>
 impl<R: Remote> Remote for CryptRemote<R> {
     async fn scan(&self) -> Result<RemoteTree, RemoteError> {
         let raw = self.inner.scan().await?;
-        let mut tree = RemoteTree { root_id: raw.root_id, entries: Vec::with_capacity(raw.entries.len()), skipped: raw.skipped };
+        let mut tree = RemoteTree {
+            root_id: raw.root_id,
+            entries: Vec::with_capacity(raw.entries.len()),
+            skipped: raw.skipped,
+        };
         for e in raw.entries {
             let name = e.name.clone();
             match self.decrypt_entry(e) {
@@ -216,18 +252,36 @@ impl<R: Remote> Remote for CryptRemote<R> {
         Ok(self.map_entry(e, name, None))
     }
 
-    async fn upload(&self, parent_id: &str, name: &str, body: UploadBody) -> Result<RemoteEntry, RemoteError> {
+    async fn upload(
+        &self,
+        parent_id: &str,
+        name: &str,
+        body: UploadBody,
+    ) -> Result<RemoteEntry, RemoteError> {
         let enc_name = self.enc_name(name)?;
         let plain_size = body.size;
         let stream = encrypt_stream(self.cipher.clone(), body.stream);
         let e = self
             .inner
-            .upload(parent_id, &enc_name, UploadBody { stream, size: crypt::encrypted_size(plain_size), mtime_ms: body.mtime_ms })
+            .upload(
+                parent_id,
+                &enc_name,
+                UploadBody {
+                    stream,
+                    size: crypt::encrypted_size(plain_size),
+                    mtime_ms: body.mtime_ms,
+                },
+            )
             .await?;
         Ok(self.map_entry(e, name, Some(plain_size)))
     }
 
-    async fn read(&self, file: &RemoteEntry, offset: u64, len: Option<u64>) -> Result<ByteStream, RemoteError> {
+    async fn read(
+        &self,
+        file: &RemoteEntry,
+        offset: u64,
+        len: Option<u64>,
+    ) -> Result<ByteStream, RemoteError> {
         let raw = self.inner_entry(file)?;
         if len == Some(0) || offset >= file.size {
             return Ok(Box::pin(futures::stream::empty()));
@@ -244,10 +298,21 @@ impl<R: Remote> Remote for CryptRemote<R> {
         let nonce = self.file_nonce(&raw).await?;
         let r = crypt::underlying_range(offset, len.unwrap_or(file.size - offset));
         let s = self.inner.read(&raw, r.offset, len.map(|_| r.len)).await?;
-        Ok(decrypt_stream(self.cipher.clone(), s, Some((nonce, r.first_block)), r.discard, len))
+        Ok(decrypt_stream(
+            self.cipher.clone(),
+            s,
+            Some((nonce, r.first_block)),
+            r.discard,
+            len,
+        ))
     }
 
-    async fn rename(&self, entry: &RemoteEntry, new_parent_id: &str, new_name: &str) -> Result<RemoteEntry, RemoteError> {
+    async fn rename(
+        &self,
+        entry: &RemoteEntry,
+        new_parent_id: &str,
+        new_name: &str,
+    ) -> Result<RemoteEntry, RemoteError> {
         let raw = self.inner_entry(entry)?;
         let enc = self.enc_name(new_name)?;
         let e = self.inner.rename(&raw, new_parent_id, &enc).await?;
@@ -282,26 +347,56 @@ mod tests {
         let (mem, c) = setup();
         let dir = c.create_folder(ROOT, "Photos").await.unwrap();
         let data: Vec<u8> = (0..300_000u32).map(|i| (i % 241) as u8).collect();
-        let f = c.upload(&dir.id, "big.raw", UploadBody::from_bytes(data.clone(), 1234)).await.unwrap();
+        let f = c
+            .upload(
+                &dir.id,
+                "big.raw",
+                UploadBody::from_bytes(data.clone(), 1234),
+            )
+            .await
+            .unwrap();
         assert_eq!(f.size, data.len() as u64);
         assert_eq!(f.name, "big.raw");
 
         // Inner names are encrypted.
-        assert!(mem.snapshot().keys().all(|k| !k.contains("Photos") && !k.contains("big.raw")));
+        assert!(
+            mem.snapshot()
+                .keys()
+                .all(|k| !k.contains("Photos") && !k.contains("big.raw"))
+        );
 
         let tree = c.scan().await.unwrap();
         let names: Vec<_> = tree.entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"Photos") && names.contains(&"big.raw"));
-        let f = tree.entries.iter().find(|e| e.name == "big.raw").unwrap().clone();
+        let f = tree
+            .entries
+            .iter()
+            .find(|e| e.name == "big.raw")
+            .unwrap()
+            .clone();
         assert_eq!(f.size, data.len() as u64);
 
-        assert_eq!(read_all(c.read(&f, 0, None).await.unwrap()).await.unwrap(), data);
-        for (off, len) in [(0u64, 10u64), (1, 65_536), (65_535, 2), (65_536, 65_536), (200_000, 100_000), (299_999, 50)] {
-            let got = read_all(c.read(&f, off, Some(len)).await.unwrap()).await.unwrap();
+        assert_eq!(
+            read_all(c.read(&f, 0, None).await.unwrap()).await.unwrap(),
+            data
+        );
+        for (off, len) in [
+            (0u64, 10u64),
+            (1, 65_536),
+            (65_535, 2),
+            (65_536, 65_536),
+            (200_000, 100_000),
+            (299_999, 50),
+        ] {
+            let got = read_all(c.read(&f, off, Some(len)).await.unwrap())
+                .await
+                .unwrap();
             let end = ((off + len) as usize).min(data.len());
             assert_eq!(got, &data[off as usize..end], "range {off}+{len}");
         }
-        let tail = read_all(c.read(&f, 123_456, None).await.unwrap()).await.unwrap();
+        let tail = read_all(c.read(&f, 123_456, None).await.unwrap())
+            .await
+            .unwrap();
         assert_eq!(tail, &data[123_456..]);
     }
 
@@ -313,10 +408,18 @@ mod tests {
         assert!(tree.entries.is_empty());
         assert_eq!(tree.skipped, vec!["readme.txt".to_string()]);
         let long = "a".repeat(MAX_NAME_BYTES + 1);
-        assert!(matches!(c.create_folder(ROOT, &long).await, Err(RemoteError::InvalidName(_))));
+        assert!(matches!(
+            c.create_folder(ROOT, &long).await,
+            Err(RemoteError::InvalidName(_))
+        ));
         let ok = "b".repeat(MAX_NAME_BYTES);
         let e = c.create_folder(ROOT, &ok).await.unwrap();
-        let raw_len = mem.snapshot().keys().map(|k| k.trim_end_matches('/').len()).max().unwrap();
+        let raw_len = mem
+            .snapshot()
+            .keys()
+            .map(|k| k.trim_end_matches('/').len())
+            .max()
+            .unwrap();
         assert!(raw_len <= 255, "{raw_len}");
         assert_eq!(e.name, ok);
     }
@@ -324,8 +427,14 @@ mod tests {
     #[tokio::test]
     async fn rename_and_empty_file() {
         let (_mem, c) = setup();
-        let f = c.upload(ROOT, "empty", UploadBody::from_bytes(Vec::new(), 0)).await.unwrap();
-        assert_eq!(read_all(c.read(&f, 0, None).await.unwrap()).await.unwrap(), Vec::<u8>::new());
+        let f = c
+            .upload(ROOT, "empty", UploadBody::from_bytes(Vec::new(), 0))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_all(c.read(&f, 0, None).await.unwrap()).await.unwrap(),
+            Vec::<u8>::new()
+        );
         let r = c.rename(&f, ROOT, "renamed").await.unwrap();
         assert_eq!(r.name, "renamed");
         let tree = c.scan().await.unwrap();

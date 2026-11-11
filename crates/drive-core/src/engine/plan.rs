@@ -23,18 +23,45 @@ pub enum Change {
     /// Record the vault's root folder id.
     SetRootRemote(String),
     /// A new remote item: insert a node and show it locally.
-    Create { temp_id: TempId, parent: NodeId, name: String, entry: RemoteEntry, needs_move: bool, pinned: bool },
+    Create {
+        temp_id: TempId,
+        parent: NodeId,
+        name: String,
+        entry: RemoteEntry,
+        needs_move: bool,
+        pinned: bool,
+    },
     /// The item moved/was renamed remotely: move it locally too.
-    Move { node: NodeId, generation: i64, parent: NodeId, name: String, entry: RemoteEntry, needs_move: bool },
+    Move {
+        node: NodeId,
+        generation: i64,
+        parent: NodeId,
+        name: String,
+        entry: RemoteEntry,
+        needs_move: bool,
+    },
     /// Remote location changed but local intent wins (pending local move or delete).
     Rebase { node: NodeId, entry: RemoteEntry },
     /// A clean file got new content remotely.
-    Replace { node: NodeId, generation: i64, entry: RemoteEntry },
+    Replace {
+        node: NodeId,
+        generation: i64,
+        entry: RemoteEntry,
+    },
     /// A local folder (not yet created remotely, or recreated) matched to a remote folder.
-    Adopt { node: NodeId, generation: i64, entry: RemoteEntry },
+    Adopt {
+        node: NodeId,
+        generation: i64,
+        entry: RemoteEntry,
+    },
     /// Rename a local item out of the way of a remote one. `detach` forgets the remote copy
     /// (it no longer exists), so the item is uploaded as a new file under the new name.
-    MoveAside { node: NodeId, generation: i64, name: String, detach: bool },
+    MoveAside {
+        node: NodeId,
+        generation: i64,
+        name: String,
+        detach: bool,
+    },
     /// Remote deletion of an item without local changes: remove it (and its subtree).
     Remove { node: NodeId, generation: i64 },
     /// Remote deletion of an item with local changes: keep it and upload it again.
@@ -207,7 +234,9 @@ impl Model {
     }
 
     fn taken(&self, parent: NodeId, name: &str, except: Option<NodeId>) -> bool {
-        self.by_name.get(&(parent, name_key(name))).is_some_and(|id| Some(*id) != except)
+        self.by_name
+            .get(&(parent, name_key(name)))
+            .is_some_and(|id| Some(*id) != except)
     }
 
     /// `name`, or `stem (2).ext`, `stem (3).ext`, … — the first that is free in `parent`.
@@ -216,7 +245,10 @@ impl Model {
             return name.to_string();
         }
         let (stem, ext) = split_ext(name);
-        (2..).map(|i| format!("{stem} ({i}){ext}")).find(|n| !self.taken(parent, n, except)).expect("infinite range")
+        (2..)
+            .map(|i| format!("{stem} ({i}){ext}"))
+            .find(|n| !self.taken(parent, n, except))
+            .expect("infinite range")
     }
 
     fn depth(&self, mut id: NodeId) -> usize {
@@ -232,7 +264,11 @@ impl Model {
         let mut stack = vec![id];
         while let Some(cur) = stack.pop() {
             let n = &self.nodes[&cur];
-            if !n.deleted && (n.dirty || n.pending & pending::PUSH != 0 || (n.remote_id.is_none() && cur != id)) {
+            if !n.deleted
+                && (n.dirty
+                    || n.pending & pending::PUSH != 0
+                    || (n.remote_id.is_none() && cur != id))
+            {
                 return true;
             }
             stack.extend(self.children.get(&cur).into_iter().flatten().copied());
@@ -299,7 +335,8 @@ pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
     }
 
     if m.nodes[&ROOT_ID].remote_id.as_deref() != Some(tree.root_id.as_str()) {
-        out.changes.push(Change::SetRootRemote(tree.root_id.clone()));
+        out.changes
+            .push(Change::SetRootRemote(tree.root_id.clone()));
         let n = m.nodes.get_mut(&ROOT_ID).unwrap();
         n.remote_id = Some(tree.root_id.clone());
         m.by_remote.insert(tree.root_id.clone(), ROOT_ID);
@@ -308,7 +345,9 @@ pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
     // Top-down walk so parents are always placed before their children.
     let mut queue: VecDeque<(&str, NodeId)> = VecDeque::from([(tree.root_id.as_str(), ROOT_ID)]);
     while let Some((remote_parent, local_parent)) = queue.pop_front() {
-        let Some(children) = kids.get(remote_parent) else { continue };
+        let Some(children) = kids.get(remote_parent) else {
+            continue;
+        };
         for e in children.clone() {
             if let Some(local) = place(&mut m, &mut out, input, &remote, e, local_parent)
                 && e.kind == Kind::Folder
@@ -326,7 +365,9 @@ pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
             **id > 0
                 && **id != ROOT_ID
                 && n.op_seq <= input.scan_seq
-                && n.remote_id.as_deref().is_some_and(|r| !remote.contains_key(r))
+                && n.remote_id
+                    .as_deref()
+                    .is_some_and(|r| !remote.contains_key(r))
         })
         .map(|(id, _)| *id)
         .collect();
@@ -353,28 +394,44 @@ pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
             gone.insert(id);
         } else if n.kind == Kind::File {
             if n.dirty || n.pending & pending::PUSH != 0 {
-                out.changes.push(Change::Resurrect { node: id, generation: n.generation });
+                out.changes.push(Change::Resurrect {
+                    node: id,
+                    generation: n.generation,
+                });
                 m.clear_remote(id);
             } else {
-                removals.push(Change::Remove { node: id, generation: n.generation });
+                removals.push(Change::Remove {
+                    node: id,
+                    generation: n.generation,
+                });
                 removal_files += 1;
                 gone.insert(id);
             }
         } else if m.has_local_changes(id) {
-            out.changes.push(Change::Resurrect { node: id, generation: n.generation });
+            out.changes.push(Change::Resurrect {
+                node: id,
+                generation: n.generation,
+            });
             m.clear_remote(id);
         } else {
             removal_files += m.file_count(id);
-            removals.push(Change::Remove { node: id, generation: n.generation });
+            removals.push(Change::Remove {
+                node: id,
+                generation: n.generation,
+            });
             gone.insert(id);
         }
     }
 
     // Removed nodes keep their remote id in the model, so this counts them too.
-    let synced_files =
-        m.nodes.iter().filter(|(id, n)| **id > 0 && n.kind == Kind::File && n.remote_id.is_some()).count() as u32;
+    let synced_files = m
+        .nodes
+        .iter()
+        .filter(|(id, n)| **id > 0 && n.kind == Kind::File && n.remote_id.is_some())
+        .count() as u32;
     let suspicious = removal_files > 0
-        && ((removal_files >= 100 && removal_files * 2 >= synced_files) || (remote.is_empty() && removal_files >= 10));
+        && ((removal_files >= 100 && removal_files * 2 >= synced_files)
+            || (remote.is_empty() && removal_files >= 10));
     if suspicious && !input.allow_mass_removal {
         out.held_removal_files = removal_files;
     } else {
@@ -397,13 +454,17 @@ fn place(
         if n.op_seq > input.scan_seq || n.kind != e.kind {
             return Some(id);
         }
-        let moved = n.base_parent.as_deref() != Some(e.parent_id.as_str()) || n.base_name.as_deref() != Some(e.name.as_str());
+        let moved = n.base_parent.as_deref() != Some(e.parent_id.as_str())
+            || n.base_name.as_deref() != Some(e.name.as_str());
         if !moved {
             return Some(id);
         }
         if n.deleted || n.pending & pending::MOVE != 0 || !(input.valid_name)(&e.name) {
             // Our local location wins; the worker moves the remote item back/onwards.
-            out.changes.push(Change::Rebase { node: id, entry: e.clone() });
+            out.changes.push(Change::Rebase {
+                node: id,
+                entry: e.clone(),
+            });
             let mn = m.nodes.get_mut(&id).unwrap();
             mn.base_parent = Some(e.parent_id.clone());
             mn.base_name = Some(e.name.clone());
@@ -415,9 +476,19 @@ fn place(
         let name = m.unique_name(parent, &e.name, Some(id));
         let needs_move = name != e.name;
         if n.parent == Some(parent) && n.name == name {
-            out.changes.push(Change::Rebase { node: id, entry: e.clone() });
+            out.changes.push(Change::Rebase {
+                node: id,
+                entry: e.clone(),
+            });
         } else {
-            out.changes.push(Change::Move { node: id, generation: n.generation, parent, name: name.clone(), entry: e.clone(), needs_move });
+            out.changes.push(Change::Move {
+                node: id,
+                generation: n.generation,
+                parent,
+                name: name.clone(),
+                entry: e.clone(),
+                needs_move,
+            });
             m.rename(id, parent, &name);
         }
         let mn = m.nodes.get_mut(&id).unwrap();
@@ -435,31 +506,61 @@ fn place(
     let mut needs_move = false;
     if let Some(&x) = m.by_name.get(&(parent, name_key(&e.name))) {
         let xn = m.nodes[&x].clone();
-        let old_gone = xn.remote_id.as_deref().is_some_and(|r| !remote.contains_key(r)) && xn.op_seq <= input.scan_seq;
+        let old_gone = xn
+            .remote_id
+            .as_deref()
+            .is_some_and(|r| !remote.contains_key(r))
+            && xn.op_seq <= input.scan_seq;
         match (xn.kind, e.kind) {
             (Kind::File, Kind::File) if old_gone => {
                 if xn.dirty || xn.pending & pending::PUSH != 0 {
                     // Edited here and replaced there: keep ours as a conflicted copy.
-                    let name = m.unique_name(parent, &conflict_name(&xn.name, input.device_name, input.stamp), Some(x));
-                    out.changes.push(Change::MoveAside { node: x, generation: xn.generation, name: name.clone(), detach: true });
+                    let name = m.unique_name(
+                        parent,
+                        &conflict_name(&xn.name, input.device_name, input.stamp),
+                        Some(x),
+                    );
+                    out.changes.push(Change::MoveAside {
+                        node: x,
+                        generation: xn.generation,
+                        name: name.clone(),
+                        detach: true,
+                    });
                     out.conflicts.push(name.clone());
                     m.rename(x, parent, &name);
                     m.clear_remote(x);
                 } else {
-                    out.changes.push(Change::Replace { node: x, generation: xn.generation, entry: e.clone() });
+                    out.changes.push(Change::Replace {
+                        node: x,
+                        generation: xn.generation,
+                        entry: e.clone(),
+                    });
                     m.set_remote(x, e);
                     return Some(x);
                 }
             }
             (Kind::File, Kind::File) if xn.remote_id.is_none() => {
                 // Created here and there with the same name before either synced.
-                let name = m.unique_name(parent, &conflict_name(&xn.name, input.device_name, input.stamp), Some(x));
-                out.changes.push(Change::MoveAside { node: x, generation: xn.generation, name: name.clone(), detach: false });
+                let name = m.unique_name(
+                    parent,
+                    &conflict_name(&xn.name, input.device_name, input.stamp),
+                    Some(x),
+                );
+                out.changes.push(Change::MoveAside {
+                    node: x,
+                    generation: xn.generation,
+                    name: name.clone(),
+                    detach: false,
+                });
                 out.conflicts.push(name.clone());
                 m.rename(x, parent, &name);
             }
             (Kind::Folder, Kind::Folder) if xn.remote_id.is_none() || old_gone => {
-                out.changes.push(Change::Adopt { node: x, generation: xn.generation, entry: e.clone() });
+                out.changes.push(Change::Adopt {
+                    node: x,
+                    generation: xn.generation,
+                    entry: e.clone(),
+                });
                 m.set_remote(x, e);
                 let mn = m.nodes.get_mut(&x).unwrap();
                 mn.pending &= !pending::PUSH;
@@ -476,7 +577,12 @@ fn place(
                     if x < 0 {
                         // `x` is itself being created by this plan: just create it under the copy name.
                         for c in out.changes.iter_mut() {
-                            if let Change::Create { temp_id, name, needs_move, .. } = c
+                            if let Change::Create {
+                                temp_id,
+                                name,
+                                needs_move,
+                                ..
+                            } = c
                                 && *temp_id == x
                             {
                                 *name = copy.clone();
@@ -484,7 +590,12 @@ fn place(
                             }
                         }
                     } else {
-                        out.changes.push(Change::MoveAside { node: x, generation: xn.generation, name: copy.clone(), detach: false });
+                        out.changes.push(Change::MoveAside {
+                            node: x,
+                            generation: xn.generation,
+                            name: copy.clone(),
+                            detach: false,
+                        });
                     }
                     m.rename(x, parent, &copy);
                     let mn = m.nodes.get_mut(&x).unwrap();
@@ -496,19 +607,39 @@ fn place(
             }
             _ => {
                 // A file and a folder with the same name: move the local one aside.
-                let name = m.unique_name(parent, &conflict_name(&xn.name, input.device_name, input.stamp), Some(x));
-                out.changes.push(Change::MoveAside { node: x, generation: xn.generation, name: name.clone(), detach: false });
+                let name = m.unique_name(
+                    parent,
+                    &conflict_name(&xn.name, input.device_name, input.stamp),
+                    Some(x),
+                );
+                out.changes.push(Change::MoveAside {
+                    node: x,
+                    generation: xn.generation,
+                    name: name.clone(),
+                    detach: false,
+                });
                 out.conflicts.push(name.clone());
                 m.rename(x, parent, &name);
             }
         }
     }
-    let name = if needs_move { m.unique_name(parent, &conflicted_copy_name(&e.name), None) } else { e.name.clone() };
+    let name = if needs_move {
+        m.unique_name(parent, &conflicted_copy_name(&e.name), None)
+    } else {
+        e.name.clone()
+    };
     if needs_move {
         out.conflicts.push(name.clone());
     }
     let temp_id = m.insert(parent, &name, e, pinned);
-    out.changes.push(Change::Create { temp_id, parent, name, entry: e.clone(), needs_move, pinned });
+    out.changes.push(Change::Create {
+        temp_id,
+        parent,
+        name,
+        entry: e.clone(),
+        needs_move,
+        pinned,
+    });
     Some(temp_id)
 }
 
@@ -516,7 +647,13 @@ fn place(
 mod tests {
     use super::*;
 
-    fn node(id: NodeId, parent: NodeId, name: &str, kind: Kind, remote: Option<(&str, &str)>) -> Node {
+    fn node(
+        id: NodeId,
+        parent: NodeId,
+        name: &str,
+        kind: Kind,
+        remote: Option<(&str, &str)>,
+    ) -> Node {
         Node {
             id,
             parent_id: Some(parent),
@@ -548,11 +685,22 @@ mod tests {
     }
 
     fn entry(id: &str, parent: &str, name: &str, kind: Kind) -> RemoteEntry {
-        RemoteEntry { id: id.into(), parent_id: parent.into(), kind, name: name.into(), size: 1, mtime_ms: 0 }
+        RemoteEntry {
+            id: id.into(),
+            parent_id: parent.into(),
+            kind,
+            name: name.into(),
+            size: 1,
+            mtime_ms: 0,
+        }
     }
 
     fn run(nodes: &[Node], entries: Vec<RemoteEntry>) -> Plan {
-        let tree = RemoteTree { root_id: "R".into(), entries, skipped: vec![] };
+        let tree = RemoteTree {
+            root_id: "R".into(),
+            entries,
+            skipped: vec![],
+        };
         let orphans = HashSet::new();
         plan(&PlanInput {
             nodes,
@@ -569,9 +717,27 @@ mod tests {
 
     #[test]
     fn creates_new_tree_in_order() {
-        let p = run(&[root()], vec![entry("f", "D", "a.txt", Kind::File), entry("D", "R", "Docs", Kind::Folder)]);
+        let p = run(
+            &[root()],
+            vec![
+                entry("f", "D", "a.txt", Kind::File),
+                entry("D", "R", "Docs", Kind::Folder),
+            ],
+        );
         match &p.changes[..] {
-            [Change::Create { temp_id: -1, parent: 1, name, .. }, Change::Create { parent: -1, name: n2, .. }] => {
+            [
+                Change::Create {
+                    temp_id: -1,
+                    parent: 1,
+                    name,
+                    ..
+                },
+                Change::Create {
+                    parent: -1,
+                    name: n2,
+                    ..
+                },
+            ] => {
                 assert_eq!(name, "Docs");
                 assert_eq!(n2, "a.txt");
             }
@@ -581,11 +747,28 @@ mod tests {
 
     #[test]
     fn remote_move_and_rename() {
-        let nodes = [root(), node(2, 1, "Docs", Kind::Folder, Some(("D", "R"))), node(3, 1, "a.txt", Kind::File, Some(("f", "R")))];
-        let p = run(&nodes, vec![entry("D", "R", "Docs", Kind::Folder), entry("f", "D", "b.txt", Kind::File)]);
+        let nodes = [
+            root(),
+            node(2, 1, "Docs", Kind::Folder, Some(("D", "R"))),
+            node(3, 1, "a.txt", Kind::File, Some(("f", "R"))),
+        ];
+        let p = run(
+            &nodes,
+            vec![
+                entry("D", "R", "Docs", Kind::Folder),
+                entry("f", "D", "b.txt", Kind::File),
+            ],
+        );
         assert_eq!(
             p.changes,
-            vec![Change::Move { node: 3, generation: 0, parent: 2, name: "b.txt".into(), entry: entry("f", "D", "b.txt", Kind::File), needs_move: false }]
+            vec![Change::Move {
+                node: 3,
+                generation: 0,
+                parent: 2,
+                name: "b.txt".into(),
+                entry: entry("f", "D", "b.txt", Kind::File),
+                needs_move: false
+            }]
         );
     }
 
@@ -594,7 +777,10 @@ mod tests {
         let mut n = node(3, 1, "mine.txt", Kind::File, Some(("f", "R")));
         n.remote_name = Some("a.txt".into());
         n.pending = pending::MOVE;
-        let p = run(&[root(), n], vec![entry("f", "R", "theirs.txt", Kind::File)]);
+        let p = run(
+            &[root(), n],
+            vec![entry("f", "R", "theirs.txt", Kind::File)],
+        );
         assert!(matches!(p.changes[..], [Change::Rebase { node: 3, .. }]));
     }
 
@@ -602,7 +788,9 @@ mod tests {
     fn replaced_clean_file_is_replaced() {
         let nodes = [root(), node(3, 1, "a.txt", Kind::File, Some(("old", "R")))];
         let p = run(&nodes, vec![entry("new", "R", "a.txt", Kind::File)]);
-        assert!(matches!(&p.changes[..], [Change::Replace { node: 3, entry, .. }] if entry.id == "new"));
+        assert!(
+            matches!(&p.changes[..], [Change::Replace { node: 3, entry, .. }] if entry.id == "new")
+        );
     }
 
     #[test]
@@ -612,7 +800,15 @@ mod tests {
         n.pending = pending::PUSH;
         let p = run(&[root(), n], vec![entry("new", "R", "a.txt", Kind::File)]);
         match &p.changes[..] {
-            [Change::MoveAside { node: 3, name, detach: true, .. }, Change::Create { name: created, .. }] => {
+            [
+                Change::MoveAside {
+                    node: 3,
+                    name,
+                    detach: true,
+                    ..
+                },
+                Change::Create { name: created, .. },
+            ] => {
                 assert_eq!(name, "a (conflict PC 2026-11-10 1200).txt");
                 assert_eq!(created, "a.txt");
             }
@@ -626,10 +822,20 @@ mod tests {
         let mut dirty = node(4, 1, "edited.txt", Kind::File, Some(("e", "R")));
         dirty.dirty = true;
         dirty.pending = pending::PUSH;
-        let nodes = [root(), node(3, 1, "a.txt", Kind::File, Some(("f", "R"))), dirty];
+        let nodes = [
+            root(),
+            node(3, 1, "a.txt", Kind::File, Some(("f", "R"))),
+            dirty,
+        ];
         let p = run(&nodes, vec![]);
-        assert!(p.changes.contains(&Change::Remove { node: 3, generation: 0 }));
-        assert!(p.changes.contains(&Change::Resurrect { node: 4, generation: 0 }));
+        assert!(p.changes.contains(&Change::Remove {
+            node: 3,
+            generation: 0
+        }));
+        assert!(p.changes.contains(&Change::Resurrect {
+            node: 4,
+            generation: 0
+        }));
     }
 
     #[test]
@@ -644,24 +850,48 @@ mod tests {
             edited,
         ];
         let p = run(&nodes, vec![]);
-        assert!(p.changes.contains(&Change::Resurrect { node: 2, generation: 0 }));
-        assert!(p.changes.contains(&Change::Remove { node: 3, generation: 0 }));
-        assert!(!p.changes.iter().any(|c| matches!(c, Change::Remove { node: 5, .. })));
+        assert!(p.changes.contains(&Change::Resurrect {
+            node: 2,
+            generation: 0
+        }));
+        assert!(p.changes.contains(&Change::Remove {
+            node: 3,
+            generation: 0
+        }));
+        assert!(
+            !p.changes
+                .iter()
+                .any(|c| matches!(c, Change::Remove { node: 5, .. }))
+        );
     }
 
     #[test]
     fn duplicates_get_unique_names() {
-        let p = run(&[root()], vec![entry("a", "R", "x.txt", Kind::File), entry("b", "R", "X.txt", Kind::File)]);
+        let p = run(
+            &[root()],
+            vec![
+                entry("a", "R", "x.txt", Kind::File),
+                entry("b", "R", "X.txt", Kind::File),
+            ],
+        );
         let names: Vec<_> = p
             .changes
             .iter()
             .filter_map(|c| match c {
-                Change::Create { name, needs_move, .. } => Some((name.clone(), *needs_move)),
+                Change::Create {
+                    name, needs_move, ..
+                } => Some((name.clone(), *needs_move)),
                 _ => None,
             })
             .collect();
         // The smaller id ("a", named "x.txt") keeps the name on every device.
-        assert_eq!(names, vec![("X (conflicted copy).txt".into(), true), ("x.txt".into(), false)]);
+        assert_eq!(
+            names,
+            vec![
+                ("X (conflicted copy).txt".into(), true),
+                ("x.txt".into(), false)
+            ]
+        );
     }
 
     #[test]
@@ -676,9 +906,17 @@ mod tests {
     fn mass_removal_is_held() {
         let mut nodes = vec![root()];
         for i in 0..150 {
-            nodes.push(node(10 + i, 1, &format!("f{i}"), Kind::File, Some((&format!("r{i}"), "R"))));
+            nodes.push(node(
+                10 + i,
+                1,
+                &format!("f{i}"),
+                Kind::File,
+                Some((&format!("r{i}"), "R")),
+            ));
         }
-        let keep: Vec<_> = (0..20).map(|i| entry(&format!("r{i}"), "R", &format!("f{i}"), Kind::File)).collect();
+        let keep: Vec<_> = (0..20)
+            .map(|i| entry(&format!("r{i}"), "R", &format!("f{i}"), Kind::File))
+            .collect();
         let p = run(&nodes, keep);
         assert_eq!(p.held_removal_files, 130);
         assert!(!p.changes.iter().any(|c| matches!(c, Change::Remove { .. })));
@@ -686,7 +924,11 @@ mod tests {
 
     #[test]
     fn wrong_password_detected() {
-        let tree = RemoteTree { root_id: "R".into(), entries: vec![], skipped: vec!["garbage".into()] };
+        let tree = RemoteTree {
+            root_id: "R".into(),
+            entries: vec![],
+            skipped: vec!["garbage".into()],
+        };
         let orphans = HashSet::new();
         let r = plan(&PlanInput {
             nodes: &[root()],

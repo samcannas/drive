@@ -13,8 +13,13 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Name of the per-user socket. Callers turn it into a platform socket name.
 pub fn socket_name() -> String {
-    let user = std::env::var("USERNAME").or_else(|_| std::env::var("USER")).unwrap_or_else(|_| "user".into());
-    let user: String = user.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
+    let user = std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "user".into());
+    let user: String = user
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
     format!("drive-{user}.sock")
 }
 
@@ -48,14 +53,24 @@ pub enum Call {
     /// Partial update; omitted fields are unchanged. Returns the new [`Settings`].
     UpdateSettings(SettingsPatch),
     /// Most recent first; returns `Vec<Activity>`.
-    RecentActivity { limit: u32 },
+    RecentActivity {
+        limit: u32,
+    },
     /// Returns `Vec<Issue>`.
     ListIssues,
-    ResolveIssue { id: i64, action: IssueAction },
+    ResolveIssue {
+        id: i64,
+        action: IssueAction,
+    },
     /// Keep a file or folder (recursively) downloaded on this device, or release it.
-    SetPinned { path: String, pinned: bool },
+    SetPinned {
+        path: String,
+        pinned: bool,
+    },
     /// Evict the downloaded copy of a file or folder (it stays in the cloud).
-    FreeUpSpace { path: String },
+    FreeUpSpace {
+        path: String,
+    },
     /// Returns [`RecoveryKit`]: an rclone config that opens the vault without Drive.
     ExportRecovery,
     /// Disconnects the account and forgets credentials. Local placeholders are removed.
@@ -307,10 +322,21 @@ pub struct RecoveryKit {
 
 impl Response {
     pub fn ok(id: u64, value: impl Serialize) -> Self {
-        Self { id, result: Some(serde_json::to_value(value).unwrap_or(serde_json::Value::Null)), error: None }
+        Self {
+            id,
+            result: Some(serde_json::to_value(value).unwrap_or(serde_json::Value::Null)),
+            error: None,
+        }
     }
     pub fn err(id: u64, code: ErrorCode, message: impl Into<String>) -> Self {
-        Self { id, result: None, error: Some(RpcError { code, message: message.into() }) }
+        Self {
+            id,
+            result: None,
+            error: Some(RpcError {
+                code,
+                message: message.into(),
+            }),
+        }
     }
 }
 
@@ -320,7 +346,10 @@ mod tests {
 
     #[test]
     fn wire_format() {
-        let r: Request = serde_json::from_str(r#"{"id":3,"method":"set_pinned","params":{"path":"a/b","pinned":true}}"#).unwrap();
+        let r: Request = serde_json::from_str(
+            r#"{"id":3,"method":"set_pinned","params":{"path":"a/b","pinned":true}}"#,
+        )
+        .unwrap();
         assert!(matches!(r.call, Call::SetPinned { pinned: true, .. }));
         let r: Request = serde_json::from_str(r#"{"id":4,"method":"status"}"#).unwrap();
         assert!(matches!(r.call, Call::Status));

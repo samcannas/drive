@@ -141,8 +141,15 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(db: Arc<Db>, remote: Arc<dyn Remote>, cfg: EngineConfig) -> Result<Arc<Self>> {
-        let max_seq: i64 = db.read(|c| c.query_row("SELECT COALESCE(MAX(op_seq), 0) FROM node", [], |r| r.get(0)))?;
-        let last_sync = db.kv_get("last_sync_ms")?.and_then(|v| v.parse().ok()).unwrap_or(0);
+        let max_seq: i64 = db.read(|c| {
+            c.query_row("SELECT COALESCE(MAX(op_seq), 0) FROM node", [], |r| {
+                r.get(0)
+            })
+        })?;
+        let last_sync = db
+            .kv_get("last_sync_ms")?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         let paused = db.kv_get("paused")?.as_deref() == Some("1");
         let (status_tx, _) = watch::channel(Status::default());
         let (events, _) = broadcast::channel(512);
@@ -189,7 +196,9 @@ impl Engine {
     }
 
     fn local(&self) -> &Arc<dyn LocalSide> {
-        self.local.get().expect("Engine::set_local must be called before use")
+        self.local
+            .get()
+            .expect("Engine::set_local must be called before use")
     }
 
     pub fn db(&self) -> &Arc<Db> {
@@ -217,7 +226,10 @@ impl Engine {
 
     /// Spawns the background loops on the current Tokio runtime.
     pub fn start(self: &Arc<Self>) {
-        assert!(self.local.get().is_some(), "Engine::set_local must be called before start");
+        assert!(
+            self.local.get().is_some(),
+            "Engine::set_local must be called before start"
+        );
         tokio::spawn(self.clone().scanner_loop());
         tokio::spawn(self.clone().worker_loop());
         tokio::spawn(self.clone().evictor_loop());
@@ -261,7 +273,14 @@ impl Engine {
         }
     }
 
-    fn issue(&self, kind: IssueKind, key: &str, node: Option<NodeId>, path: Option<&str>, message: &str) {
+    fn issue(
+        &self,
+        kind: IssueKind,
+        key: &str,
+        node: Option<NodeId>,
+        path: Option<&str>,
+        message: &str,
+    ) {
         match self.db.raise_issue(kind, key, node, path, message) {
             Ok(true) => {
                 info!("issue: {message}");
@@ -315,7 +334,9 @@ impl Engine {
         let local_deletes = self.db.pending_trash_files().unwrap_or(0);
         let delete_confirm = if held > 0 {
             Some(held)
-        } else if local_deletes > LOCAL_DELETE_GUARD && now_ms() > self.allow_local_deletes_until.load(Ordering::Relaxed) {
+        } else if local_deletes > LOCAL_DELETE_GUARD
+            && now_ms() > self.allow_local_deletes_until.load(Ordering::Relaxed)
+        {
             Some(local_deletes)
         } else {
             None
@@ -343,13 +364,23 @@ impl Engine {
             SyncState::Error if delete_confirm.is_some() => {
                 format!("Confirm deleting {} files", delete_confirm.unwrap_or(0))
             }
-            SyncState::Error => format!("{issues} {} need{} attention", plural(issues, "item", "items"), if issues == 1 { "s" } else { "" }),
+            SyncState::Error => format!(
+                "{issues} {} need{} attention",
+                plural(issues, "item", "items"),
+                if issues == 1 { "s" } else { "" }
+            ),
             SyncState::Offline => "Offline. Changes will sync when you reconnect".to_string(),
             SyncState::Paused => "Syncing is paused".to_string(),
-            SyncState::Syncing if up > 0 && down == 0 => format!("Uploading {up} {}", plural(up, "file", "files")),
-            SyncState::Syncing if down > 0 && up == 0 => format!("Downloading {down} {}", plural(down, "file", "files")),
+            SyncState::Syncing if up > 0 && down == 0 => {
+                format!("Uploading {up} {}", plural(up, "file", "files"))
+            }
+            SyncState::Syncing if down > 0 && up == 0 => {
+                format!("Downloading {down} {}", plural(down, "file", "files"))
+            }
             SyncState::Syncing if up + down > 0 => format!("Syncing {} files", up + down),
-            SyncState::Syncing => format!("Syncing {pending} {}", plural(pending, "change", "changes")),
+            SyncState::Syncing => {
+                format!("Syncing {pending} {}", plural(pending, "change", "changes"))
+            }
             SyncState::UpToDate | SyncState::NotSetUp => "Up to date".to_string(),
         };
         let last = self.last_sync_ms.load(Ordering::Relaxed);
@@ -459,12 +490,24 @@ impl Engine {
     // ---- helpers -----------------------------------------------------------------------
 
     pub fn item(&self, n: &Node) -> Result<LocalItem> {
-        let path = self.db.path_of(n.id)?.ok_or_else(|| EngineError::NotFound(format!("node {}", n.id)))?;
-        Ok(LocalItem { id: n.id, path, kind: n.kind, size: n.size, mtime_ms: n.mtime_ms, pinned: n.pinned })
+        let path = self
+            .db
+            .path_of(n.id)?
+            .ok_or_else(|| EngineError::NotFound(format!("node {}", n.id)))?;
+        Ok(LocalItem {
+            id: n.id,
+            path,
+            kind: n.kind,
+            size: n.size,
+            mtime_ms: n.mtime_ms,
+            pinned: n.pinned,
+        })
     }
 
     fn node(&self, id: NodeId) -> Result<Node> {
-        self.db.node(id)?.ok_or_else(|| EngineError::NotFound(format!("node {id}")))
+        self.db
+            .node(id)?
+            .ok_or_else(|| EngineError::NotFound(format!("node {id}")))
     }
 
     /// The node's entry as the remote last knew it.
@@ -528,7 +571,14 @@ impl Engine {
     }
 
     /// Creates a new local node under `parent` (FUSE create/mkdir).
-    pub fn create_in(&self, parent: NodeId, name: &str, kind: Kind, size: u64, mtime_ms: i64) -> Result<NodeId> {
+    pub fn create_in(
+        &self,
+        parent: NodeId,
+        name: &str,
+        kind: Kind,
+        size: u64,
+        mtime_ms: i64,
+    ) -> Result<NodeId> {
         if name.is_empty() || name.contains('/') {
             return Err(EngineError::Invalid(format!("invalid name {name:?}")));
         }
@@ -560,8 +610,13 @@ impl Engine {
         let id = match id {
             Ok(Some(id)) => id,
             Ok(None) => return Err(EngineError::NotFound(format!("parent folder {parent}"))),
-            Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::ConstraintViolation => {
-                return Err(EngineError::Io(io::Error::new(io::ErrorKind::AlreadyExists, format!("{name} already exists"))));
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                return Err(EngineError::Io(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("{name} already exists"),
+                )));
             }
             Err(e) => return Err(e.into()),
         };
@@ -575,7 +630,9 @@ impl Engine {
     pub fn local_modified(&self, path: &str, size: u64, mtime_ms: i64) -> Result<()> {
         match self.db.node_by_path(path)? {
             Some(n) => self.modified(n.id, size, mtime_ms),
-            None => self.local_create(path, Kind::File, size, mtime_ms).map(|_| ()),
+            None => self
+                .local_create(path, Kind::File, size, mtime_ms)
+                .map(|_| ()),
         }
     }
 
@@ -605,7 +662,10 @@ impl Engine {
 
     /// `from` was moved/renamed to `to` locally. An existing item at `to` is replaced.
     pub fn local_rename(&self, from: &str, to: &str) -> Result<()> {
-        let n = self.db.node_by_path(from)?.ok_or_else(|| EngineError::NotFound(from.to_string()))?;
+        let n = self
+            .db
+            .node_by_path(from)?
+            .ok_or_else(|| EngineError::NotFound(from.to_string()))?;
         let (parent, name) = Self::split_path(to);
         let parent_id = self.ensure_folder(parent)?;
         self.rename_id(n.id, parent_id, name)
@@ -620,7 +680,9 @@ impl Engine {
         let mut cur = Some(new_parent);
         while let Some(c) = cur {
             if c == id {
-                return Err(EngineError::Invalid("cannot move a folder into itself".into()));
+                return Err(EngineError::Invalid(
+                    "cannot move a folder into itself".into(),
+                ));
             }
             cur = self.db.node(c)?.and_then(|n| n.parent_id);
         }
@@ -724,14 +786,23 @@ impl Engine {
     // ---- reading -------------------------------------------------------------------------
 
     /// Streams plaintext bytes of a file from the cloud.
-    pub async fn read(self: &Arc<Self>, id: NodeId, offset: u64, len: Option<u64>) -> Result<ByteStream> {
+    pub async fn read(
+        self: &Arc<Self>,
+        id: NodeId,
+        offset: u64,
+        len: Option<u64>,
+    ) -> Result<ByteStream> {
         let n = self.node(id)?;
         if n.kind != Kind::File {
             return Err(EngineError::Invalid("not a file".into()));
         }
-        let entry = self.remote_entry(&n).ok_or_else(|| EngineError::NotFound("file is not in the cloud yet".into()))?;
+        let entry = self
+            .remote_entry(&n)
+            .ok_or_else(|| EngineError::NotFound("file is not in the cloud yet".into()))?;
         self.touch(id);
-        let total = len.unwrap_or(n.size.saturating_sub(offset)).min(n.size.saturating_sub(offset));
+        let total = len
+            .unwrap_or(n.size.saturating_sub(offset))
+            .min(n.size.saturating_sub(offset));
         let stream = match self.remote.read(&entry, offset, len).await {
             Ok(s) => {
                 self.note_remote_ok();
@@ -744,15 +815,28 @@ impl Engine {
         };
         let done = Arc::new(AtomicU64::new(0));
         let tid = self.begin_transfer(false, total, done.clone());
-        let guard = TransferGuard { engine: self.clone(), id: tid };
+        let guard = TransferGuard {
+            engine: self.clone(),
+            id: tid,
+        };
         let s = metered(stream, done, self.down.clone());
         // Keep the transfer registered until the stream is dropped.
-        Ok(Box::pin(GuardedStream { inner: s, _guard: guard }))
+        Ok(Box::pin(GuardedStream {
+            inner: s,
+            _guard: guard,
+        }))
     }
 
     fn begin_transfer(&self, upload: bool, total: u64, done: Arc<AtomicU64>) -> u64 {
         let id = self.next_transfer.fetch_add(1, Ordering::Relaxed);
-        self.transfers.lock().unwrap().insert(id, Transfer { upload, total, done });
+        self.transfers.lock().unwrap().insert(
+            id,
+            Transfer {
+                upload,
+                total,
+                done,
+            },
+        );
         self.status_changed.notify_one();
         id
     }
@@ -766,7 +850,10 @@ impl Engine {
 
     /// Keeps a file or folder (recursively) downloaded on this device, or releases it.
     pub fn set_pinned(self: &Arc<Self>, path: &str, pinned: bool) -> Result<()> {
-        let n = self.db.node_by_path(path)?.ok_or_else(|| EngineError::NotFound(path.to_string()))?;
+        let n = self
+            .db
+            .node_by_path(path)?
+            .ok_or_else(|| EngineError::NotFound(path.to_string()))?;
         self.db.write(|tx| {
             tx.execute(
                 "WITH RECURSIVE sub(id) AS (SELECT ?1 UNION ALL SELECT n.id FROM node n JOIN sub ON n.parent_id = sub.id)
@@ -791,7 +878,10 @@ impl Engine {
     /// Unpins and evicts everything below `path` that is safely in the cloud.
     pub async fn free_up_space(self: &Arc<Self>, path: &str) -> Result<u64> {
         self.set_pinned(path, false)?;
-        let n = self.db.node_by_path(path)?.ok_or_else(|| EngineError::NotFound(path.to_string()))?;
+        let n = self
+            .db
+            .node_by_path(path)?
+            .ok_or_else(|| EngineError::NotFound(path.to_string()))?;
         let ids: Vec<NodeId> = self.db.read(|c| {
             let mut st = c.prepare(
                 "WITH RECURSIVE sub(id) AS (SELECT ?1 UNION ALL SELECT n.id FROM node n JOIN sub ON n.parent_id = sub.id)
@@ -839,7 +929,9 @@ impl Engine {
                 }
                 let item = me.item(&n)?;
                 let local = me.local().clone();
-                tokio::task::spawn_blocking(move || local.hydrate(&item)).await.map_err(io::Error::other)??;
+                tokio::task::spawn_blocking(move || local.hydrate(&item))
+                    .await
+                    .map_err(io::Error::other)??;
                 me.mark_hydrated(id, true);
                 Ok::<_, EngineError>(())
             }
@@ -892,8 +984,12 @@ impl Engine {
 
     async fn evict_pass(&self) {
         let cfg = self.config();
-        let Ok(totals) = self.db.storage_totals() else { return };
-        let mut need = totals.cache_bytes.saturating_sub(cfg.cache_limit_bytes.saturating_mul(9) / 10);
+        let Ok(totals) = self.db.storage_totals() else {
+            return;
+        };
+        let mut need = totals
+            .cache_bytes
+            .saturating_sub(cfg.cache_limit_bytes.saturating_mul(9) / 10);
         if totals.cache_bytes <= cfg.cache_limit_bytes {
             need = 0;
         }
@@ -911,7 +1007,9 @@ impl Engine {
         let mut freed = 0u64;
         let mut evicted = 0u32;
         while freed < need {
-            let Ok(batch) = self.db.eviction_candidates(64) else { break };
+            let Ok(batch) = self.db.eviction_candidates(64) else {
+                break;
+            };
             if batch.is_empty() {
                 break;
             }
@@ -933,7 +1031,12 @@ impl Engine {
         }
         if evicted > 0 {
             info!("evicted {evicted} files ({freed} bytes)");
-            self.activity(ActivityKind::Evicted, &format!("{evicted} files"), freed, Some("Freed up space on this device"));
+            self.activity(
+                ActivityKind::Evicted,
+                &format!("{evicted} files"),
+                freed,
+                Some("Freed up space on this device"),
+            );
         }
         if low_disk && freed < need {
             self.issue(
@@ -967,12 +1070,15 @@ impl Engine {
             }
             self.flush_access_times();
             ticks += 1;
-            if ticks % 120 == 0 {
+            if ticks.is_multiple_of(120) {
                 self.db.optimize();
             }
             // Forget trashed ids once no scan can still be listing them.
             let seq = self.op_seq.load(Ordering::SeqCst);
-            self.recently_gone.lock().unwrap().retain(|_, s| *s + 10_000 > seq);
+            self.recently_gone
+                .lock()
+                .unwrap()
+                .retain(|_, s| *s + 10_000 > seq);
         }
     }
 
@@ -981,11 +1087,12 @@ impl Engine {
     async fn scanner_loop(self: Arc<Self>) {
         let mut backoff = Duration::from_secs(5);
         loop {
-            let ok = if self.paused.load(Ordering::Relaxed) || self.signed_out.load(Ordering::Relaxed) {
-                true
-            } else {
-                self.scan_once().await.is_ok()
-            };
+            let ok =
+                if self.paused.load(Ordering::Relaxed) || self.signed_out.load(Ordering::Relaxed) {
+                    true
+                } else {
+                    self.scan_once().await.is_ok()
+                };
             let wait = if ok {
                 backoff = Duration::from_secs(5);
                 self.config().poll_interval
@@ -1025,7 +1132,14 @@ impl Engine {
     fn apply_scan(&self, tree: crate::remote::RemoteTree, scan_seq: i64) -> Result<()> {
         let nodes = self.db.all_nodes()?;
         let mut orphans = self.db.orphan_ids()?;
-        orphans.extend(self.recently_gone.lock().unwrap().iter().filter(|(_, s)| **s > scan_seq).map(|(k, _)| k.clone()));
+        orphans.extend(
+            self.recently_gone
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, s)| **s > scan_seq)
+                .map(|(k, _)| k.clone()),
+        );
         let cfg = self.config();
         let stamp = chrono::Local::now().format("%Y-%m-%d %H%M").to_string();
         let local = self.local().clone();
@@ -1062,7 +1176,10 @@ impl Engine {
             }
         };
         if !tree.skipped.is_empty() {
-            debug!("{} remote items could not be decrypted and were ignored", tree.skipped.len());
+            debug!(
+                "{} remote items could not be decrypted and were ignored",
+                tree.skipped.len()
+            );
         }
 
         let mut ids: HashMap<i64, NodeId> = HashMap::new();
@@ -1079,7 +1196,12 @@ impl Engine {
         for name in &plan.conflicts {
             // MoveAside already reported its own conflicts; report same-name collisions here.
             if name.contains("(conflicted copy)") {
-                self.activity(ActivityKind::Conflict, name, 0, Some("Two versions were uploaded at the same time"));
+                self.activity(
+                    ActivityKind::Conflict,
+                    name,
+                    0,
+                    Some("Two versions were uploaded at the same time"),
+                );
                 self.issue(
                     IssueKind::Conflict,
                     &format!("conflict:{name}"),
@@ -1089,7 +1211,8 @@ impl Engine {
                 );
             }
         }
-        self.held_remote_removals.store(plan.held_removal_files, Ordering::Relaxed);
+        self.held_remote_removals
+            .store(plan.held_removal_files, Ordering::Relaxed);
         if plan.held_removal_files > 0 {
             self.issue(
                 IssueKind::MassDelete,
@@ -1122,13 +1245,31 @@ impl Engine {
     }
 
     fn apply_change(&self, change: Change, ids: &mut HashMap<i64, NodeId>) -> Result<()> {
-        let real = |id: NodeId, ids: &HashMap<i64, NodeId>| if id < 0 { ids.get(&id).copied() } else { Some(id) };
+        let real = |id: NodeId, ids: &HashMap<i64, NodeId>| {
+            if id < 0 {
+                ids.get(&id).copied()
+            } else {
+                Some(id)
+            }
+        };
         match change {
             Change::SetRootRemote(r) => {
-                self.db.write(|tx| tx.execute("UPDATE node SET remote_id = ?1 WHERE id = 1", [&r]).map(|_| ()))?;
+                self.db.write(|tx| {
+                    tx.execute("UPDATE node SET remote_id = ?1 WHERE id = 1", [&r])
+                        .map(|_| ())
+                })?;
             }
-            Change::Create { temp_id, parent, name, entry, needs_move, pinned } => {
-                let Some(parent) = real(parent, ids) else { return Ok(()) };
+            Change::Create {
+                temp_id,
+                parent,
+                name,
+                entry,
+                needs_move,
+                pinned,
+            } => {
+                let Some(parent) = real(parent, ids) else {
+                    return Ok(());
+                };
                 let now = now_ms();
                 let inserted = self.db.write(|tx| {
                     let Some(p) = db::get_node(tx, parent)?.filter(|p| !p.deleted) else { return Ok(None) };
@@ -1162,7 +1303,10 @@ impl Engine {
                 let item = self.item(&n)?;
                 if let Err(e) = self.local().create(&item) {
                     warn!("showing {} locally failed: {e}", item.path);
-                    self.db.write(|tx| tx.execute("DELETE FROM node WHERE id = ?1", [id]).map(|_| ()))?;
+                    self.db.write(|tx| {
+                        tx.execute("DELETE FROM node WHERE id = ?1", [id])
+                            .map(|_| ())
+                    })?;
                     return Ok(());
                 }
                 if n.pinned && n.kind == Kind::File {
@@ -1170,8 +1314,17 @@ impl Engine {
                     self.wake_evictor.notify_one();
                 }
             }
-            Change::Move { node, generation, parent, name, entry, needs_move } => {
-                let Some(parent) = real(parent, ids) else { return Ok(()) };
+            Change::Move {
+                node,
+                generation,
+                parent,
+                name,
+                entry,
+                needs_move,
+            } => {
+                let Some(parent) = real(parent, ids) else {
+                    return Ok(());
+                };
                 let n = self.node(node)?;
                 if n.generation != generation || n.deleted {
                     return Ok(());
@@ -1180,9 +1333,23 @@ impl Engine {
                     return Ok(());
                 }
                 let from = self.item(&n)?.path;
-                let parent_path = self.db.path_of(parent)?.ok_or_else(|| EngineError::NotFound("parent".into()))?;
-                let to = if parent_path.is_empty() { name.clone() } else { format!("{parent_path}/{name}") };
-                let item = LocalItem { id: node, path: to.clone(), kind: n.kind, size: n.size, mtime_ms: n.mtime_ms, pinned: n.pinned };
+                let parent_path = self
+                    .db
+                    .path_of(parent)?
+                    .ok_or_else(|| EngineError::NotFound("parent".into()))?;
+                let to = if parent_path.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{parent_path}/{name}")
+                };
+                let item = LocalItem {
+                    id: node,
+                    path: to.clone(),
+                    kind: n.kind,
+                    size: n.size,
+                    mtime_ms: n.mtime_ms,
+                    pinned: n.pinned,
+                };
                 self.local().rename(&from, &item)?;
                 self.db.write(|tx| {
                     tx.execute(
@@ -1196,7 +1363,12 @@ impl Engine {
                 })?;
                 if name.contains("(conflicted copy)") && !from.contains("(conflicted copy)") {
                     // Another device resolved a same-name collision by renaming this file.
-                    self.activity(ActivityKind::Conflict, &to, n.size, Some("Two versions were uploaded at the same time"));
+                    self.activity(
+                        ActivityKind::Conflict,
+                        &to,
+                        n.size,
+                        Some("Two versions were uploaded at the same time"),
+                    );
                     self.issue(
                         IssueKind::Conflict,
                         &format!("conflict:{to}"),
@@ -1217,7 +1389,11 @@ impl Engine {
                     recompute_move(tx, node)
                 })?;
             }
-            Change::Replace { node, generation, entry } => {
+            Change::Replace {
+                node,
+                generation,
+                entry,
+            } => {
                 let n = self.node(node)?;
                 if n.generation != generation || n.dirty || n.deleted {
                     return Ok(());
@@ -1239,7 +1415,11 @@ impl Engine {
                     self.wake_evictor.notify_one();
                 }
             }
-            Change::Adopt { node, generation: _, entry } => {
+            Change::Adopt {
+                node,
+                generation: _,
+                entry,
+            } => {
                 self.db.write(|tx| {
                     tx.execute(
                         "UPDATE node SET remote_id = ?2, remote_parent_id = ?3, remote_name = ?4, pending = pending & ~1
@@ -1249,12 +1429,19 @@ impl Engine {
                     recompute_move(tx, node)
                 })?;
             }
-            Change::MoveAside { node, generation, name, detach } => {
+            Change::MoveAside {
+                node,
+                generation,
+                name,
+                detach,
+            } => {
                 let n = self.node(node)?;
                 if n.generation != generation || n.deleted {
                     return Ok(());
                 }
-                let Some(parent) = n.parent_id else { return Ok(()) };
+                let Some(parent) = n.parent_id else {
+                    return Ok(());
+                };
                 if self.db.child(parent, &name)?.is_some() {
                     return Ok(());
                 }
@@ -1263,7 +1450,14 @@ impl Engine {
                     Some(i) => format!("{}/{name}", &from[..i]),
                     None => name.clone(),
                 };
-                let item = LocalItem { id: node, path: to.clone(), kind: n.kind, size: n.size, mtime_ms: n.mtime_ms, pinned: n.pinned };
+                let item = LocalItem {
+                    id: node,
+                    path: to.clone(),
+                    kind: n.kind,
+                    size: n.size,
+                    mtime_ms: n.mtime_ms,
+                    pinned: n.pinned,
+                };
                 self.local().rename(&from, &item)?;
                 self.db.write(|tx| {
                     tx.execute(
@@ -1279,7 +1473,12 @@ impl Engine {
                     }
                     recompute_move(tx, node)
                 })?;
-                self.activity(ActivityKind::Conflict, &to, n.size, Some(&format!("Kept your version of {from}")));
+                self.activity(
+                    ActivityKind::Conflict,
+                    &to,
+                    n.size,
+                    Some(&format!("Kept your version of {from}")),
+                );
                 self.issue(
                     IssueKind::Conflict,
                     &format!("conflict:{node}"),
@@ -1293,7 +1492,11 @@ impl Engine {
             }
             Change::Remove { node, generation } => {
                 let n = self.node(node)?;
-                if n.generation != generation || n.dirty || n.pending & pending::PUSH != 0 || n.deleted {
+                if n.generation != generation
+                    || n.dirty
+                    || n.pending & pending::PUSH != 0
+                    || n.deleted
+                {
                     return Ok(());
                 }
                 if n.is_folder() && self.subtree_has_changes(node)? {
@@ -1301,10 +1504,21 @@ impl Engine {
                 }
                 let item = self.item(&n)?;
                 self.local().remove(&item)?;
-                self.db.write(|tx| tx.execute("DELETE FROM node WHERE id = ?1", [node]).map(|_| ()))?;
-                self.activity(ActivityKind::Deleted, &item.path, n.size, Some("Deleted in the cloud"));
+                self.db.write(|tx| {
+                    tx.execute("DELETE FROM node WHERE id = ?1", [node])
+                        .map(|_| ())
+                })?;
+                self.activity(
+                    ActivityKind::Deleted,
+                    &item.path,
+                    n.size,
+                    Some("Deleted in the cloud"),
+                );
             }
-            Change::Resurrect { node, generation: _ } => {
+            Change::Resurrect {
+                node,
+                generation: _,
+            } => {
                 self.db.write(|tx| {
                     tx.execute(
                         "UPDATE node SET remote_id = NULL, remote_parent_id = NULL, remote_name = NULL,
@@ -1316,7 +1530,10 @@ impl Engine {
                 })?;
             }
             Change::DropTombstone { node } => {
-                self.db.write(|tx| tx.execute("DELETE FROM node WHERE id = ?1 AND deleted = 1", [node]).map(|_| ()))?;
+                self.db.write(|tx| {
+                    tx.execute("DELETE FROM node WHERE id = ?1 AND deleted = 1", [node])
+                        .map(|_| ())
+                })?;
             }
         }
         Ok(())
@@ -1357,7 +1574,9 @@ impl Engine {
                 let now = now_ms();
                 let debounce = self.config().debounce.as_millis() as i64;
                 match self.db.next_work_at().ok().flatten() {
-                    Some(at) => Duration::from_millis((at + debounce - now).clamp(200, 30_000) as u64),
+                    Some(at) => {
+                        Duration::from_millis((at + debounce - now).clamp(200, 30_000) as u64)
+                    }
                     None => Duration::from_secs(30),
                 }
             };
@@ -1379,7 +1598,8 @@ impl Engine {
 
         let trash_blocked = {
             let n = self.db.pending_trash_files().unwrap_or(0);
-            let blocked = n > LOCAL_DELETE_GUARD && now > self.allow_local_deletes_until.load(Ordering::Relaxed);
+            let blocked = n > LOCAL_DELETE_GUARD
+                && now > self.allow_local_deletes_until.load(Ordering::Relaxed);
             if blocked {
                 self.issue(
                     IssueKind::MassDelete,
@@ -1394,7 +1614,9 @@ impl Engine {
             blocked
         };
 
-        let Ok(due) = self.db.due_work(now, debounce_before, 200) else { return 0 };
+        let Ok(due) = self.db.due_work(now, debounce_before, 200) else {
+            return 0;
+        };
         for n in due {
             if self.in_flight.lock().unwrap().len() >= max {
                 break;
@@ -1479,7 +1701,11 @@ impl Engine {
         let r = if n.deleted {
             self.push_trash(&n).await
         } else if n.pending & pending::PUSH != 0 {
-            if n.is_folder() { self.push_mkdir(&n).await } else { self.push_upload(&n).await }
+            if n.is_folder() {
+                self.push_mkdir(&n).await
+            } else {
+                self.push_upload(&n).await
+            }
         } else if n.pending & pending::MOVE != 0 {
             self.push_move(&n).await
         } else {
@@ -1497,7 +1723,12 @@ impl Engine {
 
     fn handle_failure(&self, n: &Node, e: EngineError) {
         let now = now_ms();
-        let path = self.db.path_of(n.id).ok().flatten().unwrap_or_else(|| n.name.clone());
+        let path = self
+            .db
+            .path_of(n.id)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| n.name.clone());
         let (delay_ms, count_attempt): (i64, bool) = match &e {
             EngineError::Remote(re) => {
                 self.note_remote_error(re);
@@ -1558,13 +1789,18 @@ impl Engine {
             )
             .map(|_| ())
         });
-        if count_attempt && attempts >= 5 && !matches!(&e, EngineError::Io(io) if io.kind() == io::ErrorKind::WouldBlock) {
+        if count_attempt
+            && attempts >= 5
+            && !matches!(&e, EngineError::Io(io) if io.kind() == io::ErrorKind::WouldBlock)
+        {
             self.issue(
                 IssueKind::TransferFailed,
                 &format!("transfer:{}", n.id),
                 Some(n.id),
                 Some(&path),
-                &format!("\"{path}\" couldn't be synced after several tries: {e}. Drive keeps retrying."),
+                &format!(
+                    "\"{path}\" couldn't be synced after several tries: {e}. Drive keeps retrying."
+                ),
             );
         }
     }
@@ -1579,13 +1815,18 @@ impl Engine {
             let seq = self.next_seq();
             self.recently_gone.lock().unwrap().insert(entry.id, seq);
         }
-        self.db.write(|tx| tx.execute("DELETE FROM node WHERE id = ?1 AND deleted = 1", [n.id]).map(|_| ()))?;
+        self.db.write(|tx| {
+            tx.execute("DELETE FROM node WHERE id = ?1 AND deleted = 1", [n.id])
+                .map(|_| ())
+        })?;
         self.activity(ActivityKind::Deleted, &path, n.size, None);
         Ok(())
     }
 
     async fn push_mkdir(&self, n: &Node) -> Result<()> {
-        let parent = self.parent_remote_id(n)?.ok_or_else(|| EngineError::NotFound("parent folder".into()))?;
+        let parent = self
+            .parent_remote_id(n)?
+            .ok_or_else(|| EngineError::NotFound("parent folder".into()))?;
         let entry = self.remote.create_folder(&parent, &n.name).await?;
         let seq = self.next_seq();
         self.db.write(|tx| {
@@ -1613,16 +1854,25 @@ impl Engine {
     }
 
     async fn push_upload(&self, n: &Node) -> Result<()> {
-        let parent = self.parent_remote_id(n)?.ok_or_else(|| EngineError::NotFound("parent folder".into()))?;
+        let parent = self
+            .parent_remote_id(n)?
+            .ok_or_else(|| EngineError::NotFound("parent folder".into()))?;
         // An edit of a synced file must be based on the version that is still current in the
         // cloud. If that version was replaced or deleted meanwhile, rescan first: the planner
         // turns our edit into a conflicted copy (replaced) or re-uploads it (deleted).
         if let Some(base) = self.remote_entry(n)
             && !self.remote.exists(&base).await?
         {
-            debug!("base version of {} changed remotely; rescanning before upload", n.name);
+            debug!(
+                "base version of {} changed remotely; rescanning before upload",
+                n.name
+            );
             self.db.write(|tx| {
-                tx.execute("UPDATE node SET retry_at_ms = ?2 WHERE id = ?1", params![n.id, now_ms() + 2_000]).map(|_| ())
+                tx.execute(
+                    "UPDATE node SET retry_at_ms = ?2 WHERE id = ?1",
+                    params![n.id, now_ms() + 2_000],
+                )
+                .map(|_| ())
             })?;
             self.wake_scanner.notify_one();
             return Ok(());
@@ -1630,7 +1880,9 @@ impl Engine {
         let item = self.item(n)?;
         let local = self.local().clone();
         let it = item.clone();
-        let src = tokio::task::spawn_blocking(move || local.open_for_upload(&it)).await.map_err(io::Error::other)??;
+        let src = tokio::task::spawn_blocking(move || local.open_for_upload(&it))
+            .await
+            .map_err(io::Error::other)??;
         let size = src.size;
         let mtime = src.mtime_ms;
         let file = tokio::fs::File::from_std(src.file);
@@ -1639,7 +1891,11 @@ impl Engine {
         let stream: ByteStream = Box::pin(reader);
         let done = Arc::new(AtomicU64::new(0));
         let tid = self.begin_transfer(true, size, done.clone());
-        let body = UploadBody { stream: metered(stream, done, self.up.clone()), size, mtime_ms: mtime };
+        let body = UploadBody {
+            stream: metered(stream, done, self.up.clone()),
+            size,
+            mtime_ms: mtime,
+        };
         let result = self.remote.upload(&parent, &n.name, body).await;
         self.end_transfer(tid);
         let entry = result?;
@@ -1678,10 +1934,16 @@ impl Engine {
             match self.remote.trash(&old).await {
                 Ok(()) | Err(RemoteError::NotFound(_)) => {
                     let seq = self.next_seq();
-                    self.recently_gone.lock().unwrap().insert(old.id.clone(), seq);
+                    self.recently_gone
+                        .lock()
+                        .unwrap()
+                        .insert(old.id.clone(), seq);
                     self.db.remove_orphan(&old.id)?;
                 }
-                Err(e) => debug!("retiring the previous version of {} failed (will retry): {e}", item.path),
+                Err(e) => debug!(
+                    "retiring the previous version of {} failed (will retry): {e}",
+                    item.path
+                ),
             }
         }
 
@@ -1689,13 +1951,14 @@ impl Engine {
             UploadOutcome::Clean => {
                 let local = self.local().clone();
                 let it = item.clone();
-                let still_same = tokio::task::spawn_blocking(move || local.uploaded(&it, size, mtime))
-                    .await
-                    .map_err(io::Error::other)?
-                    .unwrap_or_else(|e| {
-                        warn!("marking {} as synced failed: {e}", item.path);
-                        true
-                    });
+                let still_same =
+                    tokio::task::spawn_blocking(move || local.uploaded(&it, size, mtime))
+                        .await
+                        .map_err(io::Error::other)?
+                        .unwrap_or_else(|e| {
+                            warn!("marking {} as synced failed: {e}", item.path);
+                            true
+                        });
                 if !still_same {
                     self.db.write(|tx| {
                         tx.execute(
@@ -1708,7 +1971,12 @@ impl Engine {
                 self.activity(ActivityKind::Uploaded, &item.path, size, None);
             }
             UploadOutcome::ChangedMeanwhile => {
-                self.activity(ActivityKind::Uploaded, &item.path, size, Some("Changed again while uploading; uploading the newer version"));
+                self.activity(
+                    ActivityKind::Uploaded,
+                    &item.path,
+                    size,
+                    Some("Changed again while uploading; uploading the newer version"),
+                );
             }
             UploadOutcome::Gone => {}
         }
@@ -1717,8 +1985,12 @@ impl Engine {
     }
 
     async fn push_move(&self, n: &Node) -> Result<()> {
-        let parent = self.parent_remote_id(n)?.ok_or_else(|| EngineError::NotFound("parent folder".into()))?;
-        let entry = self.remote_entry(n).ok_or_else(|| EngineError::NotFound("remote item".into()))?;
+        let parent = self
+            .parent_remote_id(n)?
+            .ok_or_else(|| EngineError::NotFound("parent folder".into()))?;
+        let entry = self
+            .remote_entry(n)
+            .ok_or_else(|| EngineError::NotFound("remote item".into()))?;
         let moved = self.remote.rename(&entry, &parent, &n.name).await?;
         let seq = self.next_seq();
         self.db.write(|tx| {
@@ -1740,7 +2012,9 @@ impl Engine {
         let mut list = self.db.issues()?;
         // The remote mass-delete guard can only be confirmed (or left waiting).
         for i in &mut list {
-            if i.kind == IssueKind::MassDelete && i.message.contains("deleted from your uloz.to vault") {
+            if i.kind == IssueKind::MassDelete
+                && i.message.contains("deleted from your uloz.to vault")
+            {
                 i.actions = vec![IssueAction::ConfirmDelete, IssueAction::Dismiss];
             }
         }
@@ -1756,7 +2030,11 @@ impl Engine {
             IssueAction::Retry => {
                 if let Some(node) = node {
                     self.db.write(|tx| {
-                        tx.execute("UPDATE node SET retry_at_ms = 0, attempts = 0 WHERE id = ?1", [node]).map(|_| ())
+                        tx.execute(
+                            "UPDATE node SET retry_at_ms = 0, attempts = 0 WHERE id = ?1",
+                            [node],
+                        )
+                        .map(|_| ())
                     })?;
                 }
                 self.wake_evictor.notify_one();
@@ -1765,11 +2043,13 @@ impl Engine {
             IssueAction::ConfirmDelete => {
                 let until = now_ms() + 15 * 60_000;
                 if key == "mass_delete:remote" {
-                    self.allow_remote_removal_until.store(until, Ordering::Relaxed);
+                    self.allow_remote_removal_until
+                        .store(until, Ordering::Relaxed);
                     self.held_remote_removals.store(0, Ordering::Relaxed);
                     self.wake_scanner.notify_one();
                 } else {
-                    self.allow_local_deletes_until.store(until, Ordering::Relaxed);
+                    self.allow_local_deletes_until
+                        .store(until, Ordering::Relaxed);
                     self.wake_worker.notify_one();
                 }
             }
@@ -1787,7 +2067,10 @@ impl Engine {
     /// fills in their contents.
     fn restore_local_deletes(&self) -> Result<()> {
         let tombstones: Vec<Node> = self.db.read(|c| {
-            let mut st = c.prepare(&format!("SELECT {} FROM node WHERE deleted = 1 AND pending & 4 != 0", db::NODE_COLUMNS))?;
+            let mut st = c.prepare(&format!(
+                "SELECT {} FROM node WHERE deleted = 1 AND pending & 4 != 0",
+                db::NODE_COLUMNS
+            ))?;
             st.query_map([], Node::from_row)?.collect()
         })?;
         for n in tombstones {
@@ -1869,7 +2152,10 @@ struct GuardedStream {
 
 impl futures::Stream for GuardedStream {
     type Item = io::Result<bytes::Bytes>;
-    fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
         self.inner.as_mut().poll_next(cx)
     }
 }

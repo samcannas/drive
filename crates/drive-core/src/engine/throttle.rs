@@ -18,7 +18,10 @@ pub struct Throttle {
 
 impl Throttle {
     pub fn new(kbps: u64) -> Self {
-        Self { rate_bytes: AtomicU64::new(kbps * 1024), state: tokio::sync::Mutex::new((0.0, Instant::now())) }
+        Self {
+            rate_bytes: AtomicU64::new(kbps * 1024),
+            state: tokio::sync::Mutex::new((0.0, Instant::now())),
+        }
     }
 
     pub fn set_kbps(&self, kbps: u64) {
@@ -38,7 +41,11 @@ impl Throttle {
             st.0 = (st.0 + elapsed * rate).min(rate);
             st.1 = now;
             st.0 -= bytes as f64;
-            if st.0 < 0.0 { Duration::from_secs_f64(-st.0 / rate) } else { Duration::ZERO }
+            if st.0 < 0.0 {
+                Duration::from_secs_f64(-st.0 / rate)
+            } else {
+                Duration::ZERO
+            }
         };
         if !wait.is_zero() {
             tokio::time::sleep(wait).await;

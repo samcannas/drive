@@ -61,10 +61,17 @@ impl MemRemote {
         let mut items = index.items;
         for (id, it) in items.iter_mut() {
             if it.kind == Kind::File {
-                it.data = std::fs::read(dir.join("blobs").join(id)).map(Bytes::from).unwrap_or_default();
+                it.data = std::fs::read(dir.join("blobs").join(id))
+                    .map(Bytes::from)
+                    .unwrap_or_default();
             }
         }
-        Ok(Self { items: Mutex::new(items), next: AtomicU64::new(index.next), dir: Some(dir), ..Default::default() })
+        Ok(Self {
+            items: Mutex::new(items),
+            next: AtomicU64::new(index.next),
+            dir: Some(dir),
+            ..Default::default()
+        })
     }
 
     fn persist(&self, new_blob: Option<(&str, &[u8])>) {
@@ -72,7 +79,10 @@ impl MemRemote {
         if let Some((id, data)) = new_blob {
             let _ = std::fs::write(dir.join("blobs").join(id), data);
         }
-        let index = Index { next: self.next.load(Ordering::SeqCst), items: self.items.lock().unwrap().clone() };
+        let index = Index {
+            next: self.next.load(Ordering::SeqCst),
+            items: self.items.lock().unwrap().clone(),
+        };
         let tmp = dir.join("index.json.tmp");
         if std::fs::write(&tmp, serde_json::to_vec(&index).unwrap_or_default()).is_ok() {
             let _ = std::fs::rename(&tmp, dir.join("index.json"));
@@ -122,7 +132,10 @@ impl MemRemote {
     }
 
     fn exists_folder(items: &HashMap<String, Item>, id: &str) -> bool {
-        id == ROOT || items.get(id).is_some_and(|i| i.kind == Kind::Folder && !i.trashed)
+        id == ROOT
+            || items
+                .get(id)
+                .is_some_and(|i| i.kind == Kind::Folder && !i.trashed)
     }
 
     // ---- direct manipulation, simulating another device ------------------------------
@@ -131,7 +144,14 @@ impl MemRemote {
         let id = self.new_id();
         self.items.lock().unwrap().insert(
             id.clone(),
-            Item { parent: parent.into(), kind: Kind::File, name: name.into(), data: Bytes::copy_from_slice(data), mtime_ms, trashed: false },
+            Item {
+                parent: parent.into(),
+                kind: Kind::File,
+                name: name.into(),
+                data: Bytes::copy_from_slice(data),
+                mtime_ms,
+                trashed: false,
+            },
         );
         self.persist(Some((&id, data)));
         id
@@ -141,7 +161,14 @@ impl MemRemote {
         let id = self.new_id();
         self.items.lock().unwrap().insert(
             id.clone(),
-            Item { parent: parent.into(), kind: Kind::Folder, name: name.into(), data: Bytes::new(), mtime_ms: 0, trashed: false },
+            Item {
+                parent: parent.into(),
+                kind: Kind::Folder,
+                name: name.into(),
+                data: Bytes::new(),
+                mtime_ms: 0,
+                trashed: false,
+            },
         );
         self.persist(None);
         id
@@ -154,7 +181,12 @@ impl MemRemote {
             if let Some(it) = items.get_mut(&cur) {
                 it.trashed = true;
             }
-            stack.extend(items.iter().filter(|(_, i)| i.parent == cur && !i.trashed).map(|(k, _)| k.clone()));
+            stack.extend(
+                items
+                    .iter()
+                    .filter(|(_, i)| i.parent == cur && !i.trashed)
+                    .map(|(k, _)| k.clone()),
+            );
         }
         drop(items);
         self.persist(None);
@@ -214,7 +246,13 @@ impl MemRemote {
     }
 
     pub fn trashed_names(&self) -> Vec<String> {
-        self.items.lock().unwrap().values().filter(|i| i.trashed).map(|i| i.name.clone()).collect()
+        self.items
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|i| i.trashed)
+            .map(|i| i.name.clone())
+            .collect()
     }
 }
 
@@ -234,8 +272,16 @@ impl Remote for MemRemote {
             }
             true
         };
-        let entries = items.iter().filter(|(id, _)| alive(id)).map(|(id, it)| Self::entry(id, it)).collect();
-        Ok(RemoteTree { root_id: ROOT.into(), entries, skipped: vec![] })
+        let entries = items
+            .iter()
+            .filter(|(id, _)| alive(id))
+            .map(|(id, it)| Self::entry(id, it))
+            .collect();
+        Ok(RemoteTree {
+            root_id: ROOT.into(),
+            entries,
+            skipped: vec![],
+        })
     }
 
     async fn create_folder(&self, parent_id: &str, name: &str) -> Result<RemoteEntry, RemoteError> {
@@ -248,14 +294,23 @@ impl Remote for MemRemote {
         Ok(Self::entry(&id, &items[&id]))
     }
 
-    async fn upload(&self, parent_id: &str, name: &str, mut body: UploadBody) -> Result<RemoteEntry, RemoteError> {
+    async fn upload(
+        &self,
+        parent_id: &str,
+        name: &str,
+        mut body: UploadBody,
+    ) -> Result<RemoteEntry, RemoteError> {
         self.check(format!("upload {name}"))?;
         let mut data = Vec::new();
         while let Some(chunk) = body.stream.next().await {
             data.extend_from_slice(&chunk.map_err(|e| RemoteError::Network(e.to_string()))?);
         }
         if data.len() as u64 != body.size {
-            return Err(RemoteError::Integrity(format!("size {} != declared {}", data.len(), body.size)));
+            return Err(RemoteError::Integrity(format!(
+                "size {} != declared {}",
+                data.len(),
+                body.size
+            )));
         }
         if !Self::exists_folder(&self.items.lock().unwrap(), parent_id) {
             return Err(RemoteError::NotFound(parent_id.into()));
@@ -265,10 +320,18 @@ impl Remote for MemRemote {
         Ok(Self::entry(&id, &items[&id]))
     }
 
-    async fn read(&self, file: &RemoteEntry, offset: u64, len: Option<u64>) -> Result<ByteStream, RemoteError> {
+    async fn read(
+        &self,
+        file: &RemoteEntry,
+        offset: u64,
+        len: Option<u64>,
+    ) -> Result<ByteStream, RemoteError> {
         self.check(String::new())?;
         let items = self.items.lock().unwrap();
-        let it = items.get(&file.id).filter(|i| !i.trashed).ok_or_else(|| RemoteError::NotFound(file.id.clone()))?;
+        let it = items
+            .get(&file.id)
+            .filter(|i| !i.trashed)
+            .ok_or_else(|| RemoteError::NotFound(file.id.clone()))?;
         let start = (offset as usize).min(it.data.len());
         let end = match len {
             Some(l) => (start + l as usize).min(it.data.len()),
@@ -276,17 +339,28 @@ impl Remote for MemRemote {
         };
         let data = it.data.slice(start..end);
         // Deliver in uneven chunks to exercise stream handling.
-        let chunks: Vec<std::io::Result<Bytes>> = data.chunks(50_000).map(|c| Ok(Bytes::copy_from_slice(c))).collect();
+        let chunks: Vec<std::io::Result<Bytes>> = data
+            .chunks(50_000)
+            .map(|c| Ok(Bytes::copy_from_slice(c)))
+            .collect();
         Ok(Box::pin(futures::stream::iter(chunks)))
     }
 
-    async fn rename(&self, entry: &RemoteEntry, new_parent_id: &str, new_name: &str) -> Result<RemoteEntry, RemoteError> {
+    async fn rename(
+        &self,
+        entry: &RemoteEntry,
+        new_parent_id: &str,
+        new_name: &str,
+    ) -> Result<RemoteEntry, RemoteError> {
         self.check(format!("rename {} -> {new_name}", entry.name))?;
         let mut items = self.items.lock().unwrap();
         if !Self::exists_folder(&items, new_parent_id) {
             return Err(RemoteError::NotFound(new_parent_id.into()));
         }
-        let it = items.get_mut(&entry.id).filter(|i| !i.trashed).ok_or_else(|| RemoteError::NotFound(entry.id.clone()))?;
+        let it = items
+            .get_mut(&entry.id)
+            .filter(|i| !i.trashed)
+            .ok_or_else(|| RemoteError::NotFound(entry.id.clone()))?;
         it.parent = new_parent_id.into();
         it.name = new_name.into();
         let e = Self::entry(&entry.id, it);
@@ -297,7 +371,13 @@ impl Remote for MemRemote {
 
     async fn trash(&self, entry: &RemoteEntry) -> Result<(), RemoteError> {
         self.check(format!("trash {}", entry.name))?;
-        if !self.items.lock().unwrap().get(&entry.id).is_some_and(|i| !i.trashed) {
+        if self
+            .items
+            .lock()
+            .unwrap()
+            .get(&entry.id)
+            .is_none_or(|i| i.trashed)
+        {
             return Err(RemoteError::NotFound(entry.id.clone()));
         }
         self.remove(&entry.id);
@@ -306,6 +386,11 @@ impl Remote for MemRemote {
 
     async fn exists(&self, entry: &RemoteEntry) -> Result<bool, RemoteError> {
         self.check(String::new())?;
-        Ok(self.items.lock().unwrap().get(&entry.id).is_some_and(|i| !i.trashed))
+        Ok(self
+            .items
+            .lock()
+            .unwrap()
+            .get(&entry.id)
+            .is_some_and(|i| !i.trashed))
     }
 }

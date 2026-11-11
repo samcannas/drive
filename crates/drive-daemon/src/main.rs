@@ -13,13 +13,18 @@ use std::io::{BufRead, Write};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use drive_core::ipc::{
-    Activity, Call, ErrorCode, Issue, IssueAction, RecoveryKit, SetupRequest, SetupResult, Settings, SettingsPatch, Status,
+    Activity, Call, ErrorCode, Issue, IssueAction, RecoveryKit, Settings, SettingsPatch,
+    SetupRequest, SetupResult, Status,
 };
 use drive_core::ipc_client::{Client, ClientError};
 use tracing::{error, info};
 
 #[derive(Parser)]
-#[command(name = "drive", version, about = "Encrypted cloud drive backed by uloz.to")]
+#[command(
+    name = "drive",
+    version,
+    about = "Encrypted cloud drive backed by uloz.to"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -80,7 +85,9 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     match cli.command {
         Command::Daemon { foreground } => rt.block_on(run_daemon(foreground)),
         other => rt.block_on(run_client(other)),
@@ -95,7 +102,10 @@ async fn run_daemon(foreground: bool) -> Result<()> {
 
     let listener = match ipc_server::bind().await {
         Ok(l) => l,
-        Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::AddrInUse) => {
+        Err(e)
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::AddrInUse) =>
+        {
             info!("another instance is already running");
             return Ok(());
         }
@@ -132,7 +142,10 @@ async fn terminate() {
     std::future::pending::<()>().await;
 }
 
-fn init_logging(paths: &config::Paths, foreground: bool) -> Result<tracing_appender::non_blocking::WorkerGuard> {
+fn init_logging(
+    paths: &config::Paths,
+    foreground: bool,
+) -> Result<tracing_appender::non_blocking::WorkerGuard> {
     use tracing_subscriber::prelude::*;
     std::fs::create_dir_all(paths.log_dir())?;
     let file = tracing_appender::rolling::Builder::new()
@@ -145,9 +158,15 @@ fn init_logging(paths: &config::Paths, foreground: bool) -> Result<tracing_appen
     let (writer, guard) = tracing_appender::non_blocking(file);
     let filter = tracing_subscriber::EnvFilter::try_from_env("DRIVE_LOG")
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,drive_core=info,drive=info"));
-    let file_layer = tracing_subscriber::fmt::layer().with_writer(writer).with_ansi(false);
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(writer)
+        .with_ansi(false);
     let console = foreground.then(|| tracing_subscriber::fmt::layer().with_writer(std::io::stderr));
-    tracing_subscriber::registry().with(filter).with(file_layer).with(console).init();
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(file_layer)
+        .with(console)
+        .init();
     Ok(guard)
 }
 
@@ -157,7 +176,9 @@ async fn connect() -> Result<Client> {
     match Client::connect().await {
         Ok(c) => Ok(c),
         Err(ClientError::NotRunning(_)) => {
-            bail!("The Drive service isn't running. Start the Drive app, or run `drive daemon` in another terminal.")
+            bail!(
+                "The Drive service isn't running. Start the Drive app, or run `drive daemon` in another terminal."
+            )
         }
         Err(e) => Err(e.into()),
     }
@@ -171,7 +192,11 @@ fn human_bytes(b: u64) -> String {
         v /= 1024.0;
         i += 1;
     }
-    if i == 0 { format!("{b} B") } else { format!("{v:.1} {}", UNITS[i]) }
+    if i == 0 {
+        format!("{b} B")
+    } else {
+        format!("{v:.1} {}", UNITS[i])
+    }
 }
 
 fn prompt_secret(label: &str) -> Result<String> {
@@ -191,35 +216,65 @@ async fn run_client(cmd: Command) -> Result<()> {
             if let Some(f) = &s.folder {
                 println!("  Folder:      {f}");
             }
-            println!("  In the cloud: {} files, {}", s.cloud_files, human_bytes(s.cloud_bytes));
-            println!("  On this device: {} kept offline, {} of {} cache used", human_bytes(s.pinned_bytes), human_bytes(s.cache_bytes), human_bytes(s.cache_limit_bytes));
+            println!(
+                "  In the cloud: {} files, {}",
+                s.cloud_files,
+                human_bytes(s.cloud_bytes)
+            );
+            println!(
+                "  On this device: {} kept offline, {} of {} cache used",
+                human_bytes(s.pinned_bytes),
+                human_bytes(s.cache_bytes),
+                human_bytes(s.cache_limit_bytes)
+            );
             if s.pending > 0 || s.uploading + s.downloading > 0 {
-                println!("  Pending: {} changes, {} uploading, {} downloading", s.pending, s.uploading, s.downloading);
+                println!(
+                    "  Pending: {} changes, {} uploading, {} downloading",
+                    s.pending, s.uploading, s.downloading
+                );
             }
             if s.issues > 0 {
                 println!("  {} issue(s) — run `drive issues`", s.issues);
             }
         }
-        Command::Setup { login, folder, existing_vault } => {
+        Command::Setup {
+            login,
+            folder,
+            existing_vault,
+        } => {
             let password = prompt_secret("uloz.to password: ")?;
             let encryption_password = if existing_vault {
                 Some(prompt_secret("Vault encryption password: ")?)
             } else {
                 None
             };
-            let req = SetupRequest { login, password, encryption_password, folder, app_token: None };
+            let req = SetupRequest {
+                login,
+                password,
+                encryption_password,
+                folder,
+                app_token: None,
+            };
             match client.call::<SetupResult>(Call::Setup(req)).await {
                 Ok(r) => {
                     println!("Connected. Your Drive folder is {}", r.folder);
                     if let Some(p) = r.generated_encryption_password {
                         println!();
                         println!("Your encryption password is:\n\n    {p}\n");
-                        println!("Write it down and keep it safe. You need it to set up Drive on another device,");
-                        println!("and nobody — not even uloz.to — can recover your files without it.");
-                        println!("Run `drive recovery` for an rclone config that opens your vault without Drive.");
+                        println!(
+                            "Write it down and keep it safe. You need it to set up Drive on another device,"
+                        );
+                        println!(
+                            "and nobody — not even uloz.to — can recover your files without it."
+                        );
+                        println!(
+                            "Run `drive recovery` for an rclone config that opens your vault without Drive."
+                        );
                     }
                 }
-                Err(ClientError::Rpc(e)) if e.code == ErrorCode::WrongEncryptionPassword && !existing_vault => {
+                Err(ClientError::Rpc(e))
+                    if e.code == ErrorCode::WrongEncryptionPassword && !existing_vault =>
+                {
                     bail!("{} Run the command again with --existing-vault.", e.message)
                 }
                 Err(e) => return Err(e.into()),
@@ -239,18 +294,28 @@ async fn run_client(cmd: Command) -> Result<()> {
         }
         Command::Pin { path } => {
             let path = absolute(&path);
-            client.call_value(Call::SetPinned { path, pinned: true }).await?;
+            client
+                .call_value(Call::SetPinned { path, pinned: true })
+                .await?;
             println!("Kept on this device.");
         }
         Command::Unpin { path } => {
             let path = absolute(&path);
-            client.call_value(Call::SetPinned { path, pinned: false }).await?;
+            client
+                .call_value(Call::SetPinned {
+                    path,
+                    pinned: false,
+                })
+                .await?;
             println!("No longer kept on this device.");
         }
         Command::Free { path } => {
             let path = absolute(&path);
             let v = client.call_value(Call::FreeUpSpace { path }).await?;
-            println!("Freed {}.", human_bytes(v.get("freed_bytes").and_then(|b| b.as_u64()).unwrap_or(0)));
+            println!(
+                "Freed {}.",
+                human_bytes(v.get("freed_bytes").and_then(|b| b.as_u64()).unwrap_or(0))
+            );
         }
         Command::Issues => {
             let issues: Vec<Issue> = client.call(Call::ListIssues).await?;
@@ -258,8 +323,17 @@ async fn run_client(cmd: Command) -> Result<()> {
                 println!("Nothing needs attention.");
             }
             for i in issues {
-                let actions: Vec<String> = i.actions.iter().map(|a| format!("{a:?}").to_lowercase()).collect();
-                println!("#{} {}\n    actions: {}", i.id, i.message, actions.join(", "));
+                let actions: Vec<String> = i
+                    .actions
+                    .iter()
+                    .map(|a| format!("{a:?}").to_lowercase())
+                    .collect();
+                println!(
+                    "#{} {}\n    actions: {}",
+                    i.id,
+                    i.message,
+                    actions.join(", ")
+                );
             }
         }
         Command::Resolve { id, action } => {
@@ -277,7 +351,11 @@ async fn run_client(cmd: Command) -> Result<()> {
             let items: Vec<Activity> = client.call(Call::RecentActivity { limit }).await?;
             for a in items {
                 let when = chrono::DateTime::from_timestamp_millis(a.at_ms)
-                    .map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+                    .map(|t| {
+                        t.with_timezone(&chrono::Local)
+                            .format("%Y-%m-%d %H:%M")
+                            .to_string()
+                    })
                     .unwrap_or_default();
                 println!("{when}  {:<14} {}", format!("{:?}", a.kind), a.path);
             }
@@ -285,8 +363,13 @@ async fn run_client(cmd: Command) -> Result<()> {
         Command::Settings { changes } => {
             let mut patch = SettingsPatch::default();
             for c in &changes {
-                let (k, v) = c.split_once('=').with_context(|| format!("expected key=value, got {c}"))?;
-                let num = || v.parse::<u64>().with_context(|| format!("{k} needs a number"));
+                let (k, v) = c
+                    .split_once('=')
+                    .with_context(|| format!("expected key=value, got {c}"))?;
+                let num = || {
+                    v.parse::<u64>()
+                        .with_context(|| format!("{k} needs a number"))
+                };
                 match k {
                     "cache-limit-gb" => patch.cache_limit_bytes = Some(num()? * 1024 * 1024 * 1024),
                     "poll-interval" => patch.poll_interval_secs = Some(num()?),
@@ -308,10 +391,15 @@ async fn run_client(cmd: Command) -> Result<()> {
         Command::Recovery => {
             let kit: RecoveryKit = client.call(Call::ExportRecovery).await?;
             println!("{}", kit.rclone_config);
-            eprintln!("Encryption password: {}\nSalt: {}\n\n{}", kit.encryption_password, kit.encryption_salt, kit.instructions);
+            eprintln!(
+                "Encryption password: {}\nSalt: {}\n\n{}",
+                kit.encryption_password, kit.encryption_salt, kit.instructions
+            );
         }
         Command::SignOut => {
-            print!("Disconnect this device from uloz.to? Files that only exist in the cloud disappear from this device (they stay in the cloud). [y/N] ");
+            print!(
+                "Disconnect this device from uloz.to? Files that only exist in the cloud disappear from this device (they stay in the cloud). [y/N] "
+            );
             std::io::stdout().flush()?;
             let mut answer = String::new();
             std::io::stdin().lock().read_line(&mut answer)?;
@@ -333,7 +421,9 @@ fn absolute(path: &str) -> String {
     if p.is_absolute() {
         path.to_string()
     } else {
-        std::env::current_dir().map(|d| d.join(p).display().to_string()).unwrap_or_else(|_| path.to_string())
+        std::env::current_dir()
+            .map(|d| d.join(p).display().to_string())
+            .unwrap_or_else(|_| path.to_string())
     }
 }
 
