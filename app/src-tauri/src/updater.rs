@@ -654,6 +654,10 @@ fn bullets(body: &str) -> Vec<String> {
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .map(|l| {
+            // A bare marker ("- " trimmed to "-") is an empty bullet.
+            if matches!(l, "-" | "*" | "•") {
+                return String::new();
+            }
             l.strip_prefix("- ")
                 .or_else(|| l.strip_prefix("* "))
                 .or_else(|| l.strip_prefix("• "))
