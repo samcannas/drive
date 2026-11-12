@@ -14,6 +14,14 @@ const KNOWN_ORDER: KnownFolder[] = ["desktop", "documents", "downloads", "pictur
 /** Scanning or uploading right now. */
 export const isBusy = (b: BackupInfo) => b.state === "scanning" || b.state === "backing_up";
 
+/** On-demand: bytes of the folder that are only in the cloud right now. */
+export const cloudOnlyBytes = (b: BackupInfo) => Math.max(0, b.bytes - b.local_bytes);
+
+/** On-demand: "4.8 GB on this PC · 90.8 GB only in the cloud". */
+export function storageLine(b: BackupInfo, device: string): string {
+  return `${bytes(b.local_bytes)} on this ${device} · ${bytes(cloudOnlyBytes(b))} only in the cloud`;
+}
+
 export interface BackupLine {
   icon: IconName;
   tone: Tone;
@@ -49,6 +57,13 @@ export function stateLine(b: BackupInfo, now: number): BackupLine {
       return { icon: "clock", tone: "neutral", text: b.detail ?? "Waiting to continue" };
     case "problem":
       return { icon: "warning", tone: "warning", text: b.detail ?? "Drive can't read this folder." };
+    case "converting":
+      // The service says which way, e.g. "Downloading 12.4 GB back to this PC…".
+      return {
+        icon: "sync",
+        tone: "accent",
+        text: b.detail ?? (b.on_demand ? "Freeing up space…" : "Downloading files back…"),
+      };
   }
 }
 

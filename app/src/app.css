@@ -471,6 +471,10 @@ p {
 select.input {
   cursor: default;
 }
+.input:disabled {
+  border-color: var(--stroke-divider);
+  color: var(--text-disabled);
+}
 
 input[type="checkbox"],
 input[type="radio"],
@@ -517,6 +521,18 @@ input[type="range"] {
 }
 .switch:focus-visible {
   outline-offset: 2px;
+}
+.switch:disabled {
+  border-color: var(--text-disabled);
+}
+.switch:disabled::after {
+  background: var(--text-disabled);
+}
+.switch:disabled:checked {
+  background: var(--text-disabled);
+}
+.switch:disabled:checked::after {
+  background: var(--surface);
 }
 
 /* ---------- Surfaces ---------- */

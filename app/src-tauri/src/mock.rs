@@ -11,8 +11,11 @@
 //!   a paused upload, large files held for the overnight window and a partly done one that
 //!   resumes. Progress moves, and items finish and come back.
 //! * `DRIVE_UI_MOCK_BACKUPS=1` starts with backed-up folders in every state: one backing up,
-//!   one up to date, one switched off and one whose folder is missing. Without it there are no
-//!   backups and the suggestions show; adding one scans, backs up and finishes in about 20 s.
+//!   one up to date, one switched off, one whose folder is missing and Downloads saving space
+//!   on this device (on-demand; Windows only). Making a folder on-demand or a full copy again
+//!   takes about 5 s; making Downloads a full copy again fails for lack of disk space. Without it
+//!   there are no backups and the suggestions show; adding one scans, backs up and finishes in
+//!   about 20 s.
 //! * `DRIVE_UI_MOCK_UPDATE=1` offers a made-up update (see `updater`); installing it only
 //!   pretends. Works with or without the mock service.
 
@@ -87,7 +90,23 @@ struct MockBackup {
     total_bytes: u64,
     /// Which sample file uploads next.
     cursor: usize,
+    /// Switching between a full copy and on-demand.
+    convert: Option<Convert>,
 }
+
+/// A folder switching modes: ticks left, and the bytes on this device it goes from and to.
+struct Convert {
+    ticks: u32,
+    from: u64,
+    to: u64,
+}
+
+/// Ticks a switch between a full copy and on-demand takes (about 5 s).
+const CONVERT_TICKS: u32 = 7;
+/// Free space the mock pretends this device has: making the on-demand Downloads a full copy
+/// again doesn't fit.
+const FREE_BYTES: u64 = 21 * GB;
+const KEEP_DEFAULT: u64 = 5 * GB;
 
 #[derive(Clone)]
 struct MockTransfer {
@@ -320,6 +339,38 @@ impl Mock {
                         b.info.detail = Some(format!("Looking through {} files…", thousands(seen)));
                     }
                     b.info.pending = (b.info.files - b.info.done_files.min(b.info.files)) as u32;
+                }
+                BackupState::Converting => {
+                    changed = true;
+                    let Some(c) = b.convert.as_mut() else {
+                        continue;
+                    };
+                    c.ticks = c.ticks.saturating_sub(1);
+                    let left = u64::from(c.ticks);
+                    let total = u64::from(CONVERT_TICKS);
+                    b.info.local_bytes = if c.to > c.from {
+                        c.to - (c.to - c.from) * left / total
+                    } else {
+                        c.to + (c.from - c.to) * left / total
+                    };
+                    if !b.info.on_demand {
+                        b.info.detail = Some(format!(
+                            "Downloading {} back to this PC…",
+                            size(b.info.bytes.saturating_sub(b.info.local_bytes))
+                        ));
+                    }
+                    if c.ticks == 0 {
+                        b.info.local_bytes = c.to;
+                        b.convert = None;
+                        b.info.detail = None;
+                        b.info.state = if !b.info.enabled {
+                            BackupState::Off
+                        } else if b.info.done_files == b.info.files {
+                            BackupState::UpToDate
+                        } else {
+                            BackupState::BackingUp
+                        };
+                    }
                 }
                 BackupState::BackingUp => {
                     changed = true;
@@ -663,6 +714,17 @@ impl Mock {
                     b.scan = 3;
                 }
                 let info = b.info.clone();
+                self.emit_backups(&st);
+                json!(info)
+            }
+            Call::SetBackupOnDemand {
+                id,
+                on_demand,
+                keep_bytes,
+            } => {
+                let b = backup_mut(&mut st, &id)?;
+                set_on_demand(b, on_demand, keep_bytes)?;
+                let info = info_of(b);
                 self.emit_backups(&st);
                 json!(info)
             }
@@ -1245,7 +1307,100 @@ fn backup_info(
         skipped_online_only: 0,
         added_ms: now,
         last_complete_ms: None,
+        on_demand: false,
+        on_demand_available: cfg!(windows),
+        local_bytes: 0,
+        keep_bytes: KEEP_DEFAULT,
     }
+}
+
+/// 97_066_215_833 → "90.4 GB", like the app's `bytes()`.
+fn size(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 || v >= 100.0 {
+        format!("{v:.0} {}", UNITS[u])
+    } else {
+        let one = format!("{v:.1}");
+        format!("{} {}", one.trim_end_matches(".0"), UNITS[u])
+    }
+}
+
+/// What the overview shows for a folder: a full copy is all on this device.
+fn info_of(b: &MockBackup) -> BackupInfo {
+    let mut info = b.info.clone();
+    if !info.on_demand && info.state != BackupState::Converting {
+        info.local_bytes = info.bytes;
+    }
+    info
+}
+
+/// `SetBackupOnDemand`: starts switching modes, or changes how much stays on this device.
+fn set_on_demand(
+    b: &mut MockBackup,
+    on_demand: bool,
+    keep_bytes: Option<u64>,
+) -> Result<(), RpcError> {
+    let i = &mut b.info;
+    if !i.on_demand_available {
+        return Err(err(
+            ErrorCode::BadRequest,
+            "Saving space is available on Windows only for now.",
+        ));
+    }
+    if i.state == BackupState::Converting {
+        return Err(err(
+            ErrorCode::BadRequest,
+            &format!(
+                "Drive is still switching {}. Try again when it's done.",
+                i.name
+            ),
+        ));
+    }
+    let local = if i.on_demand { i.local_bytes } else { i.bytes };
+    if on_demand {
+        i.keep_bytes = keep_bytes.unwrap_or(i.keep_bytes);
+        if i.on_demand {
+            // A smaller limit frees space right away; a larger one fills up as files are opened.
+            i.local_bytes = i.local_bytes.min(i.keep_bytes);
+        } else {
+            i.on_demand = true;
+            i.state = BackupState::Converting;
+            i.detail = Some(format!("Freeing up space in {}…", i.name));
+            b.convert = Some(Convert {
+                ticks: CONVERT_TICKS,
+                from: local,
+                to: i.bytes.min(i.keep_bytes),
+            });
+        }
+    } else if i.on_demand {
+        let missing = i.bytes.saturating_sub(local);
+        if missing > FREE_BYTES {
+            return Err(err(
+                ErrorCode::BadRequest,
+                &format!(
+                    "Drive needs {} to download {} back, but this PC has only {} free. Free up space, then try again.",
+                    size(missing),
+                    i.name,
+                    size(FREE_BYTES)
+                ),
+            ));
+        }
+        i.on_demand = false;
+        i.state = BackupState::Converting;
+        i.detail = Some(format!("Downloading {} back to this PC…", size(missing)));
+        b.convert = Some(Convert {
+            ticks: CONVERT_TICKS,
+            from: local,
+            to: i.bytes,
+        });
+    }
+    Ok(())
 }
 
 fn rich_backups(now: i64) -> Vec<MockBackup> {
@@ -1270,6 +1425,7 @@ fn rich_backups(now: i64) -> Vec<MockBackup> {
         total_files: 98_000,
         total_bytes: 14 * GB,
         cursor: 0,
+        convert: None,
     });
 
     let (k, name, path, _) = find(KnownFolder::Desktop);
@@ -1288,6 +1444,7 @@ fn rich_backups(now: i64) -> Vec<MockBackup> {
         total_files: 449,
         total_bytes: 410 * MB,
         cursor: 0,
+        convert: None,
     });
 
     let (k, name, path, _) = find(KnownFolder::Pictures);
@@ -1307,6 +1464,30 @@ fn rich_backups(now: i64) -> Vec<MockBackup> {
         total_files: 3_120,
         total_bytes: 6 * GB + 300 * MB,
         cursor: 0,
+        convert: None,
+    });
+
+    // Saves space on this device: most of it is only in the cloud.
+    let (k, name, path, _) = find(KnownFolder::Downloads);
+    let mut info = backup_info("b5", name, path, Some(*k), now - 6 * 86_400_000);
+    let downloads = 95 * GB + 600 * MB;
+    info.state = BackupState::UpToDate;
+    info.detail = None;
+    info.files = 2_310;
+    info.bytes = downloads;
+    info.done_files = 2_310;
+    info.done_bytes = downloads;
+    info.on_demand = info.on_demand_available;
+    info.local_bytes = 4 * GB + 800 * MB;
+    info.last_complete_ms = Some(now - 4 * 60_000);
+    out.push(MockBackup {
+        info,
+        scan: 0,
+        ticks: 20,
+        total_files: 2_310,
+        total_bytes: downloads,
+        cursor: 0,
+        convert: None,
     });
 
     let mut info = backup_info(
@@ -1331,12 +1512,13 @@ fn rich_backups(now: i64) -> Vec<MockBackup> {
         total_files: 12_400,
         total_bytes: 31 * GB,
         cursor: 0,
+        convert: None,
     });
     out
 }
 
 fn overview_of(st: &State) -> BackupOverview {
-    let mut folders: Vec<BackupInfo> = st.backups.iter().map(|b| b.info.clone()).collect();
+    let mut folders: Vec<BackupInfo> = st.backups.iter().map(info_of).collect();
     if st.paused {
         for f in &mut folders {
             if matches!(f.state, BackupState::Scanning | BackupState::BackingUp) {
@@ -1478,6 +1660,7 @@ fn add_backup(st: &mut State, raw: &str) -> Result<BackupInfo, RpcError> {
         total_files,
         total_bytes,
         cursor: 0,
+        convert: None,
     });
     st.backups_ever = true;
     Ok(info)

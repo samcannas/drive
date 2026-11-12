@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
   import { api, closeWindow, env, errorOf, EVENTS, listen } from "../lib/api";
-  import { progressOf, stateLine, suggestionSize } from "../lib/backups";
+  import { cloudOnlyBytes, progressOf, stateLine, storageLine, suggestionSize } from "../lib/backups";
   import { connect, drive, refreshBackups, updateVersion } from "../lib/drive.svelte";
   import { bytes, clockOf, GB, plural, relative } from "../lib/format";
   import Icon, { type IconName } from "../lib/Icon.svelte";
@@ -130,6 +130,81 @@
     }
   }
 
+  // Save space on this PC (on-demand)
+  const device = windows ? "PC" : "computer";
+  const KEEP_CHOICES = [1, 2, 5, 10, 20, 50].map((n) => n * GB);
+  /** The usual sizes, plus the current one if the service has another. */
+  const keepChoices = (b: BackupInfo) =>
+    KEEP_CHOICES.includes(b.keep_bytes) || b.keep_bytes <= 0
+      ? KEEP_CHOICES
+      : [...KEEP_CHOICES, b.keep_bytes].sort((x, y) => x - y);
+
+  async function toggleOnDemand(b: BackupInfo, input: HTMLInputElement) {
+    const on = input.checked;
+    backupError = null;
+    if (!on && cloudOnlyBytes(b) > 0) {
+      // Stays on until the download back is confirmed.
+      input.checked = true;
+      openFull(b);
+      return;
+    }
+    try {
+      await api.setBackupOnDemand(b.id, on);
+      await refreshBackups();
+      say(on ? `Freeing up space in ${b.name}` : `${b.name} is a full copy again`);
+    } catch (e) {
+      input.checked = !on;
+      backupError = {
+        key: b.id,
+        text: `Couldn't turn ${on ? "on" : "off"} Save space. ${errorOf(e).message}`,
+      };
+    }
+  }
+
+  async function setKeep(b: BackupInfo, select: HTMLSelectElement) {
+    const keep = Number(select.value);
+    backupError = null;
+    try {
+      await api.setBackupOnDemand(b.id, true, keep);
+      await refreshBackups();
+      say(`Drive keeps up to ${bytes(keep)} of ${b.name} on this ${device}`);
+    } catch (e) {
+      select.value = String(b.keep_bytes);
+      backupError = { key: b.id, text: `Couldn't change how much stays on this ${device}. ${errorOf(e).message}` };
+    }
+  }
+
+  // Turning Save space off downloads everything back first.
+  let fullDialog = $state<HTMLDialogElement>();
+  let fullId = $state<string | null>(null);
+  let fullBusy = $state(false);
+  let fullError = $state<string | null>(null);
+  const fullFor = $derived(ov?.folders.find((f) => f.id === fullId) ?? null);
+  const fullBytes = $derived(fullFor ? bytes(cloudOnlyBytes(fullFor)) : "");
+
+  function openFull(b: BackupInfo) {
+    fullId = b.id;
+    fullError = null;
+    fullDialog?.showModal();
+  }
+
+  async function makeFullCopy() {
+    if (!fullFor || fullBusy) return;
+    fullBusy = true;
+    fullError = null;
+    const { id, name } = fullFor;
+    try {
+      await api.setBackupOnDemand(id, false);
+      await refreshBackups();
+      fullDialog?.close();
+      say(`Downloading ${name} back to this ${device}`);
+    } catch (e) {
+      fullError = errorOf(e).message;
+    } finally {
+      fullBusy = false;
+    }
+  }
+
   // Skipped items
   let skipDialog = $state<HTMLDialogElement>();
   let skipFor = $state<BackupInfo | null>(null);
@@ -179,6 +254,8 @@
   let stopDelete = $state(false);
   let stopping = $state(false);
   let stopError = $state<string | null>(null);
+  /** Saving space: some files exist only in the cloud copy, so it can't be deleted. */
+  const stopCloudOnly = $derived(stopFor?.on_demand ? cloudOnlyBytes(stopFor) : 0);
 
   function openStop(b: BackupInfo) {
     stopFor = b;
@@ -628,8 +705,24 @@
       <div class="group intro">
         <p>
           Drive can keep a copy of folders like Desktop and Documents in your encrypted cloud without moving them. The
-          folders stay where they are, and Drive never changes or deletes anything in them.
+          folders stay where they are, and apps keep saving to them as usual.
         </p>
+        <dl class="modes">
+          <div>
+            <dt class="body-strong">Full copy</dt>
+            <dd class="secondary">
+              Every file is on this {device} and in the cloud, so your files are safe if this {device} breaks. Drive never
+              changes anything in the folder.
+            </dd>
+          </div>
+          <div>
+            <dt class="body-strong">Save space on this {device}</dt>
+            <dd class="secondary">
+              Also frees up space: files you haven't opened lately stay only in the cloud and download again when you
+              open them.{windows ? "" : " Available on Windows."}
+            </dd>
+          </div>
+        </dl>
         <p class="secondary">
           When you delete a file from a backed-up folder, Drive removes it from the cloud copy too. It stays in the
           uloz.to trash for 30 days. The copies are in <span class="selectable cloud-path">{cloudFolder}</span> in your Drive
@@ -651,6 +744,8 @@
             <ul class="group plain" role="list">
               {#each ov.folders as b (b.id)}
                 {@const line = stateLine(b, drive.now)}
+                {@const od = `backup-${b.id}-od`}
+                {@const converting = b.state === "converting"}
                 <li class="card backup">
                   <div class="backup-head">
                     <span class="avatar" aria-hidden="true"><Icon name="folder" /></span>
@@ -665,6 +760,7 @@
                       aria-label="Back up {b.name}"
                       aria-describedby="backup-{b.id}-state"
                       checked={b.enabled}
+                      disabled={converting}
                       onchange={(e) => setBackupEnabled(b, e.currentTarget)}
                     />
                   </div>
@@ -685,6 +781,47 @@
                           : "them"} available offline in that app.
                       </p>
                     {/if}
+                    <div class="on-demand">
+                      <div class="on-demand-head">
+                        <div class="setting-text">
+                          <label for={od}>Save space on this {device}</label>
+                          <p class="caption secondary" id="{od}-desc">
+                            {b.on_demand_available
+                              ? "Files you haven't opened lately stay only in the cloud and download when you open them. The folder stays where it is."
+                              : "Available on Windows"}
+                          </p>
+                        </div>
+                        <input
+                          id={od}
+                          type="checkbox"
+                          role="switch"
+                          class="switch"
+                          aria-describedby={b.on_demand ? `${od}-desc ${od}-storage` : `${od}-desc`}
+                          checked={b.on_demand}
+                          disabled={!b.on_demand_available || converting}
+                          onchange={(e) => toggleOnDemand(b, e.currentTarget)}
+                        />
+                      </div>
+                      {#if b.on_demand && b.on_demand_available}
+                        <p class="caption numeric with-icon storage" id="{od}-storage">
+                          <Icon name="cloud" size={14} />{storageLine(b, device)}
+                        </p>
+                        <div class="keep">
+                          <label class="caption" for="{od}-keep">Keep recently used files up to</label>
+                          <select
+                            id="{od}-keep"
+                            class="input"
+                            value={String(b.keep_bytes)}
+                            disabled={converting}
+                            onchange={(e) => setKeep(b, e.currentTarget)}
+                          >
+                            {#each keepChoices(b) as n}
+                              <option value={String(n)}>{bytes(n)}</option>
+                            {/each}
+                          </select>
+                        </div>
+                      {/if}
+                    </div>
                     {#if backupError?.key === b.id}
                       <p class="error-text" role="alert"><Icon name="alert" size={14} />{backupError.text}</p>
                     {/if}
@@ -719,6 +856,9 @@
                       <p class="caption secondary with-icon"><Icon name="info" size={14} />{f.blocked}</p>
                     {:else}
                       <p class="caption secondary numeric">{suggestionSize(f)}</p>
+                      {#if windows && f.known === "downloads"}
+                        <p class="caption secondary">Once it's backed up, you can save space on this {device}.</p>
+                      {/if}
                     {/if}
                     {#if backupError?.key === f.known}
                       <p class="error-text" role="alert"><Icon name="alert" size={14} />{backupError.text}</p>
@@ -792,6 +932,29 @@
         </form>
       </dialog>
 
+      <dialog bind:this={fullDialog} aria-labelledby="full-title" aria-describedby="full-body">
+        <div class="dialog-body">
+          <h2 id="full-title" class="subtitle">Download {fullFor?.name ?? "this folder"} back to this {device}?</h2>
+          <div class="dialog-text">
+            <p id="full-body">
+              {fullFor?.name ?? "The folder"} becomes a full copy again, with every file on this {device} and in the cloud.
+              Drive first downloads the <span class="numeric">{fullBytes}</span> that's only in the cloud, so this {device}
+              needs about <span class="numeric">{fullBytes}</span> of free space.
+            </p>
+            {#if fullError}
+              <p class="error-text" role="alert"><Icon name="alert" size={14} />{fullError}</p>
+            {/if}
+          </div>
+        </div>
+        <div class="dialog-actions">
+          <button class="btn primary" aria-disabled={fullBusy} onclick={makeFullCopy}>
+            {fullBusy ? "Starting…" : `Download ${fullBytes}`}
+          </button>
+          <!-- svelte-ignore a11y_autofocus -->
+          <button class="btn" onclick={() => fullDialog?.close()} autofocus>Cancel</button>
+        </div>
+      </dialog>
+
       <dialog bind:this={stopDialog} aria-labelledby="stop-title" aria-describedby="stop-body">
         <div class="dialog-body">
           <h2 id="stop-title" class="subtitle">Stop backing up {stopFor?.name ?? "this folder"}?</h2>
@@ -812,11 +975,21 @@
                 </span>
               </label>
               <label class="choice">
-                <input type="radio" name="stop-copy" value="delete" checked={stopDelete} onchange={() => (stopDelete = true)} />
+                <input
+                  type="radio"
+                  name="stop-copy"
+                  value="delete"
+                  checked={stopDelete}
+                  disabled={stopCloudOnly > 0}
+                  aria-describedby="stop-delete-desc"
+                  onchange={() => (stopDelete = true)}
+                />
                 <span>
                   <span>Delete it from the cloud</span>
-                  <span class="caption secondary">
-                    It moves to the uloz.to trash. You can restore it from there for 30 days.
+                  <span class="caption secondary" id="stop-delete-desc">
+                    {stopCloudOnly > 0
+                      ? `${bytes(stopCloudOnly)} of ${stopFor?.name} is only in the cloud. To delete the copy, first turn off Save space so Drive downloads it back.`
+                      : "It moves to the uloz.to trash. You can restore it from there for 30 days."}
                   </span>
                 </span>
               </label>
@@ -1471,6 +1644,45 @@
   .backup-state.warning :global(.icon) {
     color: var(--warning-icon);
   }
+  .modes {
+    display: grid;
+    gap: var(--s2);
+    margin: 0;
+  }
+  .modes dd {
+    margin: 0;
+  }
+  .on-demand {
+    display: grid;
+    gap: var(--s2);
+    margin-block: var(--s1);
+    padding-block-start: var(--s3);
+    border-block-start: 1px solid var(--stroke-divider);
+  }
+  .on-demand-head {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--s4);
+  }
+  /* The switch lines up with the label's first line. */
+  .on-demand-head > .switch {
+    margin-block-start: 1px;
+  }
+  .storage {
+    color: var(--text);
+  }
+  .keep {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--s2);
+  }
+  .keep label {
+    color: var(--text-2);
+  }
+  .keep select {
+    width: auto;
+  }
   .backup-actions {
     display: flex;
     flex-wrap: wrap;
@@ -1523,6 +1735,9 @@
   }
   .choice input {
     margin: 2px 0 0;
+  }
+  .choice:has(input:disabled) > span > span:first-child {
+    color: var(--text-disabled);
   }
   .choice > span {
     display: grid;

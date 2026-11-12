@@ -124,6 +124,13 @@ export const api = {
   removeBackup: (id: string, deleteFromCloud: boolean) =>
     invoke<BackupOverview>("remove_backup", { id, deleteFromCloud }),
   setBackupExcludes: (id: string, excludes: string[]) => invoke<BackupInfo>("set_backup_excludes", { id, excludes }),
+  /**
+   * Makes a backed-up folder on-demand (files not used lately stay only in the cloud), or a full copy
+   * again (downloads everything back first; fails if there isn't enough free space). `keepBytes`
+   * changes how much stays on this device.
+   */
+  setBackupOnDemand: (id: string, onDemand: boolean, keepBytes: number | null = null) =>
+    invoke<BackupInfo>("set_backup_on_demand", { id, onDemand, keepBytes }),
   dismissBackupSuggestions: () => invoke<BackupOverview>("dismiss_backup_suggestions"),
   /** Native folder picker; null when cancelled. */
   pickBackupFolder: () => invoke<string | null>("pick_backup_folder"),

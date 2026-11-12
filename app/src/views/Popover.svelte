@@ -41,8 +41,10 @@
   const fileManager = flyout ? "File Explorer" : "the file manager";
   const summary = $derived(transfers && transfers.items.length ? summarize(transfers, device) : null);
   const backups = $derived(drive.backups);
-  /** Backups worth a line on the home panel: scanning, uploading, or stuck. */
-  const backupRows = $derived(backups?.folders.filter((b) => isBusy(b) || b.state === "problem") ?? []);
+  /** Backups worth a line on the home panel: scanning, uploading, switching modes, or stuck. */
+  const backupRows = $derived(
+    backups?.folders.filter((b) => isBusy(b) || b.state === "converting" || b.state === "problem") ?? [],
+  );
   /** The one calm suggestion to back up Desktop, Documents…; never while something else needs attention. */
   const offer = $derived.by(() => {
     if (!backups || backups.suggestions_dismissed || backups.folders.length >= 2) return null;
@@ -442,6 +444,15 @@
                       <Icon name="warning" size={16} /><span><span class="body-strong">{b.name}</span> can't be backed up</span>
                     </p>
                     {#if b.detail}<p class="caption secondary indent">{b.detail}</p>{/if}
+                  {:else if b.state === "converting"}
+                    <!-- `on_demand` is already the mode being switched to. -->
+                    {@const title = b.on_demand
+                      ? `Freeing up space in ${b.name}`
+                      : `Downloading ${b.name} back to this ${flyout ? "PC" : "computer"}`}
+                    <p class="with-icon"><Icon name="sync" size={16} />{title}</p>
+                    {#if b.detail && b.detail.replace(/…$/, "") !== title}
+                      <p class="caption secondary indent numeric">{b.detail}</p>
+                    {/if}
                   {:else if b.state === "scanning"}
                     <p class="with-icon"><Icon name="backup" size={16} />Getting {b.name} ready to back up</p>
                     {#if b.detail}<p class="caption secondary indent numeric">{b.detail}</p>{/if}

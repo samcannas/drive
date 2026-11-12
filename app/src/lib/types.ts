@@ -148,7 +148,7 @@ export interface Issue {
 
 // ----- Backups of folders outside the Drive folder (ipc `BackupOverview`)
 
-export type BackupState = "scanning" | "backing_up" | "up_to_date" | "off" | "waiting" | "problem";
+export type BackupState = "scanning" | "backing_up" | "up_to_date" | "off" | "waiting" | "problem" | "converting";
 export type KnownFolder = "desktop" | "documents" | "downloads" | "pictures" | "videos" | "music";
 
 export interface BackupInfo {
@@ -179,6 +179,17 @@ export interface BackupInfo {
   added_ms: number;
   /** When the backup was last fully up to date. */
   last_complete_ms: number | null;
+  /**
+   * On-demand: the folder stays where it is, but files not used lately live only in the cloud
+   * (cloud-only placeholders) and download again when opened. Off: a full copy.
+   */
+  on_demand: boolean;
+  /** Whether this device can make folders on-demand (Windows only for now). */
+  on_demand_available: boolean;
+  /** Bytes of this folder stored on this device (all of it unless on-demand). */
+  local_bytes: number;
+  /** On-demand: recently used files are kept on this device up to this size. */
+  keep_bytes: number;
 }
 
 export interface FolderSuggestion {

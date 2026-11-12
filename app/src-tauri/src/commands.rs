@@ -352,6 +352,24 @@ pub async fn set_backup_excludes(
     svc.call(Call::SetBackupExcludes { id, excludes }).await
 }
 
+/// Makes a backed-up folder on-demand (files not used lately stay only in the cloud and download
+/// when opened), or a full copy again (the service first downloads everything back and refuses if
+/// there isn't enough free space). `keep_bytes` changes how much stays on this device.
+#[tauri::command]
+pub async fn set_backup_on_demand(
+    svc: Svc<'_>,
+    id: String,
+    on_demand: bool,
+    keep_bytes: Option<u64>,
+) -> Res<BackupInfo> {
+    svc.call(Call::SetBackupOnDemand {
+        id,
+        on_demand,
+        keep_bytes,
+    })
+    .await
+}
+
 /// Hides the "these folders aren't backed up" suggestion. Returns the new overview.
 #[tauri::command]
 pub async fn dismiss_backup_suggestions(svc: Svc<'_>) -> Res<BackupOverview> {

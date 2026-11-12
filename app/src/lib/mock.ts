@@ -9,6 +9,9 @@
 //            uploads held for tonight) | transfers-paused (only paused uploads)
 //            backups (backed-up folders in every state: backing up, up to date, off, folder missing)
 //            backup-suggest (no backups yet; the popover suggests backing up Desktop, Documents…)
+//            on-demand (Downloads saves space on this PC, Documents is a full copy; turning on takes
+//            about 5 s, turning Downloads off fails for lack of disk space). Add &platform=linux to
+//            see the switch unavailable.
 
 import type {
   Activity,
@@ -27,10 +30,12 @@ import type {
   TransferState,
   UpdateState,
 } from "./types";
+import { bytes } from "./format";
 
 const GB = 1024 ** 3;
 const MB = 1024 ** 2;
 const scenario = new URLSearchParams(location.search).get("scenario") ?? "";
+const platform = new URLSearchParams(location.search).get("platform") ?? "windows";
 
 type Handler = (p: unknown) => void;
 const handlers = new Map<string, Set<Handler>>();
@@ -157,7 +162,13 @@ interface MockBackup {
   totalFiles: number;
   totalBytes: number;
   cursor: number;
+  /** Switching between a full copy and on-demand: ticks left, and the size on this PC it ends at. */
+  convert?: { ticks: number; from: number; to: number };
 }
+
+/** Free space the mock pretends this PC has: making Downloads a full copy again doesn't fit. */
+const FREE_BYTES = 21 * GB;
+const KEEP_DEFAULT = 5 * GB;
 
 function backupInfo(id: string, name: string, path: string, known: KnownFolder | null, added: number): BackupInfo {
   return {
@@ -177,6 +188,10 @@ function backupInfo(id: string, name: string, path: string, known: KnownFolder |
     skipped_online_only: 0,
     added_ms: added,
     last_complete_ms: null,
+    on_demand: false,
+    on_demand_available: platform === "windows",
+    local_bytes: 0,
+    keep_bytes: KEEP_DEFAULT,
   };
 }
 
@@ -253,17 +268,55 @@ function richBackups(): MockBackup[] {
   ];
 }
 
+/** Downloads saves space on this PC; Documents is a full copy. */
+function onDemandBackups(): MockBackup[] {
+  const k = (known: KnownFolder) => KNOWN.find((f) => f.known === known)!;
+  const downloads = k("downloads");
+  const docs = k("documents");
+  const full = (id: string, f: FolderSuggestion, files: number, size: number, added: number): BackupInfo => ({
+    ...backupInfo(id, f.name, f.path, f.known, added),
+    state: "up_to_date",
+    detail: null,
+    files,
+    bytes: size,
+    done_files: files,
+    done_bytes: size,
+    local_bytes: size,
+    last_complete_ms: now - 4 * 60_000,
+  });
+  return [
+    {
+      info: { ...full("b1", downloads, 2_310, 95.6 * GB, now - 6 * 86_400_000), on_demand: platform === "windows", local_bytes: 4.8 * GB },
+      scan: 0,
+      ticks: 20,
+      totalFiles: 2_310,
+      totalBytes: 95.6 * GB,
+      cursor: 0,
+    },
+    {
+      info: full("b2", docs, 98_000, 14 * GB, now - 9 * 86_400_000),
+      scan: 0,
+      ticks: 20,
+      totalFiles: 98_000,
+      totalBytes: 14 * GB,
+      cursor: 0,
+    },
+  ];
+}
+
 const backupState = {
-  folders: scenario === "backups" ? richBackups() : ([] as MockBackup[]),
+  folders: scenario === "backups" ? richBackups() : scenario === "on-demand" ? onDemandBackups() : ([] as MockBackup[]),
   // Outside the backup scenarios the popover stays as it was; Settings still lists the suggestions.
   dismissed: scenario !== "backup-suggest",
-  ever: scenario === "backups",
+  ever: scenario === "backups" || scenario === "on-demand",
   next: 10,
 };
 
 function overview(): BackupOverview {
   const folders = backupState.folders.map((b) => {
     const info = { ...b.info, excludes: [...b.info.excludes] };
+    // A full copy is all on this PC.
+    if (!info.on_demand && info.state !== "converting") info.local_bytes = info.bytes;
     if (state.paused && (info.state === "scanning" || info.state === "backing_up")) {
       info.state = "waiting";
       info.detail = "Syncing is paused. The backup continues when you resume.";
@@ -303,6 +356,18 @@ function tickBackups() {
         i.detail = `Looking through ${i.files.toLocaleString("en")} files…`;
       }
       i.pending = i.files - Math.min(i.done_files, i.files);
+    } else if (i.state === "converting" && b.convert) {
+      changed = true;
+      const c = b.convert;
+      c.ticks--;
+      i.local_bytes = Math.round(c.to + ((c.from - c.to) * Math.max(0, c.ticks)) / 7);
+      if (!i.on_demand) i.detail = `Downloading ${bytes(i.bytes - i.local_bytes)} back to this PC…`;
+      if (c.ticks <= 0) {
+        b.convert = undefined;
+        i.local_bytes = c.to;
+        i.detail = null;
+        i.state = !i.enabled ? "off" : i.done_files === i.files ? "up_to_date" : "backing_up";
+      }
     } else if (i.state === "backing_up") {
       changed = true;
       i.done_files = Math.min(i.files, i.done_files + Math.max(1, Math.round(b.totalFiles / b.ticks)));
@@ -889,6 +954,38 @@ async function handle(cmd: string, a: Record<string, unknown>): Promise<unknown>
       }
       emitBackups();
       return { ...b.info, excludes: [...list] };
+    }
+    case "set_backup_on_demand": {
+      const b = findBackup(a.id);
+      if (!b) return fail("not_found", "That folder isn't backed up anymore.");
+      const i = b.info;
+      if (!i.on_demand_available) return fail("bad_request", "Saving space is available on Windows only for now.");
+      if (i.state === "converting") return fail("bad_request", `Drive is still switching ${i.name}. Try again when it's done.`);
+      const keep = typeof a.keepBytes === "number" ? a.keepBytes : i.keep_bytes;
+      const local = i.on_demand ? i.local_bytes : i.bytes;
+      if (a.onDemand) {
+        i.keep_bytes = keep;
+        if (i.on_demand) {
+          // A smaller limit frees space right away; a larger one fills up as files are opened.
+          i.local_bytes = Math.min(i.local_bytes, keep);
+        } else {
+          i.on_demand = true;
+          b.convert = { ticks: 7, from: local, to: Math.min(i.bytes, keep) };
+          Object.assign(i, { state: "converting", detail: `Freeing up space in ${i.name}…` });
+        }
+      } else if (i.on_demand) {
+        const missing = i.bytes - local;
+        if (missing > FREE_BYTES)
+          return fail(
+            "bad_request",
+            `Drive needs ${bytes(missing)} to download ${i.name} back, but this PC has only ${bytes(FREE_BYTES)} free. Free up space, then try again.`,
+          );
+        i.on_demand = false;
+        b.convert = { ticks: 7, from: local, to: i.bytes };
+        Object.assign(i, { state: "converting", detail: `Downloading ${bytes(missing)} back to this PC…` });
+      }
+      emitBackups();
+      return { ...overview().folders.find((f) => f.id === i.id)! };
     }
     case "dismiss_backup_suggestions":
       backupState.dismissed = true;

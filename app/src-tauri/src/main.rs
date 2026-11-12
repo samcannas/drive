@@ -68,6 +68,7 @@ fn main() {
             commands::set_backup_enabled,
             commands::remove_backup,
             commands::set_backup_excludes,
+            commands::set_backup_on_demand,
             commands::dismiss_backup_suggestions,
             commands::pick_backup_folder,
             commands::show_window,
