@@ -38,12 +38,14 @@ fn git(mut node: Node) -> Node {
     node
 }
 
+#[cfg(windows)]
 fn programs(mut node: Node) -> Node {
     node.programs = true;
     node.program_bytes = node.bytes;
     node
 }
 
+#[cfg(windows)]
 fn skipped(mut node: Node, bytes: u64) -> Node {
     node.skipped = bytes;
     node
