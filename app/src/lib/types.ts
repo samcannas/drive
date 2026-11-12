@@ -20,6 +20,9 @@ export interface Status {
   cloud_files: number;
   last_sync_ms: number | null;
   pending_delete_confirmation: number | null;
+  /** Free and total space of the disk holding the Drive folder (null until measured; missing from an older service). */
+  disk_free_bytes?: number | null;
+  disk_total_bytes?: number | null;
 }
 
 export interface Settings {
@@ -132,7 +135,7 @@ export type IssueKind =
   | "file_locked"
   | "other";
 
-export type IssueAction = "retry" | "dismiss" | "confirm_delete" | "restore_deleted" | "sign_in";
+export type IssueAction = "retry" | "dismiss" | "confirm_delete" | "restore_deleted" | "sign_in" | "find_space";
 
 export interface Issue {
   id: number;
@@ -212,6 +215,99 @@ export interface BackupOverview {
   cloud_folder: string | null;
   /** The skip list new backups start with. */
   default_excludes: string[];
+}
+
+// ----- Disk space (ipc `SpaceReport`)
+
+export type SpaceScanState = "idle" | "scanning" | "done" | "failed";
+
+export interface SpaceScan {
+  state: SpaceScanState;
+  /** Progress of the running scan (or totals of the last one). */
+  scanned_bytes: number;
+  scanned_files: number;
+  /** Folder being read right now, for the progress line. */
+  current: string | null;
+  started_ms: number | null;
+  /** When the report was made ("Checked 2 hours ago"). */
+  finished_ms: number | null;
+  /** Plain-language reason when `state` is `failed`. */
+  error: string | null;
+}
+
+export interface DiskUsage {
+  /** Where it is mounted: `C:\` or `/`. */
+  path: string;
+  /** "Local Disk (C:)", "/home". */
+  name: string;
+  total_bytes: number;
+  free_bytes: number;
+  /** Whether the report's items cover this disk. */
+  scanned: boolean;
+}
+
+export interface SpaceSaved {
+  /** Files in the Drive folder that are only in the cloud. */
+  drive_folder_bytes: number;
+  /** Files of on-demand backed-up folders that are only in the cloud. */
+  backups_bytes: number;
+}
+
+export type SpaceCategory =
+  | "user_folder"
+  | "drive_folder"
+  | "backup"
+  | "developer"
+  | "apps"
+  | "app_data"
+  | "temporary"
+  | "recycle_bin"
+  | "other_cloud"
+  | "other_users"
+  | "system"
+  | "other";
+
+/**
+ * What Drive can do for an item: save space (back up and make on-demand; Windows), turn it on for a
+ * folder that's already backed up, back up only (frees nothing), free the Drive folder's downloads,
+ * or open the system's own cleanup (Windows Storage settings).
+ */
+export type SpaceAction = "save_space" | "turn_on_save_space" | "back_up" | "free_drive_cache" | "open_system_cleanup";
+
+export interface SpaceItem {
+  /** Absolute path; empty for buckets that aren't one folder ("Windows and system"). */
+  path: string;
+  name: string;
+  /** Space it takes on the disk (online-only files of cloud apps count as 0). */
+  bytes: number;
+  files: number;
+  category: SpaceCategory;
+  known: KnownFolder | null;
+  /** The backup this folder is (or is inside of), if any. */
+  backup_id: string | null;
+  /** Already saving space (an on-demand backed-up folder). */
+  on_demand: boolean;
+  action: SpaceAction | null;
+  /** About how much the action frees (0 for actions that only protect). */
+  frees_bytes: number;
+  /** Shown before acting. */
+  caution: string | null;
+  /** Explanation for items Drive can't act on ("Managed by OneDrive"). */
+  note: string | null;
+  /** Largest subfolders (one level). */
+  children: SpaceItem[];
+}
+
+export interface SpaceReport {
+  scan: SpaceScan;
+  /** This device's fixed disks; the scanned ones first. */
+  disks: DiskUsage[];
+  /** What Drive already keeps off this device. */
+  saved: SpaceSaved;
+  /** The biggest uses of space, largest first. */
+  items: SpaceItem[];
+  /** "Drive can free up to …". */
+  can_free_bytes: number;
 }
 
 export interface AccountCheck {

@@ -7,10 +7,10 @@ use std::time::Duration;
 
 use drive_core::ipc::{
     AccountCheck, AccountCredentials, Activity, BackupInfo, BackupOverview, Call, Issue,
-    IssueAction, RecoveryKit, Settings, SettingsPatch, SetupRequest, SetupResult, Status,
-    TransferList, TransferMode,
+    IssueAction, RecoveryKit, Settings, SettingsPatch, SetupRequest, SetupResult, SpaceItem,
+    SpaceReport, Status, TransferList, TransferMode,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
@@ -394,6 +394,93 @@ pub async fn pick_backup_folder(app: AppHandle) -> Res<Option<String>> {
         .map(|p| p.to_string_lossy().into_owned()))
 }
 
+// ----- Disk space advisor
+
+/// The disk space report. Starts a scan when there is none yet (or with `rescan`) and returns
+/// at once; progress and the finished report arrive as `drive://space`.
+#[tauri::command]
+pub async fn space(svc: Svc<'_>, rescan: bool) -> Res<SpaceReport> {
+    let report: SpaceReport = svc.call(Call::Space { rescan }).await?;
+    svc.set_space_report(report.clone());
+    Ok(report)
+}
+
+/// Stops a running disk scan; the previous report, if any, is kept.
+#[tauri::command]
+pub async fn cancel_space_scan(svc: Svc<'_>) -> Res<()> {
+    svc.call_value(Call::CancelSpaceScan).await.map(|_| ())
+}
+
+/// Backs a folder up (if it isn't yet) and makes it on-demand: files stay where they are, and
+/// the ones not used lately live only in the cloud. Windows only. Progress shows in the backup
+/// (`drive://backups`).
+#[tauri::command]
+pub async fn save_space(svc: Svc<'_>, path: String, keep_bytes: Option<u64>) -> Res<BackupInfo> {
+    svc.call(Call::SaveSpace { path, keep_bytes }).await
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Freed {
+    pub freed_bytes: u64,
+}
+
+/// Frees downloaded files in the Drive folder (pinned files and pending uploads stay).
+#[tauri::command]
+pub async fn free_drive_cache(svc: Svc<'_>) -> Res<Freed> {
+    let freed: Freed = svc.call(Call::FreeDriveCache).await?;
+    svc.refresh_status().await;
+    Ok(freed)
+}
+
+/// Whether `path` is one of the report's items or their children. Only these can be opened
+/// from the advisor, so the webview can't open arbitrary paths.
+fn in_report(items: &[SpaceItem], path: &str) -> bool {
+    items
+        .iter()
+        .any(|i| (!i.path.is_empty() && i.path == path) || in_report(&i.children, path))
+}
+
+/// Opens a folder from the disk space report in the file manager (a file is shown in its
+/// folder). Only paths in the latest report are accepted.
+#[tauri::command]
+pub fn reveal_space_item(app: AppHandle, svc: Svc<'_>, path: String) -> Res<()> {
+    let known = svc
+        .space_report()
+        .is_some_and(|r| in_report(&r.items, &path));
+    if !known {
+        return Err(CallError::new(
+            "bad_request",
+            "That folder isn't in the disk space report anymore. Check again, then try once more.",
+        ));
+    }
+    let p = Path::new(&path);
+    let result = if p.is_dir() {
+        app.opener().open_path(&path, None::<&str>)
+    } else if p.exists() {
+        app.opener().reveal_item_in_dir(p)
+    } else {
+        return Err(CallError::new(
+            "not_found",
+            "That folder isn't there anymore. Check again to update the list.",
+        ));
+    };
+    result.map_err(|e| CallError::new("internal", format!("Couldn't open the folder: {e}")))
+}
+
+/// The system's own cleanup: Storage settings on Windows. Nothing else can be opened here.
+#[tauri::command]
+pub fn open_system_cleanup(app: AppHandle) -> Res<()> {
+    if !cfg!(windows) {
+        return Err(CallError::new(
+            "bad_request",
+            "Storage settings are available on Windows only.",
+        ));
+    }
+    app.opener()
+        .open_url("ms-settings:storagesense", None::<&str>)
+        .map_err(|e| CallError::new("internal", format!("Couldn't open Storage settings: {e}")))
+}
+
 #[tauri::command]
 pub fn open_url(app: AppHandle, url: String) -> Res<()> {
     const ALLOWED: &[&str] = &[
@@ -504,5 +591,41 @@ pub async fn stop_service(svc: &Arc<Backend>, wait: bool) {
         && drive_core::ipc_client::Client::connect().await.is_ok()
     {
         tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use drive_core::ipc::SpaceCategory;
+
+    fn item(path: &str, children: Vec<SpaceItem>) -> SpaceItem {
+        SpaceItem {
+            path: path.into(),
+            name: "x".into(),
+            bytes: 1,
+            files: 1,
+            category: SpaceCategory::UserFolder,
+            known: None,
+            backup_id: None,
+            on_demand: false,
+            action: None,
+            frees_bytes: 0,
+            caution: None,
+            note: None,
+            children,
+        }
+    }
+
+    #[test]
+    fn only_report_paths_can_be_opened() {
+        let appdata = r"C:\Users\alex\AppData";
+        let npm = r"C:\Users\alex\AppData\Local\npm-cache";
+        let items = vec![item("", vec![]), item(appdata, vec![item(npm, vec![])])];
+        assert!(in_report(&items, appdata));
+        assert!(in_report(&items, npm));
+        assert!(!in_report(&items, ""));
+        assert!(!in_report(&items, r"C:\Windows"));
+        assert!(!in_report(&items, r"C:\Users\alex\AppData\.."));
     }
 }

@@ -18,6 +18,7 @@ import type {
   SettingsPatch,
   SetupRequest,
   SetupResult,
+  SpaceReport,
   Status,
   TransferList,
   TransferMode,
@@ -38,6 +39,8 @@ export const EVENTS = {
   update: "drive://update",
   /** Backed-up folders and suggestions, on every change and about once a second during progress. */
   backups: "drive://backups",
+  /** Disk scan progress (about twice a second) and the finished disk space report. */
+  space: "drive://space",
   /** Settings only: switch to a section (opened from the popover). */
   settingsSection: "drive://settings-section",
   popoverShown: "drive://popover-shown",
@@ -132,6 +135,17 @@ export const api = {
   setBackupOnDemand: (id: string, onDemand: boolean, keepBytes: number | null = null) =>
     invoke<BackupInfo>("set_backup_on_demand", { id, onDemand, keepBytes }),
   dismissBackupSuggestions: () => invoke<BackupOverview>("dismiss_backup_suggestions"),
+  /** The disk space report; starts a scan when there's none yet, or with `rescan`. Progress arrives as `drive://space`. */
+  space: (rescan = false) => invoke<SpaceReport>("space", { rescan }),
+  cancelSpaceScan: () => invoke<void>("cancel_space_scan"),
+  /** Backs a folder up if needed and makes it on-demand (Windows). Progress shows in its backup. */
+  saveSpace: (path: string, keepBytes: number | null = null) => invoke<BackupInfo>("save_space", { path, keepBytes }),
+  /** Frees the Drive folder's downloaded files (pinned files and pending uploads stay). */
+  freeDriveCache: () => invoke<{ freed_bytes: number }>("free_drive_cache"),
+  /** Opens a folder from the latest disk space report in the file manager (other paths are refused). */
+  revealSpaceItem: (path: string) => invoke<void>("reveal_space_item", { path }),
+  /** Windows Storage settings. */
+  openSystemCleanup: () => invoke<void>("open_system_cleanup"),
   /** Native folder picker; null when cancelled. */
   pickBackupFolder: () => invoke<string | null>("pick_backup_folder"),
   finishOnboarding: () => invoke<void>("finish_onboarding"),

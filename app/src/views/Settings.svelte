@@ -2,16 +2,19 @@
   import { onMount, tick } from "svelte";
   import { api, closeWindow, env, errorOf, EVENTS, listen } from "../lib/api";
   import { cloudOnlyBytes, progressOf, stateLine, storageLine, suggestionSize } from "../lib/backups";
+  import DiskSpace from "../lib/DiskSpace.svelte";
   import { connect, drive, refreshBackups, updateVersion } from "../lib/drive.svelte";
   import { bytes, clockOf, GB, plural, relative } from "../lib/format";
   import Icon, { type IconName } from "../lib/Icon.svelte";
   import ReleaseNotes from "../lib/ReleaseNotes.svelte";
+  import { KEEP_CHOICES } from "../lib/space";
   import type { AppInfo, BackupInfo, SettingsPatch } from "../lib/types";
 
-  type Section = "general" | "backups" | "storage" | "network" | "account" | "recovery" | "updates" | "about";
+  type Section = "general" | "backups" | "space" | "storage" | "network" | "account" | "recovery" | "updates" | "about";
   const SECTIONS: { id: Section; label: string; icon: IconName }[] = [
     { id: "general", label: "General", icon: "gear" },
     { id: "backups", label: "Backups", icon: "backup" },
+    { id: "space", label: "Disk space", icon: "pie" },
     { id: "storage", label: "Storage", icon: "storage" },
     { id: "network", label: "Network", icon: "network" },
     { id: "account", label: "Account", icon: "user" },
@@ -22,7 +25,7 @@
   const windows = env().platform === "windows";
 
   const isSection = (id: unknown): id is Section => SECTIONS.some((x) => x.id === id);
-  // Opened from the popover's "Back up…": start at that section.
+  // Opened at a section: the popover's "Back up…" or "Free up space…", the tray's "Free up disk space…".
   const opened = env().section;
   let section = $state<Section>(isSection(opened) ? opened : "general");
   let info = $state<AppInfo | null>(null);
@@ -35,9 +38,9 @@
   const setUp = $derived(connected && status !== null && status.state !== "not_set_up");
 
   onMount(() => {
-    connect({ settings: true, backups: true });
+    connect({ settings: true, backups: true, space: true });
     api.appInfo().then((i) => (info = i));
-    // Already open when the popover asks for a section.
+    // Already open when the popover or the tray asks for a section.
     listen<string>(EVENTS.settingsSection, (id) => {
       if (isSection(id)) section = id;
     });
@@ -132,7 +135,6 @@
 
   // Save space on this PC (on-demand)
   const device = windows ? "PC" : "computer";
-  const KEEP_CHOICES = [1, 2, 5, 10, 20, 50].map((n) => n * GB);
   /** The usual sizes, plus the current one if the service has another. */
   const keepChoices = (b: BackupInfo) =>
     KEEP_CHOICES.includes(b.keep_bytes) || b.keep_bytes <= 0
@@ -1022,6 +1024,8 @@
           <button class="btn" onclick={() => stopDialog?.close()} autofocus>Cancel</button>
         </div>
       </dialog>
+    {:else if section === "space"}
+      <DiskSpace {windows} onsection={(id) => (section = id)} />
     {:else if section === "storage"}
       <div class="group">
         {#if status}
@@ -1764,38 +1768,6 @@
     align-items: center;
     gap: var(--s4);
     padding: var(--s4);
-  }
-
-  .dialog-body {
-    display: grid;
-    gap: var(--s3);
-    padding: var(--s6);
-  }
-  .dialog-text {
-    display: grid;
-    gap: var(--s3);
-  }
-  .callout-inline {
-    display: flex;
-    gap: var(--s2);
-    padding: var(--s2) var(--s3);
-    border-radius: var(--radius-control);
-    background: var(--warning-soft);
-  }
-  .callout-inline :global(.icon) {
-    color: var(--warning-icon);
-    margin-block-start: 1px;
-  }
-  .dialog-actions {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: var(--s2);
-    padding: var(--s6);
-    border-block-start: 1px solid var(--stroke-divider);
-    background: var(--bg);
-  }
-  :root[data-material] .dialog-actions {
-    background: color-mix(in srgb, var(--bg-dialog, #fff), var(--text) 3%);
   }
 
   @media (max-width: 600px) {

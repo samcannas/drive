@@ -62,4 +62,5 @@ export const ACTION_LABEL: Record<IssueAction, string> = {
   confirm_delete: "Delete from cloud",
   restore_deleted: "Restore files",
   sign_in: "Sign in",
+  find_space: "See what's using space",
 };

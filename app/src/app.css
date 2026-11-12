@@ -67,6 +67,15 @@
   --shadow-dialog: 0 8px 32px rgb(0 0 0 / 0.18), 0 2px 8px rgb(0 0 0 / 0.1);
   /* Opaque surface for content floating over the window (flyout cards), even on Mica/Acrylic. */
   --bg-overlay: #ffffff;
+
+  /* Disk space chart: one colour per group of what takes space (Settings › Disk space). Each is
+     at least 3:1 against cards; segments are also separated by a gap and named in a legend. */
+  --space-files: #2563c9;
+  --space-drive: #0b7a6f;
+  --space-apps: #8045c4;
+  --space-cloud: #bf3a76;
+  --space-system: #5b636c;
+  --space-other: #868c94;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -105,6 +114,12 @@
     --icon-knockout: #000000;
     --shadow-dialog: 0 8px 32px rgb(0 0 0 / 0.5), 0 2px 8px rgb(0 0 0 / 0.3);
     --bg-overlay: #2b2b2b;
+    --space-files: #6fa3ff;
+    --space-drive: #38c2b2;
+    --space-apps: #b58df2;
+    --space-cloud: #f27bb0;
+    --space-system: #aab2bc;
+    --space-other: #7d838b;
   }
 }
 
@@ -143,6 +158,12 @@
   --icon-knockout: #000000;
   --shadow-dialog: 0 8px 32px rgb(0 0 0 / 0.5), 0 2px 8px rgb(0 0 0 / 0.3);
   --bg-overlay: #2b2b2b;
+  --space-files: #6fa3ff;
+  --space-drive: #38c2b2;
+  --space-apps: #b58df2;
+  --space-cloud: #f27bb0;
+  --space-system: #aab2bc;
+  --space-other: #7d838b;
   color-scheme: dark;
 }
 
@@ -626,11 +647,47 @@ dialog {
 dialog::backdrop {
   background: rgb(0 0 0 / 0.3);
 }
+.dialog-body {
+  display: grid;
+  gap: var(--s3);
+  padding: var(--s6);
+}
+.dialog-text {
+  display: grid;
+  gap: var(--s3);
+}
+.dialog-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--s2);
+  padding: var(--s6);
+  border-block-start: 1px solid var(--stroke-divider);
+  background: var(--bg);
+}
+:root[data-material] .dialog-actions {
+  background: color-mix(in srgb, var(--bg-dialog, #fff), var(--text) 3%);
+}
+/* A warning inside a dialog or a card. */
+.callout-inline {
+  display: flex;
+  gap: var(--s2);
+  padding: var(--s2) var(--s3);
+  border-radius: var(--radius-control);
+  background: var(--warning-soft);
+}
+.callout-inline > .icon {
+  color: var(--warning-icon);
+  margin-block-start: 1px;
+}
 
 @media (forced-colors: active) {
   .switch:checked::after,
   .meter > span {
     background: Highlight;
+  }
+  .space-swatch,
+  .space-bar > span {
+    forced-color-adjust: none;
   }
   .btn {
     border-color: ButtonText;

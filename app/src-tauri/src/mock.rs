@@ -16,6 +16,10 @@
 //!   takes about 5 s; making Downloads a full copy again fails for lack of disk space. Without it
 //!   there are no backups and the suggestions show; adding one scans, backs up and finishes in
 //!   about 20 s.
+//! * `DRIVE_UI_MOCK_DISK_FULL=1` starts with an almost full disk (51 GB free of 953 GB) and a
+//!   "disk almost full" issue. Either way, opening Settings › Disk space scans for about 6 s and
+//!   finds large Videos, Downloads and Documents (Drive can save space in them on Windows, or
+//!   back them up elsewhere), app caches, programs, the Drive folder and the Recycle Bin.
 //! * `DRIVE_UI_MOCK_UPDATE=1` offers a made-up update (see `updater`); installing it only
 //!   pretends. Works with or without the mock service.
 
@@ -24,10 +28,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use drive_core::ipc::{
-    AccountCheck, Activity, ActivityKind, BackupInfo, BackupOverview, BackupState, Call, ErrorCode,
-    Event, FolderSuggestion, Hello, Issue, IssueAction, IssueKind, KnownFolder, RecoveryKit,
-    RpcError, Settings, SetupResult, Status, SyncState, TransferDirection, TransferItem,
-    TransferList, TransferMode, TransferState,
+    AccountCheck, Activity, ActivityKind, BackupInfo, BackupOverview, BackupState, Call, DiskUsage,
+    ErrorCode, Event, FolderSuggestion, Hello, Issue, IssueAction, IssueKind, KnownFolder,
+    RecoveryKit, RpcError, Settings, SetupResult, SpaceAction, SpaceCategory, SpaceItem,
+    SpaceReport, SpaceSaved, SpaceScan, SpaceScanState, Status, SyncState, TransferDirection,
+    TransferItem, TransferList, TransferMode, TransferState,
 };
 use rand::Rng;
 use serde_json::{Value, json};
@@ -76,6 +81,11 @@ struct State {
     /// A backup was added at some point, so the vault has a `Backups/<device>` folder.
     backups_ever: bool,
     next_backup: u32,
+    space: MockSpace,
+    /// Free space on the disk holding the Drive folder.
+    disk_free: u64,
+    /// Downloaded files in the Drive folder that aren't pinned.
+    cache_bytes: u64,
 }
 
 /// A backed-up folder and how the mock moves it along.
@@ -229,6 +239,14 @@ impl Mock {
         if mass {
             issues.push(mass_issue(2, 1_240, now));
         }
+        let disk_free = if disk_full_forced() {
+            51 * GB
+        } else {
+            212 * GB
+        };
+        if disk_full_forced() {
+            issues.push(disk_full_issue(3, disk_free, now));
+        }
         let backups = if backups_forced() {
             rich_backups(now)
         } else {
@@ -284,6 +302,12 @@ impl Mock {
             backups,
             suggestions_dismissed: false,
             next_backup: 10,
+            space: MockSpace {
+                report: SpaceReport::default(),
+                scan: None,
+            },
+            disk_free,
+            cache_bytes: 6 * GB + 300 * MB,
         };
         let (events, _) = broadcast::channel(64);
         let mock = Arc::new(Self {
@@ -411,6 +435,8 @@ impl Mock {
     /// Cycles between "syncing" (about 10 s) and "up to date" (about 12 s).
     fn tick(&self) {
         let mut st = self.state.lock().unwrap();
+        // The disk scan runs whether or not syncing is paused.
+        self.tick_space(&mut st);
         if !st.set_up || st.paused {
             return;
         }
@@ -733,6 +759,42 @@ impl Mock {
                 self.emit_backups(&st);
                 Value::Null
             }
+            Call::Space { rescan } => {
+                let scanning = st.space.scan.is_some();
+                if !scanning && (rescan || st.space.report.scan.state != SpaceScanState::Done) {
+                    self.start_space_scan(&mut st);
+                    self.emit_space(&st);
+                }
+                json!(st.space.report)
+            }
+            Call::CancelSpaceScan => {
+                if st.space.scan.take().is_some() {
+                    let scan = &mut st.space.report.scan;
+                    // Back to the previous report, if there was one.
+                    scan.state = if scan.finished_ms.is_some() {
+                        SpaceScanState::Done
+                    } else {
+                        SpaceScanState::Idle
+                    };
+                    scan.current = None;
+                    self.emit_space(&st);
+                }
+                Value::Null
+            }
+            Call::SaveSpace { path, keep_bytes } => {
+                let info = self.save_space(&mut st, &path, keep_bytes)?;
+                self.emit_backups(&st);
+                self.emit_status(&st);
+                self.refresh_space(&mut st);
+                json!(info)
+            }
+            Call::FreeDriveCache => {
+                let freed = std::mem::take(&mut st.cache_bytes);
+                st.disk_free = (st.disk_free + freed).min(DISK_TOTAL);
+                self.emit_status(&st);
+                self.refresh_space(&mut st);
+                json!({ "freed_bytes": freed })
+            }
         };
         Ok(v)
     }
@@ -852,13 +914,15 @@ fn status_of(st: &State) -> Status {
         transfer_bytes_total: if syncing { total } else { 0 },
         transfer_bytes_done: done,
         issues: st.issues.len() as u32,
-        cache_bytes: 6 * GB + 300 * MB,
+        cache_bytes: st.cache_bytes,
         cache_limit_bytes: st.settings.cache_limit_bytes,
-        pinned_bytes: 2 * GB + 150 * MB,
+        pinned_bytes: PINNED_BYTES,
         cloud_bytes: 148 * GB + 700 * MB,
         cloud_files: 23_418,
         last_sync_ms: Some(now_ms() - 40_000),
         pending_delete_confirmation: st.pending_delete,
+        disk_free_bytes: Some(st.disk_free),
+        disk_total_bytes: Some(DISK_TOTAL),
     }
 }
 
@@ -1664,4 +1728,510 @@ fn add_backup(st: &mut State, raw: &str) -> Result<BackupInfo, RpcError> {
     });
     st.backups_ever = true;
     Ok(info)
+}
+
+// ---- disk space ----------------------------------------------------------------------------
+
+/// The disk space report and the scan that makes it.
+struct MockSpace {
+    report: SpaceReport,
+    /// Ticks left while a scan runs.
+    scan: Option<u32>,
+}
+
+/// Ticks a disk scan takes (about 6 s).
+const SCAN_TICKS: u32 = 9;
+const DISK_TOTAL: u64 = 953 * GB;
+/// What the scan finds in the Drive folder besides the evictable cache (pinned files).
+const PINNED_BYTES: u64 = 2 * GB + 150 * MB;
+
+/// Whether to start with an almost full disk and a "disk full" issue. Always false in release
+/// builds.
+fn disk_full_forced() -> bool {
+    cfg!(debug_assertions) && std::env::var("DRIVE_UI_MOCK_DISK_FULL").is_ok_and(|v| v == "1")
+}
+
+/// Bytes the scan finds on the disk (what isn't free).
+fn disk_used(st: &State) -> u64 {
+    DISK_TOTAL.saturating_sub(st.disk_free)
+}
+
+fn disks(st: &State) -> Vec<DiskUsage> {
+    if cfg!(windows) {
+        vec![
+            DiskUsage {
+                path: "C:\\".into(),
+                name: "Local Disk (C:)".into(),
+                total_bytes: DISK_TOTAL,
+                free_bytes: st.disk_free,
+                scanned: true,
+            },
+            DiskUsage {
+                path: "D:\\".into(),
+                name: "Data (D:)".into(),
+                total_bytes: 1_863 * GB,
+                free_bytes: 1_210 * GB,
+                scanned: false,
+            },
+        ]
+    } else {
+        vec![DiskUsage {
+            path: "/".into(),
+            name: "/".into(),
+            total_bytes: DISK_TOTAL,
+            free_bytes: st.disk_free,
+            scanned: true,
+        }]
+    }
+}
+
+fn space_item(
+    path: &Path,
+    name: &str,
+    bytes: u64,
+    files: u64,
+    category: SpaceCategory,
+) -> SpaceItem {
+    SpaceItem {
+        path: path.to_string_lossy().into_owned(),
+        name: name.into(),
+        bytes,
+        files,
+        category,
+        known: None,
+        backup_id: None,
+        on_demand: false,
+        action: None,
+        frees_bytes: 0,
+        caution: None,
+        note: None,
+        children: Vec::new(),
+    }
+}
+
+fn known_path(known: KnownFolder) -> (&'static str, PathBuf) {
+    let k = known_folders()
+        .into_iter()
+        .find(|f| f.0 == known)
+        .expect("every known folder is listed");
+    (k.1, k.2)
+}
+
+/// A folder of your own files that Drive can save space in (or, off Windows, back up).
+fn own_folder(
+    st: &State,
+    known: KnownFolder,
+    bytes: u64,
+    files: u64,
+    children: Vec<SpaceItem>,
+) -> SpaceItem {
+    let (name, path) = known_path(known);
+    let backup = st.backups.iter().find(|b| Path::new(&b.info.path) == path);
+    let on_demand = backup.is_some_and(|b| b.info.on_demand);
+    let action = match (cfg!(windows), backup.is_some(), on_demand) {
+        (_, _, true) => None,
+        (true, true, false) => Some(SpaceAction::TurnOnSaveSpace),
+        (true, false, _) => Some(SpaceAction::SaveSpace),
+        (false, true, _) => None,
+        (false, false, _) => Some(SpaceAction::BackUp),
+    };
+    let frees = match action {
+        Some(SpaceAction::SaveSpace | SpaceAction::TurnOnSaveSpace) => {
+            bytes.saturating_sub(KEEP_DEFAULT)
+        }
+        _ => 0,
+    };
+    SpaceItem {
+        known: Some(known),
+        backup_id: backup.map(|b| b.info.id.clone()),
+        on_demand,
+        action,
+        frees_bytes: frees,
+        // On-demand folders take only what's kept on this device.
+        bytes: if on_demand {
+            KEEP_DEFAULT.min(bytes)
+        } else {
+            bytes
+        },
+        note: (!cfg!(windows) && backup.is_some())
+            .then(|| "Backed up. Saving space is available on Windows.".to_string()),
+        children,
+        ..space_item(&path, name, bytes, files, SpaceCategory::UserFolder)
+    }
+}
+
+/// What the finished scan finds: a nearly full disk with large videos, downloads, developer
+/// files and app caches.
+fn sample_items(st: &State) -> Vec<SpaceItem> {
+    use SpaceCategory as C;
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("C:\\Users\\alex"));
+    let win = cfg!(windows);
+    let videos = known_path(KnownFolder::Videos).1;
+    let docs = known_path(KnownFolder::Documents).1;
+    let drive = PathBuf::from(&st.settings.folder);
+    let local = |sub: &str| home.join("AppData").join("Local").join(sub);
+    let app_children = if win {
+        vec![
+            SpaceItem {
+                note: Some(
+                    "Docker's disk images. Remove ones you don't use in Docker Desktop.".into(),
+                ),
+                ..space_item(&local("Docker"), "Docker", 61 * GB, 40, C::Developer)
+            },
+            space_item(
+                &local("npm-cache"),
+                "npm-cache",
+                18 * GB,
+                412_000,
+                C::Developer,
+            ),
+            space_item(&local("Packages"), "Packages", 12 * GB, 88_000, C::AppData),
+            SpaceItem {
+                action: Some(SpaceAction::OpenSystemCleanup),
+                note: Some("Files apps no longer need. Windows can delete them for you.".into()),
+                ..space_item(
+                    &local("Temp"),
+                    "Temp",
+                    9 * GB + 400 * MB,
+                    51_000,
+                    C::Temporary,
+                )
+            },
+        ]
+    } else {
+        vec![
+            space_item(
+                &home.join(".cache/pip"),
+                "pip",
+                14 * GB,
+                90_000,
+                C::Developer,
+            ),
+            space_item(
+                &home.join(".cache/yarn"),
+                "yarn",
+                9 * GB,
+                210_000,
+                C::Developer,
+            ),
+        ]
+    };
+    let mut items = vec![
+        own_folder(
+            st,
+            KnownFolder::Videos,
+            182 * GB,
+            1_240,
+            vec![
+                space_item(&videos.join("Family 2019-2025"), "Family 2019-2025", 96 * GB, 610, C::UserFolder),
+                space_item(&videos.join("Screen recordings"), "Screen recordings", 48 * GB, 302, C::UserFolder),
+                space_item(&videos.join("Drone"), "Drone", 31 * GB, 88, C::UserFolder),
+            ],
+        ),
+        SpaceItem {
+            note: Some(if win {
+                "Settings and caches your apps keep. Clear caches in the apps themselves.".into()
+            } else {
+                "Caches your apps keep. Apps download them again when needed.".into()
+            }),
+            children: app_children,
+            ..space_item(
+                &if win { home.join("AppData") } else { home.join(".cache") },
+                if win { "AppData" } else { ".cache" },
+                143 * GB,
+                980_000,
+                C::AppData,
+            )
+        },
+        SpaceItem {
+            note: Some(if win {
+                "Installed programs and games. Uninstall ones you don't use in Settings › Apps."
+                    .into()
+            } else {
+                "Installed programs. Remove ones you don't use with your package manager.".into()
+            }),
+            ..space_item(
+                Path::new(if win { "C:\\Program Files" } else { "/usr" }),
+                if win { "Program Files" } else { "/usr" },
+                118 * GB,
+                402_000,
+                C::Apps,
+            )
+        },
+        SpaceItem {
+            note: Some(if win {
+                "Windows itself, its page and hibernation files, and folders Drive isn't allowed to read."
+                    .into()
+            } else {
+                "The system itself and folders Drive isn't allowed to read.".into()
+            }),
+            ..space_item(
+                Path::new(""),
+                if win { "Windows and system" } else { "System" },
+                96 * GB,
+                0,
+                C::System,
+            )
+        },
+        own_folder(st, KnownFolder::Downloads, 64 * GB, 1_980, Vec::new()),
+        SpaceItem {
+            caution: Some(
+                "Has 12 code projects. Build tools and code editors open many files at once, which downloads them again. Save space in other folders first."
+                    .into(),
+            ),
+            ..own_folder(
+                st,
+                KnownFolder::Documents,
+                41 * GB,
+                212_000,
+                vec![
+                    space_item(&docs.join("GitHub"), "GitHub", 22 * GB, 180_000, C::Developer),
+                    space_item(&docs.join("Thesis"), "Thesis", 3 * GB, 1_400, C::UserFolder),
+                ],
+            )
+        },
+        SpaceItem {
+            note: Some("Files of other people who use this device. Drive can't read them.".into()),
+            ..space_item(Path::new(""), "Other accounts", 14 * GB, 0, C::OtherUsers)
+        },
+        SpaceItem {
+            action: (st.cache_bytes > 0).then_some(SpaceAction::FreeDriveCache),
+            frees_bytes: st.cache_bytes,
+            note: (st.cache_bytes == 0)
+                .then(|| "Only files you chose to keep on this device are downloaded.".into()),
+            ..space_item(
+                &drive,
+                "Drive folder",
+                st.cache_bytes + PINNED_BYTES,
+                1_830,
+                C::DriveFolder,
+            )
+        },
+        own_folder(st, KnownFolder::Pictures, 6 * GB + 300 * MB, 3_120, Vec::new()),
+    ];
+    if win {
+        items.push(SpaceItem {
+            note: Some(
+                "Older 32-bit programs and games. Uninstall ones you don't use in Settings › Apps."
+                    .into(),
+            ),
+            ..space_item(
+                Path::new("C:\\Program Files (x86)"),
+                "Program Files (x86)",
+                38 * GB,
+                160_000,
+                C::Apps,
+            )
+        });
+        items.push(SpaceItem {
+            note: Some(
+                "Managed by OneDrive. To free space here, use Free up space in OneDrive.".into(),
+            ),
+            ..space_item(
+                &home.join("OneDrive"),
+                "OneDrive",
+                27 * GB,
+                8_400,
+                C::OtherCloud,
+            )
+        });
+        items.push(SpaceItem {
+            action: Some(SpaceAction::OpenSystemCleanup),
+            note: Some("Files you deleted. Empty the Recycle Bin to free this space.".into()),
+            ..space_item(
+                Path::new("C:\\$Recycle.Bin"),
+                "Recycle Bin",
+                7 * GB + 200 * MB,
+                3_100,
+                C::RecycleBin,
+            )
+        });
+    } else {
+        items.push(SpaceItem {
+            note: Some("Files you deleted. Empty the trash to free this space.".into()),
+            ..space_item(
+                &home.join(".local/share/Trash"),
+                "Trash",
+                7 * GB + 200 * MB,
+                3_100,
+                C::RecycleBin,
+            )
+        });
+    }
+    items.sort_by_key(|i| std::cmp::Reverse(i.bytes));
+    items
+}
+
+/// The finished report for the current state (made again after every action, as a new scan
+/// would find it).
+fn finished_report(st: &State, started_ms: Option<i64>, finished_ms: Option<i64>) -> SpaceReport {
+    let items = sample_items(st);
+    let backups_bytes = st
+        .backups
+        .iter()
+        .filter(|b| b.info.on_demand)
+        .map(|b| b.info.bytes.saturating_sub(b.info.local_bytes))
+        .sum();
+    let can_free_bytes = items
+        .iter()
+        .filter(|i| {
+            matches!(
+                i.action,
+                Some(
+                    SpaceAction::SaveSpace
+                        | SpaceAction::TurnOnSaveSpace
+                        | SpaceAction::FreeDriveCache
+                )
+            )
+        })
+        .map(|i| i.frees_bytes)
+        .sum();
+    SpaceReport {
+        scan: SpaceScan {
+            state: SpaceScanState::Done,
+            scanned_bytes: disk_used(st),
+            scanned_files: 2_418_000,
+            current: None,
+            started_ms,
+            finished_ms,
+            error: None,
+        },
+        disks: disks(st),
+        saved: SpaceSaved {
+            drive_folder_bytes: (148 * GB + 700 * MB).saturating_sub(st.cache_bytes + PINNED_BYTES),
+            backups_bytes,
+        },
+        items,
+        can_free_bytes,
+    }
+}
+
+/// Folders the progress line shows while scanning.
+fn scanning_folder(tick: u32) -> String {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("C:\\Users\\alex"));
+    let sub = [
+        "Videos/Family 2019-2025/2023 Summer in Croatia",
+        "AppData/Local/Docker/wsl/disk",
+        "AppData/Local/npm-cache/_cacache/content-v2/sha512/4f",
+        "Documents/GitHub/drive/target/debug/deps",
+        "Downloads/Installers",
+        "OneDrive/Pictures/Camera Roll",
+        "Pictures/2026/Lisbon",
+    ][tick as usize % 7];
+    let mut p = home;
+    p.extend(sub.split('/'));
+    p.to_string_lossy().into_owned()
+}
+
+impl Mock {
+    fn emit_space(&self, st: &State) {
+        let _ = self.events.send(Event::Space(st.space.report.clone()));
+    }
+
+    /// `Space`: starts a scan when there's no report yet, or with `rescan`.
+    fn start_space_scan(&self, st: &mut State) {
+        let disks = disks(st);
+        let report = &mut st.space.report;
+        let finished_ms = (report.scan.state == SpaceScanState::Done)
+            .then_some(report.scan.finished_ms)
+            .flatten();
+        report.scan = SpaceScan {
+            state: SpaceScanState::Scanning,
+            scanned_bytes: 0,
+            scanned_files: 0,
+            current: Some(scanning_folder(0)),
+            started_ms: Some(now_ms()),
+            finished_ms,
+            error: None,
+        };
+        report.disks = disks;
+        st.space.scan = Some(SCAN_TICKS);
+    }
+
+    /// Moves a running disk scan along by one tick (0.7 s).
+    fn tick_space(&self, st: &mut State) {
+        let Some(left) = st.space.scan else { return };
+        if left == 0 {
+            let started = st.space.report.scan.started_ms;
+            st.space.report = finished_report(st, started, Some(now_ms()));
+            st.space.scan = None;
+        } else {
+            let done = u64::from(SCAN_TICKS - left + 1);
+            let steps = u64::from(SCAN_TICKS + 1);
+            let used = disk_used(st);
+            let scan = &mut st.space.report.scan;
+            scan.scanned_bytes = used / steps * done;
+            scan.scanned_files = 2_418_000 / steps * done;
+            scan.current = Some(scanning_folder(done as u32));
+            st.space.scan = Some(left - 1);
+        }
+        self.emit_space(st);
+    }
+
+    /// After an action, the report shows its effect, as a new scan would.
+    fn refresh_space(&self, st: &mut State) {
+        if st.space.report.scan.state == SpaceScanState::Done {
+            let scan = &st.space.report.scan;
+            st.space.report = finished_report(st, scan.started_ms, scan.finished_ms);
+            self.emit_space(st);
+        }
+    }
+
+    /// `SaveSpace`: backs the folder up if it isn't yet, and makes it on-demand.
+    fn save_space(
+        &self,
+        st: &mut State,
+        path: &str,
+        keep_bytes: Option<u64>,
+    ) -> Result<BackupInfo, RpcError> {
+        if !cfg!(windows) {
+            return Err(err(
+                ErrorCode::BadRequest,
+                "Saving space is available on Windows only for now.",
+            ));
+        }
+        let keep = keep_bytes.unwrap_or(KEEP_DEFAULT);
+        let frees = sample_items(st)
+            .iter()
+            .find(|i| i.path == path)
+            .map(|i| i.frees_bytes)
+            .unwrap_or(0);
+        let existing = st
+            .backups
+            .iter()
+            .position(|b| Path::new(&b.info.path) == Path::new(path));
+        let info = match existing {
+            Some(i) => {
+                let b = &mut st.backups[i];
+                set_on_demand(b, true, Some(keep))?;
+                info_of(b)
+            }
+            None => {
+                add_backup(st, path)?;
+                let b = st.backups.last_mut().expect("just added");
+                b.info.on_demand = true;
+                b.info.keep_bytes = keep;
+                info_of(b)
+            }
+        };
+        // The space comes free as files are safely in the cloud; the mock frees it at once.
+        st.disk_free = (st.disk_free + frees).min(DISK_TOTAL);
+        Ok(info)
+    }
+}
+
+fn disk_full_issue(id: i64, free: u64, now: i64) -> Issue {
+    Issue {
+        id,
+        kind: IssueKind::DiskFull,
+        path: None,
+        backup: None,
+        message: format!(
+            "Only {} is free on this {}. When the disk is full, Drive can't download the files you open.",
+            size(free),
+            if cfg!(windows) { "PC" } else { "computer" }
+        ),
+        created_ms: now - 20 * 60_000,
+        actions: vec![IssueAction::FindSpace, IssueAction::Dismiss],
+    }
 }

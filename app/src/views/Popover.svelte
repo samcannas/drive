@@ -4,6 +4,7 @@
   import { connect, drive, refreshIssues, refreshTransfers } from "../lib/drive.svelte";
   import { isBusy, offerable, offerBytes, offerTitle, progressOf, splitBackupPath } from "../lib/backups";
   import { basename, bytes, count, dirname, plural, relative } from "../lib/format";
+  import { freeOf, statusDisk } from "../lib/space";
   import Icon from "../lib/Icon.svelte";
   import StateBadge from "../lib/StateBadge.svelte";
   import TransferRow from "../lib/TransferRow.svelte";
@@ -54,6 +55,13 @@
     const size = offerBytes(items);
     return { title: offerTitle(items), size };
   });
+  /** The disk holding the Drive folder, when the service measured it. */
+  const disk = $derived(statusDisk(status));
+  /** "Your disk is almost full", until dismissed for this session. Not while an issue already says so. */
+  let diskDismissed = $state(false);
+  const diskWarning = $derived(
+    disk !== null && disk.low && !diskDismissed && !drive.issues.some((i) => i.kind === "disk_full"),
+  );
   let recentHeading = $state<HTMLHeadingElement>();
   // Ticks every second while something waits to retry, so its countdown stays honest.
   let clock = $state(Date.now());
@@ -143,6 +151,14 @@
     return name ? `${name} › ${issue.path}` : issue.path;
   }
 
+  async function dismissDiskWarning() {
+    diskDismissed = true;
+    announce = "";
+    queueMicrotask(() => (announce = "Hidden until Drive restarts. Disk space is in Settings."));
+    await tick();
+    recentHeading?.focus();
+  }
+
   function dismissOffer() {
     return run("offer", async () => {
       drive.backups = await api.dismissBackupSuggestions();
@@ -175,6 +191,7 @@
 
   function act(issue: Issue, action: IssueAction) {
     if (action === "sign_in") return run(`sign_in`, () => api.showWindow("onboarding"));
+    if (action === "find_space") return run(`find_space`, () => api.showWindow("settings", "space"));
     return run(`${issue.id}:${action}`, async () => {
       await api.resolveIssue(issue.id, action);
       await refreshIssues();
@@ -294,7 +311,7 @@
                       <button
                         class="btn"
                         class:danger={action === "confirm_delete"}
-                        class:primary={action === "sign_in"}
+                        class:primary={action === "sign_in" || action === "find_space"}
                         aria-disabled={busy !== null}
                         onclick={() => act(issue, action)}
                       >
@@ -380,6 +397,23 @@
 
         {#if actionError}
           <p class="error-text" role="alert"><Icon name="alert" size={16} />{actionError}</p>
+        {/if}
+
+        {#if diskWarning && disk}
+          <section class="callout warning" aria-labelledby="disk-low-title">
+            <Icon name="warning" size={18} />
+            <div>
+              <h2 id="disk-low-title" class="body-strong">Your disk is almost full</h2>
+              <p>
+                Only {bytes(disk.free)} is free on this {device}. Drive can show what's using space and free some without
+                deleting anything.
+              </p>
+            </div>
+            <div class="actions">
+              <button class="btn primary" onclick={() => api.showWindow("settings", "space")}>See what's using space</button>
+              <button class="btn subtle" onclick={dismissDiskWarning}>Not now</button>
+            </div>
+          </section>
         {/if}
 
         {#if transfers && summary}
@@ -525,6 +559,21 @@
               {bytes(status.cloud_bytes)} · {plural(status.cloud_files, "file", "files")}
             </span>
           </div>
+          {#if disk}
+            <div class="disk-row">
+              <div class="row">
+                <span class="with-icon" class:low={disk.low}>
+                  <Icon name={disk.low ? "warning" : "pie"} size={16} />Disk space
+                </span>
+                <span class="caption numeric" class:secondary={!disk.low} class:low={disk.low}>
+                  {freeOf(disk.free, disk.total)}
+                </span>
+              </div>
+              <button class="link caption free-link" onclick={() => api.showWindow("settings", "space")}>
+                Free up space…
+              </button>
+            </div>
+          {/if}
         </section>
 
         <section class="recent" aria-labelledby="recent-title">
@@ -666,6 +715,24 @@
   }
   .cloud-row {
     margin-block-start: var(--s1);
+  }
+  .disk-row {
+    display: grid;
+    gap: 2px;
+    margin-block-start: var(--s1);
+    padding-block-start: var(--s2);
+    border-block-start: 1px solid var(--stroke-divider);
+  }
+  .with-icon.low :global(.icon) {
+    color: var(--warning-icon);
+  }
+  .caption.low {
+    color: var(--warning-text);
+    font-weight: 600;
+  }
+  .free-link {
+    justify-self: start;
+    margin-inline-start: 24px;
   }
 
   .backups {

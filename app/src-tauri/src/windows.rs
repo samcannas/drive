@@ -355,6 +355,9 @@ pub fn open_settings(app: &AppHandle) {
     open_settings_at(app, None);
 }
 
+/// The Settings section of the disk space advisor (tray menu, "Free up space…" in the popover).
+pub const SECTION_SPACE: &str = "space";
+
 /// Event telling an open settings window to switch to a section (e.g. `"backups"`).
 pub const EV_SETTINGS_SECTION: &str = "drive://settings-section";
 

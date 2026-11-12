@@ -9,6 +9,7 @@ import type {
   Issue,
   Release,
   Settings,
+  SpaceReport,
   Status,
   TransferList,
   UpdateState,
@@ -26,6 +27,10 @@ export const drive = $state({
   backups: null as BackupOverview | null,
   /** The service is too old to back up folders. */
   backupsUnsupported: false,
+  /** The disk space report. Null until requested (Settings › Disk space asks for it). */
+  space: null as SpaceReport | null,
+  /** The service is too old to check disk space. */
+  spaceUnsupported: false,
   update: null as UpdateState | null,
   /** Newer releases for the version on offer (see `updateVersion`). */
   changelog: [] as Release[],
@@ -79,6 +84,18 @@ export async function refreshBackups() {
   }
 }
 
+/** Asks for the disk space report, starting a scan if there's none yet (or with `rescan`). */
+export async function requestSpace(rescan = false): Promise<void> {
+  try {
+    drive.space = await api.space(rescan);
+    drive.spaceUnsupported = false;
+  } catch (e) {
+    // An older service doesn't know the call.
+    if ((e as { code?: string })?.code === "bad_request") drive.spaceUnsupported = true;
+    else throw e;
+  }
+}
+
 /** The version an update state is about, if any. */
 export function updateVersion(u: UpdateState | null): string | null {
   if (!u) return null;
@@ -113,7 +130,14 @@ export async function refreshUpdate() {
   }
 }
 
-type Opts = { activity?: boolean; issues?: boolean; settings?: boolean; transfers?: boolean; backups?: boolean };
+type Opts = {
+  activity?: boolean;
+  issues?: boolean;
+  settings?: boolean;
+  transfers?: boolean;
+  backups?: boolean;
+  space?: boolean;
+};
 
 async function refreshAll(opts: Opts) {
   try {
@@ -154,6 +178,7 @@ export async function connect(opts: Opts) {
   // The backend only sends these while the popover is visible; showing it fetches the list once.
   if (opts.transfers) await listen<TransferList>(EVENTS.transfers, (t) => (drive.transfers = t));
   if (opts.backups) await listen<BackupOverview>(EVENTS.backups, (b) => (drive.backups = b));
+  if (opts.space) await listen<SpaceReport>(EVENTS.space, (r) => (drive.space = r));
   await listen<UpdateState>(EVENTS.update, setUpdate);
   await listen(EVENTS.popoverShown, () => {
     refreshAll(opts);

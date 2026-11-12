@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use drive_core::ipc::{Call, Event, Hello, Settings, Status, SyncState, TransferList};
+use drive_core::ipc::{Call, Event, Hello, Settings, SpaceReport, Status, SyncState, TransferList};
 use drive_core::ipc_client::{Client, ClientError};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -26,6 +26,9 @@ pub const EV_TRANSFERS: &str = "drive://transfers";
 /// Backed-up folders and suggestions (`ipc::BackupOverview`), on every change and about once
 /// a second while a backup makes progress. Sent to every window (popover and settings).
 pub const EV_BACKUPS: &str = "drive://backups";
+/// The disk space report (`ipc::SpaceReport`): scan progress about twice a second while a scan
+/// runs, and the finished report. Sent to every window.
+pub const EV_SPACE: &str = "drive://space";
 
 /// Error returned to the webview. `code` is an `ipc::ErrorCode` in snake_case, or
 /// `unavailable` / `timeout` when the service could not be reached.
@@ -135,6 +138,9 @@ pub struct Backend {
     info: Mutex<ConnectionInfo>,
     status: Mutex<Status>,
     settings: Mutex<Option<Settings>>,
+    /// The latest disk space report: what "Show in Explorer" may open (see
+    /// `commands::reveal_space_item`).
+    space: Mutex<Option<SpaceReport>>,
     wake: Notify,
     /// Set while quitting or updating: don't start the service again when it goes away.
     stopping: AtomicBool,
@@ -151,6 +157,7 @@ impl Backend {
                 ..Default::default()
             }),
             settings: Mutex::new(None),
+            space: Mutex::new(None),
             wake: Notify::new(),
             stopping: AtomicBool::new(false),
         }
@@ -172,6 +179,16 @@ impl Backend {
 
     pub fn cached_settings(&self) -> Option<Settings> {
         self.settings.lock().unwrap().clone()
+    }
+
+    pub fn space_report(&self) -> Option<SpaceReport> {
+        self.space.lock().unwrap().clone()
+    }
+
+    /// Remembers the latest disk space report. Progress reports of a running scan carry the
+    /// previous report's items, so they replace it too.
+    pub fn set_space_report(&self, r: SpaceReport) {
+        *self.space.lock().unwrap() = Some(r);
     }
 
     /// Stop restarting the service from now on (it is being shut down on purpose).
@@ -353,6 +370,10 @@ impl Backend {
             Event::Transfers(list) => self.forward_transfers(&list),
             Event::Backups(overview) => {
                 let _ = self.app.emit(EV_BACKUPS, overview);
+            }
+            Event::Space(report) => {
+                self.set_space_report(report.clone());
+                let _ = self.app.emit(EV_SPACE, report);
             }
         }
     }

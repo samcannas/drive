@@ -12,16 +12,26 @@
 //            on-demand (Downloads saves space on this PC, Documents is a full copy; turning on takes
 //            about 5 s, turning Downloads off fails for lack of disk space). Add &platform=linux to
 //            see the switch unavailable.
+//            space (the disk is almost full: 51 GB free of 953 GB; Settings › Disk space checks it for
+//            about 6 s and finds large Videos, Downloads and Documents, app caches, programs, the
+//            Drive folder and the Recycle Bin) | space-done (checked 2 hours ago) | space-failed
+//            disk-full (like space, plus a "disk almost full" issue). Add &platform=linux to see
+//            folders that can only be backed up.
 
 import type {
   Activity,
   BackupInfo,
   BackupOverview,
+  DiskUsage,
   FolderSuggestion,
   Issue,
   KnownFolder,
   Release,
   Settings,
+  SpaceAction,
+  SpaceCategory,
+  SpaceItem,
+  SpaceReport,
   Status,
   TransferDirection,
   TransferItem,
@@ -461,6 +471,294 @@ function findBackup(id: unknown): MockBackup | undefined {
   return backupState.folders.find((b) => b.info.id === id);
 }
 
+// ----- Disk space
+
+const win = platform === "windows";
+const DISK_TOTAL = 953 * GB;
+const PINNED = 2 * GB + 150 * MB;
+const SCAN_TICKS = 9;
+const spaceHome = win ? HOME : "/home/alex";
+const join = (...parts: string[]) => parts.join(win ? "\\" : "/");
+
+const disk = {
+  free: scenario.startsWith("space") || scenario === "disk-full" ? 51 * GB : 212 * GB,
+  cache: 6 * GB + 300 * MB,
+};
+const space = {
+  report: null as SpaceReport | null,
+  /** Ticks left while scanning. */
+  scan: null as number | null,
+};
+
+if (scenario === "disk-full") {
+  state.issues.push({
+    id: 4,
+    kind: "disk_full",
+    path: null,
+    message: `Only ${bytes(disk.free)} is free on this ${win ? "PC" : "computer"}. When the disk is full, Drive can't download the files you open.`,
+    created_ms: now - 20 * 60_000,
+    actions: ["find_space", "dismiss"],
+  });
+}
+
+function disks(): DiskUsage[] {
+  if (!win) return [{ path: "/", name: "/", total_bytes: DISK_TOTAL, free_bytes: disk.free, scanned: true }];
+  return [
+    { path: "C:\\", name: "Local Disk (C:)", total_bytes: DISK_TOTAL, free_bytes: disk.free, scanned: true },
+    { path: "D:\\", name: "Data (D:)", total_bytes: 1_863 * GB, free_bytes: 1_210 * GB, scanned: false },
+  ];
+}
+
+function item(path: string, name: string, size: number, files: number, category: SpaceCategory, extra: Partial<SpaceItem> = {}): SpaceItem {
+  return {
+    path,
+    name,
+    bytes: size,
+    files,
+    category,
+    known: null,
+    backup_id: null,
+    on_demand: false,
+    action: null,
+    frees_bytes: 0,
+    caution: null,
+    note: null,
+    children: [],
+    ...extra,
+  };
+}
+
+/** A folder of your own files: Drive can save space in it on Windows, or back it up elsewhere. */
+function ownFolder(known: KnownFolder, name: string, size: number, files: number, extra: Partial<SpaceItem> = {}): SpaceItem {
+  const path = join(spaceHome, name);
+  const backup = backupState.folders.find((b) => b.info.path.toLowerCase() === path.toLowerCase());
+  const onDemand = backup?.info.on_demand ?? false;
+  const action: SpaceAction | null = onDemand ? null : win ? (backup ? "turn_on_save_space" : "save_space") : backup ? null : "back_up";
+  return item(path, name, onDemand ? Math.min(size, KEEP_DEFAULT) : size, files, "user_folder", {
+    known,
+    backup_id: backup?.info.id ?? null,
+    on_demand: onDemand,
+    action,
+    frees_bytes: action === "save_space" || action === "turn_on_save_space" ? Math.max(0, size - KEEP_DEFAULT) : 0,
+    note: !win && backup ? "Backed up. Saving space is available on Windows." : null,
+    ...extra,
+  });
+}
+
+function sampleItems(): SpaceItem[] {
+  const videos = join(spaceHome, "Videos");
+  const docs = join(spaceHome, "Documents");
+  const local = (sub: string) => join(spaceHome, "AppData", "Local", sub);
+  const items: SpaceItem[] = [
+    ownFolder("videos", "Videos", 182 * GB, 1_240, {
+      children: [
+        item(join(videos, "Family 2019-2025"), "Family 2019-2025", 96 * GB, 610, "user_folder"),
+        item(join(videos, "Screen recordings"), "Screen recordings", 48 * GB, 302, "user_folder"),
+        item(join(videos, "Drone"), "Drone", 31 * GB, 88, "user_folder"),
+      ],
+    }),
+    item(win ? join(spaceHome, "AppData") : join(spaceHome, ".cache"), win ? "AppData" : ".cache", 143 * GB, 980_000, "app_data", {
+      note: win
+        ? "Settings and caches your apps keep. Clear caches in the apps themselves."
+        : "Caches your apps keep. Apps download them again when needed.",
+      children: win
+        ? [
+            item(local("Docker"), "Docker", 61 * GB, 40, "developer", {
+              note: "Docker's disk images. Remove ones you don't use in Docker Desktop.",
+            }),
+            item(local("npm-cache"), "npm-cache", 18 * GB, 412_000, "developer"),
+            item(local("Packages"), "Packages", 12 * GB, 88_000, "app_data"),
+            item(local("Temp"), "Temp", 9.4 * GB, 51_000, "temporary", {
+              action: "open_system_cleanup",
+              note: "Files apps no longer need. Windows can delete them for you.",
+            }),
+          ]
+        : [
+            item(join(spaceHome, ".cache", "pip"), "pip", 14 * GB, 90_000, "developer"),
+            item(join(spaceHome, ".cache", "yarn"), "yarn", 9 * GB, 210_000, "developer"),
+          ],
+    }),
+    item(win ? "C:\\Program Files" : "/usr", win ? "Program Files" : "/usr", 118 * GB, 402_000, "apps", {
+      note: win
+        ? "Installed programs and games. Uninstall ones you don't use in Settings › Apps."
+        : "Installed programs. Remove ones you don't use with your package manager.",
+    }),
+    item("", win ? "Windows and system" : "System", 96 * GB, 0, "system", {
+      note: win
+        ? "Windows itself, its page and hibernation files, and folders Drive isn't allowed to read."
+        : "The system itself and folders Drive isn't allowed to read.",
+    }),
+    ownFolder("downloads", "Downloads", 64 * GB, 1_980),
+    ownFolder("documents", "Documents", 41 * GB, 212_000, {
+      caution:
+        "Has 12 code projects. Build tools and code editors open many files at once, which downloads them again. Save space in other folders first.",
+      children: [
+        item(join(docs, "GitHub"), "GitHub", 22 * GB, 180_000, "developer"),
+        item(join(docs, "Thesis"), "Thesis", 3 * GB, 1_400, "user_folder"),
+      ],
+    }),
+    item("", "Other accounts", 14 * GB, 0, "other_users", {
+      note: "Files of other people who use this device. Drive can't read them.",
+    }),
+    item(win ? state.settings.folder : join(spaceHome, "Drive"), "Drive folder", disk.cache + PINNED, 1_830, "drive_folder", {
+      action: disk.cache > 0 ? "free_drive_cache" : null,
+      frees_bytes: disk.cache,
+      note: disk.cache > 0 ? null : "Only files you chose to keep on this device are downloaded.",
+    }),
+    ownFolder("pictures", "Pictures", 6.3 * GB, 3_120),
+  ];
+  if (win) {
+    items.push(
+      item("C:\\Program Files (x86)", "Program Files (x86)", 38 * GB, 160_000, "apps", {
+        note: "Older 32-bit programs and games. Uninstall ones you don't use in Settings › Apps.",
+      }),
+      item(join(spaceHome, "OneDrive"), "OneDrive", 27 * GB, 8_400, "other_cloud", {
+        note: "Managed by OneDrive. To free space here, use Free up space in OneDrive.",
+      }),
+      item("C:\\$Recycle.Bin", "Recycle Bin", 7.2 * GB, 3_100, "recycle_bin", {
+        action: "open_system_cleanup",
+        note: "Files you deleted. Empty the Recycle Bin to free this space.",
+      }),
+    );
+  } else {
+    items.push(
+      item(join(spaceHome, ".local", "share", "Trash"), "Trash", 7.2 * GB, 3_100, "recycle_bin", {
+        note: "Files you deleted. Empty the trash to free this space.",
+      }),
+    );
+  }
+  return items.sort((a, b) => b.bytes - a.bytes);
+}
+
+function finishedReport(started: number | null, finished: number | null): SpaceReport {
+  const items = sampleItems();
+  return {
+    scan: {
+      state: "done",
+      scanned_bytes: DISK_TOTAL - disk.free,
+      scanned_files: 2_418_000,
+      current: null,
+      started_ms: started,
+      finished_ms: finished,
+      error: null,
+    },
+    disks: disks(),
+    saved: {
+      drive_folder_bytes: 148.7 * GB - disk.cache - PINNED,
+      backups_bytes: backupState.folders
+        .filter((b) => b.info.on_demand)
+        .reduce((n, b) => n + Math.max(0, b.info.bytes - b.info.local_bytes), 0),
+    },
+    items,
+    can_free_bytes: items
+      .filter((i) => i.action === "save_space" || i.action === "turn_on_save_space" || i.action === "free_drive_cache")
+      .reduce((n, i) => n + i.frees_bytes, 0),
+  };
+}
+
+const SCAN_FOLDERS = [
+  "Videos/Family 2019-2025/2023 Summer in Croatia",
+  "AppData/Local/Docker/wsl/disk",
+  "AppData/Local/npm-cache/_cacache/content-v2/sha512/4f",
+  "Documents/GitHub/drive/target/debug/deps",
+  "Downloads/Installers",
+  "OneDrive/Pictures/Camera Roll",
+  "Pictures/2026/Lisbon",
+];
+
+function idleReport(): SpaceReport {
+  return {
+    scan: { state: "idle", scanned_bytes: 0, scanned_files: 0, current: null, started_ms: null, finished_ms: null, error: null },
+    disks: disks(),
+    saved: { drive_folder_bytes: 0, backups_bytes: 0 },
+    items: [],
+    can_free_bytes: 0,
+  };
+}
+
+if (scenario === "space-done") space.report = finishedReport(now - 2 * 3_600_000 - 60_000, now - 2 * 3_600_000);
+if (scenario === "space-failed") {
+  space.report = idleReport();
+  space.report.scan = {
+    ...space.report.scan,
+    state: "failed",
+    error: "Drive couldn't read the disk because it was disconnected.",
+  };
+}
+
+function emitSpace() {
+  if (space.report) emit("drive://space", structuredClone(space.report));
+}
+
+function startScan() {
+  const prev = space.report;
+  const report = prev ?? idleReport();
+  report.scan = {
+    state: "scanning",
+    scanned_bytes: 0,
+    scanned_files: 0,
+    current: join(spaceHome, ...SCAN_FOLDERS[0].split("/")),
+    started_ms: Date.now(),
+    finished_ms: prev?.scan.state === "done" ? prev.scan.finished_ms : null,
+    error: null,
+  };
+  report.disks = disks();
+  space.report = report;
+  space.scan = SCAN_TICKS;
+}
+
+setInterval(() => {
+  if (space.scan === null || !space.report) return;
+  if (space.scan === 0) {
+    space.report = finishedReport(space.report.scan.started_ms, Date.now());
+    space.scan = null;
+  } else {
+    const done = SCAN_TICKS - space.scan + 1;
+    const s = space.report.scan;
+    s.scanned_bytes = ((DISK_TOTAL - disk.free) / (SCAN_TICKS + 1)) * done;
+    s.scanned_files = Math.round((2_418_000 / (SCAN_TICKS + 1)) * done);
+    s.current = join(spaceHome, ...SCAN_FOLDERS[done % SCAN_FOLDERS.length].split("/"));
+    space.scan--;
+  }
+  emitSpace();
+}, 700);
+
+/** After an action, the report shows its effect, as a new scan would. */
+function refreshSpace() {
+  if (space.report?.scan.state !== "done") return;
+  space.report = finishedReport(space.report.scan.started_ms, space.report.scan.finished_ms);
+  emitSpace();
+}
+
+function inReport(items: SpaceItem[], path: string): boolean {
+  return items.some((i) => (i.path !== "" && i.path === path) || inReport(i.children, path));
+}
+
+function saveSpace(path: string, keep: number): BackupInfo | Promise<never> {
+  if (!win) return fail("bad_request", "Saving space is available on Windows only for now.");
+  const frees = sampleItems().find((i) => i.path === path)?.frees_bytes ?? 0;
+  let b = backupState.folders.find((f) => f.info.path.toLowerCase() === path.toLowerCase());
+  if (b) {
+    const i = b.info;
+    if (i.state === "converting") return fail("bad_request", `Drive is still switching ${i.name}. Try again when it's done.`);
+    i.keep_bytes = keep;
+    i.on_demand = true;
+    b.convert = { ticks: 7, from: i.bytes, to: Math.min(i.bytes, keep) };
+    Object.assign(i, { state: "converting", detail: `Freeing up space in ${i.name}…` });
+  } else {
+    const added = addBackup(path);
+    if (added instanceof Promise) return added;
+    b = findBackup(added.id)!;
+    Object.assign(b.info, { on_demand: true, keep_bytes: keep });
+  }
+  // The space comes free as files are safely in the cloud; the mock frees it at once.
+  disk.free = Math.min(DISK_TOTAL, disk.free + frees);
+  emitBackups();
+  emit("drive://status", status());
+  refreshSpace();
+  return { ...overview().folders.find((f) => f.id === b!.info.id)! };
+}
+
 // ----- Updates
 
 const MOCK_RELEASES: Release[] = [
@@ -741,13 +1039,15 @@ function status(): Status {
     account: state.account,
     folder: state.settings.folder,
     issues: state.issues.length,
-    cache_bytes: 6 * GB + 300 * MB,
+    cache_bytes: disk.cache,
     cache_limit_bytes: state.settings.cache_limit_bytes,
-    pinned_bytes: 2 * GB + 150 * MB,
+    pinned_bytes: PINNED,
     cloud_bytes: 148 * GB + 700 * MB,
     cloud_files: 23_418,
     last_sync_ms: Date.now() - 40_000,
     pending_delete_confirmation: state.pendingDelete,
+    disk_free_bytes: disk.free,
+    disk_total_bytes: DISK_TOTAL,
   };
   if (scenario === "offline") return { ...base, state: "offline", headline: "Offline – changes will sync when you're back online", pending: 3 };
   if (scenario === "signedout") return { ...base, state: "signed_out", headline: "Sign in to keep syncing" };
@@ -987,6 +1287,40 @@ async function handle(cmd: string, a: Record<string, unknown>): Promise<unknown>
       emitBackups();
       return { ...overview().folders.find((f) => f.id === i.id)! };
     }
+    case "space":
+      if (space.scan === null && (a.rescan || space.report?.scan.state !== "done")) {
+        startScan();
+        emitSpace();
+      }
+      return structuredClone(space.report);
+    case "cancel_space_scan":
+      if (space.scan !== null && space.report) {
+        space.scan = null;
+        const s = space.report.scan;
+        // Back to the previous report, if there was one.
+        Object.assign(s, { state: s.finished_ms ? "done" : "idle", current: null });
+        emitSpace();
+      }
+      return null;
+    case "save_space":
+      return saveSpace(String(a.path ?? ""), typeof a.keepBytes === "number" ? a.keepBytes : KEEP_DEFAULT);
+    case "free_drive_cache": {
+      const freed = disk.cache;
+      disk.cache = 0;
+      disk.free = Math.min(DISK_TOTAL, disk.free + freed);
+      emit("drive://status", status());
+      refreshSpace();
+      return { freed_bytes: freed };
+    }
+    case "reveal_space_item":
+      if (!space.report || !inReport(space.report.items, String(a.path)))
+        return fail("bad_request", "That folder isn't in the disk space report anymore. Check again, then try once more.");
+      console.info(`[mock] open ${a.path}`);
+      return null;
+    case "open_system_cleanup":
+      if (!win) return fail("bad_request", "Storage settings are available on Windows only.");
+      console.info("[mock] open ms-settings:storagesense");
+      return null;
     case "dismiss_backup_suggestions":
       backupState.dismissed = true;
       emitBackups();

@@ -63,19 +63,20 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "Show status", true, None::<&str>)?;
     let open = MenuItem::with_id(app, "open", "Open Drive folder", true, None::<&str>)?;
     let pause = MenuItem::with_id(app, "pause", "Pause syncing", false, None::<&str>)?;
+    let space = MenuItem::with_id(app, "space", "Free up disk space…", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit Drive", true, None::<&str>)?;
     let update = MenuItem::with_id(app, "update", "Restart to update", true, None::<&str>)?;
     let sep1 = PredefinedMenuItem::separator(app)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
     let menu = if cfg!(windows) {
-        Menu::with_items(app, &[&open, &pause, &settings, &sep1, &quit])?
+        Menu::with_items(app, &[&open, &pause, &space, &settings, &sep1, &quit])?
     } else {
         // Linux trays don't deliver clicks, so everything must be reachable from the menu.
         Menu::with_items(
             app,
             &[
-                &status, &show, &sep1, &open, &pause, &settings, &sep2, &quit,
+                &status, &show, &sep1, &open, &pause, &space, &settings, &sep2, &quit,
             ],
         )?
     };
@@ -127,6 +128,7 @@ fn on_menu(app: &AppHandle, id: &str) {
     match id {
         "show" => windows::show_main(app, None),
         "settings" => windows::open_settings(app),
+        "space" => windows::open_settings_at(app, Some(windows::SECTION_SPACE)),
         "open" => match backend.status().folder {
             Some(folder) => crate::commands::open_path(app, &folder),
             None => windows::open_onboarding(app),
