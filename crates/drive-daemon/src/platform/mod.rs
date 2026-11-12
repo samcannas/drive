@@ -55,6 +55,7 @@ pub struct PlatformContext {
     pub account: String,
     /// Whether the folder gets its own entry in Explorer's navigation pane (Windows). Backed-up
     /// folders that save space don't: they appear under "Drive - Backups".
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub show_in_explorer: bool,
 }
 
