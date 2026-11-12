@@ -558,8 +558,19 @@ impl Service {
         let excludes: Vec<String> = excludes
             .into_iter()
             .map(|e| e.trim().to_string())
-            .filter(|e| !e.is_empty() && !e.contains('/') && !e.contains('\\'))
+            .filter(|e| !e.is_empty())
             .collect();
+        if let Some(bad) = excludes
+            .iter()
+            .find(|e| e.contains('/') || e.contains('\\'))
+        {
+            return Err(rpc(
+                ErrorCode::BadRequest,
+                format!(
+                    "\"{bad}\" contains a slash. Use a file or folder name, like node_modules or *.iso."
+                ),
+            ));
+        }
         {
             let _ops = self.backup_ops.lock().await;
             let m = self.need_manager()?;
