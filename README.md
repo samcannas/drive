@@ -77,23 +77,18 @@ Run `drive --help` for the list.
 
 ## Back up other folders
 
-Desktop, Documents, Downloads or any other folder can be backed up **without moving it**.
-OneDrive's "Known Folder Move" relocates folders; Drive doesn't. Each folder is copied,
-encrypted, into your vault under `Backups/<this PC>/<folder>`. On your other devices it shows
-up in the Drive folder, so a dual-boot Linux can open the Windows Documents backup.
+Drive can also protect folders outside the Drive folder, like Desktop, Documents or Downloads.
+They stay where they are; Drive only keeps an encrypted copy in your vault.
 
-- Set it up in **Settings → Backups**, or with `drive backup add <folder>` and `drive backup list`.
-- Drive never moves, changes or deletes anything in a backed-up folder. Files you delete there
-  are removed from the cloud copy too, but stay in the uloz.to trash for 30 days.
-- Build and dependency folders are skipped: `node_modules`, Python virtual environments,
-  folders tagged with `CACHEDIR.TAG` (Rust `target`, many tool caches), `.next`, `.cache` and
-  others. On a developer's Documents folder this is usually the bulk of the files. Edit the
-  skip list per folder in Settings, or with `drive backup skip`.
-- Each folder has an off switch (`drive backup off`) that keeps the cloud copy. Turning it
-  back on doesn't upload unchanged files again. **Stop backing up** can keep the cloud copy
-  or move it to the uloz.to trash.
-- If a backed-up folder disappears (an unplugged drive, a renamed folder), Drive reports it and
-  leaves the cloud copy alone.
+1. **See what's protected.** Settings → Backups shows each backed-up folder, how much of it is
+   in the cloud, and when it was last fully backed up.
+2. **Get a suggestion.** Drive notices your Desktop, Documents, Downloads, Pictures, Videos and
+   Music folders and tells you which aren't backed up yet and how big they are.
+3. **Back up with one click.** Pick a folder and Drive keeps a copy up to date as you work. It
+   never moves, changes or deletes your files, and each folder has an off switch.
+
+Build folders like `node_modules` are skipped. Deleted files stay in the uloz.to trash for 30
+days. From the command line: `drive backup list`, `drive backup add <folder>`.
 
 ## uloz.to notes
 
