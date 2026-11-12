@@ -63,6 +63,17 @@ Run `drive --help` for the list.
 - **Your disk fills up:** cached copies are cleared first. Files you've pinned are never
   removed.
 
+## Transfers
+
+1. **See what's going on.** Every upload and download is listed with its progress and time
+   left. If something is waiting, it tells you why, and asks you to keep the PC on for long
+   uploads.
+2. **Stay in control.** Pause, resume or upload any file right away, or hold big ones for
+   tonight so they don't slow your day.
+3. **Let Drive handle it.** Big files upload in checked pieces and pick up where they left
+   off after a restart or a dropped connection. If uploads make your internet sluggish, Drive
+   slows them down until it's smooth again, and only then.
+
 ## Back up other folders
 
 Desktop, Documents, Downloads or any other folder can be backed up **without moving it**.
