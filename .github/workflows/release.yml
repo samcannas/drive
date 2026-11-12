@@ -136,8 +136,12 @@ jobs:
           # Plain-HTTP Ubuntu mirrors (azure.archive / archive / security) are sometimes
           # unreachable from GitHub's runners while HTTPS works: use an HTTPS mirror.
           sudo sed -i -E 's#http://(azure\.archive|archive|security)\.ubuntu\.com/ubuntu#https://mirrors.edge.kernel.org/ubuntu#g' /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+          # Faster apt on a throwaway runner: no Contents indexes (tens of MB, only for
+          # command-not-found), no translations, no man-db rebuild, no fsync per file.
+          sudo rm -f /etc/apt/apt.conf.d/50command-not-found /var/lib/man-db/auto-update
+          echo 'Acquire::Languages "none";' | sudo tee /etc/apt/apt.conf.d/99-no-translations >/dev/null
           apt update
-          apt install -y --no-install-recommends \
+          apt install -y --no-install-recommends -o Dpkg::Options::=--force-unsafe-io \
             libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev             libssl-dev patchelf file
 
       - name: Set version ${{ env.VERSION }}
@@ -180,7 +184,7 @@ jobs:
           # linuxdeploy strips every library it copies into the AppImage; Ubuntu's are
           # already stripped, so that only costs time.
           NO_STRIP: "true"
-        run: pnpm tauri bundle --ci --bundles appimage --config release.conf.json
+        run: pnpm tauri bundle --ci --verbose --bundles appimage --config release.conf.json
 
       - name: Finish the Arch package
         if: always()
