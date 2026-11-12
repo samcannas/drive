@@ -130,6 +130,10 @@ pub(super) fn merge_status(mut m: Status, b: &Status) -> Status {
         m.state = b.state;
         m.headline = match b.state {
             SyncState::Syncing if b.uploading > 0 => format!("Backing up {}", files(b.uploading)),
+            // On-demand backed-up folders: opened files, or switching back to a full copy.
+            SyncState::Syncing if b.downloading > 0 => {
+                format!("Downloading {}", files(b.downloading))
+            }
             SyncState::Syncing => "Backing up your folders".to_string(),
             _ => b.headline.clone(),
         };

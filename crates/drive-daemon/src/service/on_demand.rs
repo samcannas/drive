@@ -328,10 +328,10 @@ impl Service {
 
     /// Fills in an on-demand folder's progress from its engine.
     pub(super) fn on_demand_info(&self, info: &mut BackupInfo) {
-        if !info.on_demand {
-            return;
-        }
         let Some(od) = self.on_demand_for(&info.id) else {
+            if !info.on_demand {
+                return;
+            }
             if let Some(p) = self.on_demand_problems.lock().unwrap().get(&info.id) {
                 info.state = BackupState::Problem;
                 info.detail = Some(p.clone());

@@ -1213,7 +1213,8 @@ impl Manager {
                 skipped_online_only: r.online_only,
                 added_ms: f.added_ms,
                 last_complete_ms: r.last_complete_ms,
-                on_demand: f.on_demand,
+                // The mode it's in or switching to (switching back counts as a full copy).
+                on_demand: f.on_demand && !f.leaving_on_demand,
                 on_demand_available: crate::platform::ON_DEMAND_FOLDERS,
                 local_bytes: s.bytes,
                 keep_bytes: f.keep_bytes.unwrap_or(DEFAULT_KEEP_BYTES),

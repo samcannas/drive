@@ -760,7 +760,7 @@
                       aria-label="Back up {b.name}"
                       aria-describedby="backup-{b.id}-state"
                       checked={b.enabled}
-                      disabled={converting}
+                      disabled={converting || b.on_demand}
                       onchange={(e) => setBackupEnabled(b, e.currentTarget)}
                     />
                   </div>
@@ -798,7 +798,7 @@
                           class="switch"
                           aria-describedby={b.on_demand ? `${od}-desc ${od}-storage` : `${od}-desc`}
                           checked={b.on_demand}
-                          disabled={!b.on_demand_available || converting}
+                          disabled={!b.on_demand_available || converting || !b.enabled}
                           onchange={(e) => toggleOnDemand(b, e.currentTarget)}
                         />
                       </div>
@@ -825,11 +825,26 @@
                     {#if backupError?.key === b.id}
                       <p class="error-text" role="alert"><Icon name="alert" size={14} />{backupError.text}</p>
                     {/if}
+                    {#if b.on_demand}
+                      <p class="caption secondary" id="backup-{b.id}-locked">
+                        To pause, stop or change skipped items, switch off Save space first.
+                      </p>
+                    {/if}
                     <div class="backup-actions">
-                      <button class="btn subtle" onclick={() => openSkip(b)}>
+                      <button
+                        class="btn subtle"
+                        disabled={b.on_demand || converting}
+                        aria-describedby={b.on_demand ? `backup-${b.id}-locked` : undefined}
+                        onclick={() => openSkip(b)}
+                      >
                         Edit skipped items…<span class="visually-hidden"> in {b.name}</span>
                       </button>
-                      <button class="btn subtle" onclick={() => openStop(b)}>
+                      <button
+                        class="btn subtle"
+                        disabled={b.on_demand || converting}
+                        aria-describedby={b.on_demand ? `backup-${b.id}-locked` : undefined}
+                        onclick={() => openStop(b)}
+                      >
                         Stop backing up…<span class="visually-hidden"> {b.name}</span>
                       </button>
                     </div>
