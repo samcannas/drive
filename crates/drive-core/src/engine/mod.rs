@@ -62,6 +62,9 @@ pub struct EngineConfig {
     pub min_free_bytes: u64,
     /// Large uploads wait for this window ("upload large files overnight"); `None` = off.
     pub night: Option<schedule::NightWindow>,
+    /// Large files wait for `night` on their own ("Upload large files overnight"). Without
+    /// it the window still applies to files the user holds for tonight one by one.
+    pub night_auto: bool,
     /// Uploads at least this large wait for the night window.
     pub night_min_bytes: u64,
     /// Mirror engine (folder backups): the local side is the source of truth and is never
@@ -89,6 +92,7 @@ impl Default for EngineConfig {
             debounce: Duration::from_secs(3),
             min_free_bytes: 2 * 1024 * 1024 * 1024,
             night: None,
+            night_auto: false,
             night_min_bytes: 200 * 1024 * 1024,
             mirror: false,
             exclude_remote: Vec::new(),
@@ -2486,6 +2490,13 @@ impl Engine {
             .lock()
             .unwrap()
             .insert(n.id, cancel.clone());
+        // Paused or held for tonight after this upload was picked (before the cancel handle
+        // existed): don't start it. From here on a change cancels it through the handle.
+        if self.db.node(n.id)?.is_some_and(|cur| self.held(&cur)) {
+            self.upload_cancels.lock().unwrap().remove(&n.id);
+            debug!("{} was held before its upload started", item.path);
+            return Ok(());
+        }
         let db = self.db.clone();
         let node_id = n.id;
         let checkpoint: Arc<dyn Fn(&ResumeState) + Send + Sync> =

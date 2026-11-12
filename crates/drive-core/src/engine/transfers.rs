@@ -77,9 +77,28 @@ impl Engine {
         match cfg.night {
             Some(w) if !w.is_open() => UploadGate {
                 night_closed: true,
-                night_min_bytes: cfg.night_min_bytes,
+                // Without automatic holding, no size qualifies. (i64::MAX, not u64::MAX: the
+                // database takes it as a signed integer, where u64::MAX would be -1 and hold
+                // every file.)
+                night_min_bytes: if cfg.night_auto {
+                    cfg.night_min_bytes
+                } else {
+                    i64::MAX as u64
+                },
             },
             _ => UploadGate::default(),
+        }
+    }
+
+    /// Whether this file's upload is held now: paused, held for tonight, or (with automatic
+    /// overnight uploads) large, while the night window is closed. Same rule as the queue's.
+    pub(super) fn held(&self, n: &Node) -> bool {
+        let gate = self.upload_gate();
+        match n.upload_mode {
+            upload_mode::PAUSED => true,
+            upload_mode::TONIGHT => gate.night_closed,
+            upload_mode::AUTO => gate.night_closed && n.size >= gate.night_min_bytes,
+            _ => false,
         }
     }
 

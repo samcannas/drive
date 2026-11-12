@@ -699,6 +699,7 @@ async fn large_files_wait_for_the_night_window_unless_forced() {
         end: (start + 60) % (24 * 60),
     });
     cfg.night_min_bytes = 500_000;
+    cfg.night_auto = true;
     let a = device_with(remote.clone(), cfg, Arc::new(Db::open_in_memory().unwrap()));
     a.write("small.txt", b"hello");
     a.write("huge.mov", &big(800_000));
@@ -816,4 +817,53 @@ async fn wait_for(limit: Duration, mut f: impl FnMut() -> bool) -> bool {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     f()
+}
+
+/// "Upload tonight" on one file works whether or not large files wait automatically (it
+/// used to do nothing unless "Upload large files overnight" was on), and "Upload now" undoes
+/// it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upload_tonight_holds_one_file_without_the_overnight_setting() {
+    let (mem, remote) = vault();
+    let now = chrono::Local::now();
+    let start = ((now.time().hour() + 2) % 24) as u16 * 60;
+    let mut cfg = config("A");
+    cfg.night = Some(NightWindow {
+        start,
+        end: (start + 60) % (24 * 60),
+    });
+    cfg.night_min_bytes = 500_000;
+    cfg.night_auto = false;
+    let a = device_with(remote.clone(), cfg, Arc::new(Db::open_in_memory().unwrap()));
+
+    // Large files don't wait on their own.
+    a.write("big.mov", &big(800_000));
+    a.sync().await;
+    assert!(item(&a, "big.mov").is_none(), "uploaded right away");
+
+    // One file held for tonight shows as scheduled and doesn't upload...
+    mem.set_offline(true);
+    a.write("later.mov", &big(300_000));
+    until("listed", || item(&a, "later.mov").is_some()).await;
+    let id = item(&a, "later.mov").unwrap().id;
+    a.engine
+        .set_transfer_mode(id, TransferMode::Tonight)
+        .unwrap();
+    let held = item(&a, "later.mov").unwrap();
+    assert_eq!(held.state, TransferState::Scheduled, "{held:?}");
+    assert!(
+        held.reason.as_deref().unwrap_or("").contains("tonight"),
+        "{held:?}"
+    );
+    mem.set_offline(false);
+    retry_now(&a);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Still listed (not uploaded) and still scheduled.
+    let still = item(&a, "later.mov").expect("uploaded before tonight");
+    assert_eq!(still.state, TransferState::Scheduled);
+
+    // ...until "Upload now".
+    a.engine.set_transfer_mode(id, TransferMode::Now).unwrap();
+    a.sync().await;
+    assert!(item(&a, "later.mov").is_none(), "uploaded after Upload now");
 }

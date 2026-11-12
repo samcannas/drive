@@ -175,12 +175,14 @@ export function groupsOf(list: TransferList): Group[] {
   return [
     { key: "active", label: "Active", items: list.items.filter((t) => isMoving(t.state)) },
     { key: "waiting", label: "Waiting", items: list.items.filter((t) => isPending(t.state)) },
-    { key: "held", label: "Paused and scheduled", items: list.items.filter((t) => isHeld(t.state)) },
+    { key: "scheduled", label: "Scheduled", items: list.items.filter((t) => t.state === "scheduled") },
+    { key: "paused", label: "Paused", items: list.items.filter((t) => t.state === "paused") },
   ].filter((g) => g.items.length > 0);
 }
 
-/** Moving first, then waiting, then held; the service already sends them that way. */
+/** Moving first, then waiting, scheduled, paused; the service sends them nearly that way. */
 export function ordered(items: TransferItem[]): TransferItem[] {
-  const rank = (t: TransferItem) => (isMoving(t.state) ? 0 : isPending(t.state) ? 1 : 2);
+  const rank = (t: TransferItem) =>
+    isMoving(t.state) ? 0 : isPending(t.state) ? 1 : t.state === "scheduled" ? 2 : 3;
   return [...items].sort((a, b) => rank(a) - rank(b));
 }

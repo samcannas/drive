@@ -215,11 +215,8 @@ impl Service {
             probe_target: dev_remote_dir()
                 .is_none()
                 .then(|| drive_core::ulozto::PROBE_TARGET.to_string()),
-            night: if cfg.night_uploads {
-                drive_core::engine::schedule::NightWindow::parse(&cfg.night_start, &cfg.night_end)
-            } else {
-                None
-            },
+            night: night_window(cfg).0,
+            night_auto: night_window(cfg).1,
             night_min_bytes: cfg.night_min_bytes,
             ..Default::default()
         }
@@ -968,9 +965,32 @@ pub fn recovery_kit(account: &Account, encryption_password: &str) -> RecoveryKit
     }
 }
 
+/// The overnight window, and whether large files wait for it on their own. The window always
+/// exists: files held for tonight one by one use it whatever the overnight setting says (it
+/// used to exist only with the setting on, so "Upload tonight" quietly did nothing).
+fn night_window(cfg: &Config) -> (Option<drive_core::engine::schedule::NightWindow>, bool) {
+    (
+        drive_core::engine::schedule::NightWindow::parse(&cfg.night_start, &cfg.night_end),
+        cfg.night_uploads,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_night_window_exists_without_the_overnight_setting() {
+        let mut cfg = Config {
+            night_uploads: false,
+            ..Config::default()
+        };
+        let (window, auto) = night_window(&cfg);
+        assert!(window.is_some(), "Upload tonight needs the window");
+        assert!(!auto, "large files don't wait on their own");
+        cfg.night_uploads = true;
+        assert!(night_window(&cfg).1);
+    }
 
     #[test]
     fn vault_paths() {
