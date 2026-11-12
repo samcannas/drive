@@ -131,6 +131,43 @@ async fn chunked_upload_roundtrips_and_is_verified() {
 }
 
 #[tokio::test]
+async fn a_chunk_stuck_on_a_slow_connection_is_sent_again_on_a_new_one() {
+    let fake = Fake::start().await;
+    let plain = data(1_000_000, 4);
+    let chunks = crypt::encrypted_size(plain.len() as u64).div_ceil(CHUNK) as u32;
+    let slow = chunks - 2; // late enough that earlier chunks tell what's usual
+    fake.faults(|f| f.slow_chunk = Some((slow, Duration::from_secs(60))));
+    let remote = crypt_remote(client(&fake, |c| c.max_chunk_streams = 2));
+    let run = Run::new(ResumeState::default());
+    let started = Instant::now();
+    up(&remote, &run, &plain).await.unwrap();
+    // Waited a few seconds on the slow connection, not the whole minute.
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+    let s = fake.stats();
+    assert_eq!(s.chunk_posts_by_number[&slow], 2, "sent again once");
+    assert_eq!(s.chunk_posts, chunks + 1);
+    assert_eq!(plain_of(&fake), plain);
+    assert_eq!(run.progress.done(), plain.len() as u64);
+}
+
+#[tokio::test]
+async fn uniformly_slow_chunks_are_not_sent_again() {
+    // A slow link (every chunk slow) is not a bad connection.
+    let fake = Fake::start().await;
+    fake.faults(|f| f.chunk_delay = Duration::from_millis(400));
+    let plain = data(700_000, 5);
+    let chunks = crypt::encrypted_size(plain.len() as u64).div_ceil(CHUNK) as u32;
+    let remote = crypt_remote(client(&fake, |_| {}));
+    let run = Run::new(ResumeState::default());
+    up(&remote, &run, &plain).await.unwrap();
+    assert_eq!(fake.stats().chunk_posts, chunks, "each chunk sent once");
+}
+
+#[tokio::test]
 async fn resumes_after_restart_without_resending_confirmed_chunks() {
     let fake = Fake::start().await;
     fake.faults(|f| f.chunk_delay = Duration::from_millis(30));

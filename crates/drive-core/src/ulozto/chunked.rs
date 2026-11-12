@@ -19,7 +19,10 @@
 //! * all state needed to continue lives in the [`ResumeState`], checkpointed after every
 //!   step, so an upload continues after a restart with only the missing chunks;
 //! * several chunks upload in parallel, adapted by [`AdaptiveLimit`];
-//! * every chunk has a stall watchdog and its own retries.
+//! * every chunk has a stall watchdog and its own retries;
+//! * a chunk going far slower than chunks usually do is sent again on a new connection. Some
+//!   connections to the upload servers get a route that's ~25× slower than the others (seen
+//!   from Canada: ~95 KB/s against ~2.5 MB/s), and a reused connection stays on its route.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -234,6 +237,78 @@ impl AdaptiveLimit {
         s.before_increase = None;
         s.no_increase_until = Some(now + Duration::from_secs(120));
     }
+}
+
+/// "2.4 MB/s", "96 KB/s".
+fn speed(bytes_per_sec: f64) -> String {
+    if bytes_per_sec >= 1024.0 * 1024.0 {
+        format!("{:.1} MB/s", bytes_per_sec / (1024.0 * 1024.0))
+    } else {
+        format!("{:.0} KB/s", bytes_per_sec / 1024.0)
+    }
+}
+
+// ---- slow connections ------------------------------------------------------------------------
+
+/// How fast recent chunks went, to tell a connection stuck on a slow route from a slow link.
+#[derive(Default)]
+pub struct ChunkSpeed {
+    recent: std::sync::Mutex<VecDeque<(Instant, f64)>>,
+}
+
+/// Chunks within this window describe how fast the link is now.
+const SPEED_WINDOW: Duration = Duration::from_secs(180);
+/// A chunk this many times slower than usual is on a bad connection.
+const SLOW_FACTOR: f64 = 5.0;
+/// Never give up on a chunk sooner than this.
+const SLOW_MIN: Duration = Duration::from_secs(6);
+/// New connections per chunk before accepting whatever speed we get.
+const MAX_REDIALS: u32 = 3;
+
+impl ChunkSpeed {
+    /// A chunk of `bytes` took `active` (not counting our own speed limit).
+    pub fn record(&self, bytes: u64, active: Duration, now: Instant) {
+        if active.is_zero() {
+            return;
+        }
+        let mut r = self.recent.lock().unwrap();
+        r.push_back((now, bytes as f64 / active.as_secs_f64()));
+        while r.len() > 20 || r.front().is_some_and(|(t, _)| now - *t > SPEED_WINDOW) {
+            r.pop_front();
+        }
+    }
+
+    /// Median speed of recent chunks (bytes/s), once there are enough of them.
+    pub fn typical(&self, now: Instant) -> Option<f64> {
+        let r = self.recent.lock().unwrap();
+        let mut v: Vec<f64> = r
+            .iter()
+            .filter(|(t, _)| now - *t <= SPEED_WINDOW)
+            .map(|(_, s)| *s)
+            .collect();
+        if v.len() < 3 {
+            return None;
+        }
+        v.sort_by(|a, b| a.total_cmp(b));
+        Some(v[v.len() / 2])
+    }
+
+    /// How long a chunk of `bytes` may take before its connection counts as stuck.
+    pub fn patience(&self, bytes: u64, now: Instant) -> Option<Duration> {
+        let typical = self.typical(now)?;
+        let usual = Duration::from_secs_f64(bytes as f64 / typical.max(1.0));
+        Some((usual.mul_f64(SLOW_FACTOR)).max(SLOW_MIN))
+    }
+}
+
+/// Why sending a chunk didn't work.
+enum PostError {
+    /// Far slower than usual: send it again on a new connection.
+    Slow {
+        rate: f64,
+        typical: f64,
+    },
+    Remote(RemoteError),
 }
 
 pub struct LimitPermit<'a> {
@@ -741,16 +816,31 @@ impl UlozClient {
         let data = Bytes::from(data);
         let url = format!("{url_base}/{n}");
         let mut attempt = 0;
+        let mut redials = 0;
         loop {
             attempt += 1;
             let started = Instant::now();
-            match self.post_chunk(&url, data.clone(), up).await {
-                Ok(()) => {
-                    self.chunk_limit.success(len as u64, Instant::now());
+            let watch_speed = redials < MAX_REDIALS;
+            match self.post_chunk(&url, data.clone(), up, watch_speed).await {
+                Ok(active) => {
+                    let now = Instant::now();
+                    self.chunk_limit.success(len as u64, now);
+                    self.chunk_speed.record(len as u64, active, now);
                     debug!("chunk {n} sent in {:?}", started.elapsed());
                     return Ok(n);
                 }
-                Err(e) if attempt < CHUNK_RETRIES && (e.is_transient()) => {
+                Err(PostError::Slow { rate, typical }) => {
+                    // Not the server pushing back: a bad route. Dropping the request closed
+                    // its connection; the next one gets a new connection (and route).
+                    redials += 1;
+                    attempt -= 1;
+                    info!(
+                        "chunk {n} went at {} while chunks usually go at {}: sending it again on a new connection",
+                        speed(rate),
+                        speed(typical)
+                    );
+                }
+                Err(PostError::Remote(e)) if attempt < CHUNK_RETRIES && (e.is_transient()) => {
                     self.chunk_limit.backoff(Instant::now());
                     let wait = Duration::from_millis(500 * (1 << attempt.min(5)));
                     debug!("chunk {n} failed ({e}); retrying in {wait:?}");
@@ -759,33 +849,54 @@ impl UlozClient {
                         _ = up.cancel.cancelled() => return Err(Stop::Fail(RemoteError::Cancelled)),
                     }
                 }
-                Err(e) if e.is_transient() => return Err(Stop::Fail(e)),
+                Err(PostError::Remote(e)) if e.is_transient() => return Err(Stop::Fail(e)),
                 // 4xx on a chunk: the batch is no longer accepting data (expired/discarded).
-                Err(e) => return Err(Stop::NewBatch(format!("chunk {n} refused: {e}"))),
+                Err(PostError::Remote(e)) => {
+                    return Err(Stop::NewBatch(format!("chunk {n} refused: {e}")));
+                }
             }
         }
     }
 
-    /// Sends one chunk, paced by the meter and guarded by the stall watchdog.
+    /// Sends one chunk, paced by the meter and guarded by the stall watchdog and (with
+    /// `watch_speed`) the slow-connection check. Returns how long it took, not counting time
+    /// held back by our own speed limit.
     async fn post_chunk(
         &self,
         url: &str,
         data: Bytes,
         up: &ResumableUpload,
-    ) -> Result<(), RemoteError> {
+        watch_speed: bool,
+    ) -> Result<Duration, PostError> {
         const PIECE: usize = 256 * 1024;
         let total = data.len() as u64;
+        let started = Instant::now();
+        let patience = if watch_speed {
+            self.chunk_speed.patience(total, started)
+        } else {
+            None
+        };
         let sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // Time spent waiting for our own speed limit, which says nothing about the connection.
+        let held_us = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (meter, progress, scale) = (up.meter.clone(), up.progress.clone(), up.scale);
         let counter = sent.clone();
+        let held = held_us.clone();
         let pieces: Vec<Bytes> = (0..data.len())
             .step_by(PIECE)
             .map(|i| data.slice(i..(i + PIECE).min(data.len())))
             .collect();
         let body = futures::stream::iter(pieces).then(move |piece| {
-            let (meter, progress, counter) = (meter.clone(), progress.clone(), counter.clone());
+            let (meter, progress, counter, held) = (
+                meter.clone(),
+                progress.clone(),
+                counter.clone(),
+                held.clone(),
+            );
             async move {
+                let wait = Instant::now();
                 meter.consume(piece.len()).await;
+                held.fetch_add(wait.elapsed().as_micros() as u64, Ordering::Relaxed);
                 counter.fetch_add(piece.len() as u64, Ordering::Relaxed);
                 progress.in_flight.fetch_add(
                     (piece.len() as f64 * scale).round() as u64,
@@ -810,6 +921,11 @@ impl UlozClient {
                 });
         };
         tokio::pin!(send);
+        let active = || {
+            started
+                .elapsed()
+                .saturating_sub(Duration::from_micros(held_us.load(Ordering::Relaxed)))
+        };
         let (mut seen, mut since) = (0u64, Instant::now());
         let resp = loop {
             tokio::select! {
@@ -818,6 +934,15 @@ impl UlozClient {
                     let s = sent.load(Ordering::Relaxed);
                     if s != seen {
                         (seen, since) = (s, Instant::now());
+                    }
+                    if let Some(p) = patience
+                        && active() > p
+                    {
+                        // Dropping the request below closes this connection.
+                        undo(&up.progress);
+                        let typical = self.chunk_speed.typical(Instant::now()).unwrap_or(0.0);
+                        let rate = s as f64 / active().as_secs_f64().max(0.001);
+                        return Err(PostError::Slow { rate, typical });
                     }
                     let limit = if s >= total { self.cfg.response_wait } else { self.cfg.stall_timeout };
                     if since.elapsed() > limit {
@@ -829,6 +954,7 @@ impl UlozClient {
                 }
             }
         };
+        let took = active();
         let result = match resp {
             Ok(resp) => {
                 let status = resp.status();
@@ -845,7 +971,7 @@ impl UlozClient {
         };
         // The chunk's bytes move from "in flight" to "confirmed" in the caller on success.
         undo(&up.progress);
-        result
+        result.map(|()| took).map_err(PostError::Remote)
     }
 
     async fn status(&self, b: &Batch) -> Result<ServerState, Stop> {
@@ -1109,6 +1235,24 @@ fn check_body(status: StatusCode, text: &str) -> Result<(), RemoteError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_speed_needs_a_few_samples_and_uses_the_median() {
+        let sp = ChunkSpeed::default();
+        let t = Instant::now();
+        let mb = 1024 * 1024;
+        assert_eq!(sp.patience(4 * mb, t), None);
+        sp.record(4 * mb, Duration::from_secs(2), t); // 2 MB/s
+        sp.record(4 * mb, Duration::from_secs(40), t); // a slow one
+        assert_eq!(sp.patience(4 * mb, t), None, "two samples aren't enough");
+        sp.record(4 * mb, Duration::from_secs(1), t); // 4 MB/s
+        // Median 2 MB/s: a 4 MB chunk usually takes 2 s, so 10 s is too slow.
+        assert_eq!(sp.patience(4 * mb, t), Some(Duration::from_secs(10)));
+        // Small chunks still get at least the minimum.
+        assert_eq!(sp.patience(mb / 4, t), Some(SLOW_MIN));
+        // Old samples stop counting.
+        assert_eq!(sp.patience(4 * mb, t + SPEED_WINDOW * 2), None);
+    }
 
     #[test]
     fn chunk_sizes() {

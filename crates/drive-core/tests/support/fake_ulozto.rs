@@ -31,6 +31,9 @@ pub struct Faults {
     pub stall_chunk: Option<u32>,
     /// Every chunk post waits this long before answering.
     pub chunk_delay: Duration,
+    /// The first post of this chunk number crawls (answers after this long): a connection
+    /// stuck on a slow route. Later posts of it are normal.
+    pub slow_chunk: Option<(u32, Duration)>,
     /// The assembled file's CRC32 won't match (server reports bad-crc32).
     pub corrupt_assembly: bool,
     /// Status stays "processing" this many polls after the last chunk.
@@ -93,6 +96,7 @@ pub struct FakeState {
     batches: HashMap<String, BatchRec>,
     next: u64,
     stalled_once: bool,
+    slowed_once: bool,
     url: String,
 }
 
@@ -357,6 +361,14 @@ async fn chunk(
         if stall {
             st.stalled_once = true;
         }
+        let mut delay = st.faults.chunk_delay;
+        if let Some((slow, d)) = st.faults.slow_chunk
+            && slow == n
+            && !st.slowed_once
+        {
+            st.slowed_once = true;
+            delay = d;
+        }
         let fail = st.faults.fail_chunks > 0;
         if fail {
             st.faults.fail_chunks -= 1;
@@ -365,7 +377,7 @@ async fn chunk(
         if throttle {
             st.faults.throttle_chunks -= 1;
         }
-        (st.faults.chunk_delay, stall, fail, throttle)
+        (delay, stall, fail, throttle)
     };
     let _guard = ConcurrencyGuard(s.clone());
     if stall {

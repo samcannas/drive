@@ -82,7 +82,10 @@ impl UlozConfig {
             response_wait: Duration::from_secs(600),
             chunked_min_size: 16 * 1024 * 1024,
             chunk_size: None,
-            max_chunk_streams: 4,
+            // The streams adapt below this (more only while throughput keeps improving). One
+            // connection to uloz.to's upload servers in Prague carries ~2–3 MB/s from America,
+            // so fast uplinks need several.
+            max_chunk_streams: 8,
             status_poll: Duration::from_secs(2),
         }
     }
@@ -145,6 +148,8 @@ pub struct UlozClient {
     links: std::sync::Mutex<HashMap<String, (String, std::time::Instant)>>,
     /// Chunk streams in flight, adapted to how the server copes (AIMD).
     chunk_limit: chunked::AdaptiveLimit,
+    /// How fast chunks usually go, to spot connections stuck on a slow route.
+    chunk_speed: chunked::ChunkSpeed,
     /// Set when the chunked API refused us; single-request uploads are used until then.
     chunked_unavailable_until: std::sync::Mutex<Option<std::time::Instant>>,
 }
@@ -230,6 +235,7 @@ impl UlozClient {
             pacer: Pacer::new(4),
             links: std::sync::Mutex::new(HashMap::new()),
             chunk_limit: chunked::AdaptiveLimit::new(2, cfg_max_streams),
+            chunk_speed: chunked::ChunkSpeed::default(),
             chunked_unavailable_until: std::sync::Mutex::new(None),
         })
     }
