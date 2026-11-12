@@ -286,6 +286,8 @@ impl Service {
             cache_dir: self.paths.cache_dir.join(format!("ondemand-{}", folder.id)),
             display_name: format!("{} (Drive)", folder.name),
             account: on_demand_account(&account.login, &folder.id),
+            // Reached through "Drive - Backups", not as another drive of its own.
+            show_in_explorer: false,
         };
         // Preparing reads the whole folder (it may be large).
         let platform = tokio::task::spawn_blocking(move || platform::prepare(ctx))

@@ -43,6 +43,9 @@ struct Running {
     vault_root: String,
 }
 
+/// "Drive - Backups": where it is and the links it holds (name, folder).
+type BackupsFolderState = (PathBuf, Vec<(String, PathBuf)>);
+
 struct Inner {
     config: Config,
     running: Option<Running>,
@@ -66,6 +69,8 @@ pub struct Service {
         std::sync::Mutex<std::collections::BTreeMap<i64, drive_core::ipc::TransferList>>,
     /// Backed-up folders running on-demand ("Save space").
     on_demand: std::sync::Mutex<Vec<Arc<on_demand::OnDemand>>>,
+    /// What "Drive - Backups" was last made to hold (to skip unchanged updates).
+    backups_folder: std::sync::Mutex<Option<BackupsFolderState>>,
     /// Why an on-demand folder couldn't start, by backup id.
     on_demand_problems: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
@@ -145,6 +150,7 @@ impl Service {
             last_transfers: std::sync::Mutex::new(Default::default()),
             on_demand: std::sync::Mutex::new(Vec::new()),
             on_demand_problems: std::sync::Mutex::new(Default::default()),
+            backups_folder: std::sync::Mutex::new(None),
         }))
     }
 
@@ -155,6 +161,8 @@ impl Service {
     /// Starts syncing if an account is configured.
     pub async fn start(self: &Arc<Self>) {
         tokio::spawn(self.clone().backups_loop());
+        // Brings "Drive - Backups" up to date (also after a crash or a settings change).
+        self.backups_changed.notify_one();
         let mut inner = self.inner.lock().await;
         if inner.config.account.is_none() {
             info!("no account connected yet");
@@ -298,6 +306,7 @@ impl Service {
             cache_dir: self.paths.cache_dir.join("content"),
             display_name: "Drive".into(),
             account: account.login.clone(),
+            show_in_explorer: true,
         })
         .context("setting up the Drive folder")?;
         engine.set_local(platform.local_side());
@@ -845,6 +854,9 @@ impl Service {
         // Backups belong to the account: a different account must not start receiving them.
         inner.config.backups.clear();
         inner.config.backup_cloud = None;
+        if let Some(a) = inner.config.account.clone() {
+            self.refresh_backups_folder(&inner.config, Some(&a.login));
+        }
         let folder = inner.config.folder_or_default();
         if let Some(r) = inner.running.take() {
             stop_running(r);

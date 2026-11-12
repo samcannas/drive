@@ -53,6 +53,9 @@ pub struct PlatformContext {
     pub display_name: String,
     /// The uloz.to login, used to make the Windows sync root id unique per account.
     pub account: String,
+    /// Whether the folder gets its own entry in Explorer's navigation pane (Windows). Backed-up
+    /// folders that save space don't: they appear under "Drive - Backups".
+    pub show_in_explorer: bool,
 }
 
 pub fn prepare(ctx: PlatformContext) -> Result<Box<dyn Platform>> {
@@ -72,6 +75,15 @@ pub fn forget_registration(account: &str) {
     imp::forget_registration(account);
     #[cfg(not(windows))]
     let _ = account;
+}
+
+/// Shows "Drive - Backups" (`folder`) in the file manager's sidebar, or removes the entry
+/// (`None`). `key` makes the entry unique per account and installation. Windows only.
+pub fn backups_sidebar_entry(key: &str, folder: Option<&Path>) {
+    #[cfg(windows)]
+    imp::backups_sidebar_entry(key, folder);
+    #[cfg(not(windows))]
+    let _ = (key, folder);
 }
 
 /// Whether backed-up folders can be made on-demand in place on this platform.

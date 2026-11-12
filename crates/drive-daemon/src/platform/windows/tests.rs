@@ -47,6 +47,7 @@ struct Fixture {
     mem: Arc<MemRemote>,
     remote: Arc<dyn Remote>,
     running: Option<(Arc<Engine>, Box<dyn Platform>)>,
+    show_in_explorer: bool,
 }
 
 /// Removes test sync roots left behind by earlier test processes that were killed before
@@ -109,6 +110,7 @@ impl Fixture {
             mem,
             remote,
             running: None,
+            show_in_explorer: true,
         }
     }
 
@@ -134,6 +136,7 @@ impl Fixture {
             cache_dir: self.base.join("cache"),
             display_name: "Drive (test)".into(),
             account: self.account.clone(),
+            show_in_explorer: self.show_in_explorer,
         })
         .unwrap();
         engine.set_local(platform.local_side());
@@ -595,6 +598,35 @@ async fn existing_files_are_adopted_and_offline_changes_caught_up() {
         .count()
         - uploads_before;
     assert_eq!(uploads, 2, "{:?}", fx.mem.calls());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn folders_can_stay_out_of_the_navigation_pane() {
+    let mut fx = Fixture::new("navpane");
+    fx.show_in_explorer = false;
+    fx.start();
+    let id = register::sync_root_id(&fx.account)
+        .unwrap()
+        .to_os_string()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(super::navpane::sync_root_entry_visible(&id), Some(false));
+    // Starting again (as after an update) keeps it hidden; showing it works too.
+    fx.stop();
+    fx.show_in_explorer = true;
+    fx.start();
+    assert_eq!(super::navpane::sync_root_entry_visible(&id), Some(true));
+}
+
+#[test]
+fn folder_entries_are_added_and_removed() {
+    let clsid = super::navpane::clsid_for(&format!("test-{}", rand::random::<u64>()));
+    let dir = std::env::temp_dir();
+    super::navpane::add_folder_entry(&clsid, "Drive test entry", &dir, "shell32.dll,4").unwrap();
+    let target = super::navpane::folder_entry(&clsid);
+    super::navpane::remove_folder_entry(&clsid);
+    assert_eq!(target.as_deref(), Some(dir.to_string_lossy().as_ref()));
+    assert_eq!(super::navpane::folder_entry(&clsid), None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

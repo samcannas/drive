@@ -154,6 +154,7 @@ impl Harness {
             };
             let engine = Engine::new(db, remote.clone() as Arc<dyn Remote>, cfg).unwrap();
             let platform = super::prepare(PlatformContext {
+                show_in_explorer: true,
                 engine: engine.clone(),
                 folder: mnt.clone(),
                 cache_dir: cache.clone(),

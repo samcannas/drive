@@ -112,7 +112,7 @@ fn same_path(a: &Path, b: &Path) -> bool {
 
 /// Icon shown in the navigation pane: the tray app's icon when it is installed next to us
 /// (drive.exe itself has no icon resource), else a system icon.
-fn icon_resource() -> String {
+pub fn icon_resource() -> String {
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {

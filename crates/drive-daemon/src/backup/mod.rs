@@ -14,6 +14,7 @@
 
 #[cfg(test)]
 mod e2e;
+pub mod links;
 pub mod local;
 pub mod scan;
 
@@ -90,6 +91,13 @@ pub struct BackupCloud {
     pub device_folder: String,
     /// Remote id of `Backups/<device_folder>` (the backup engine's root).
     pub device_slug: String,
+    /// Remote id of `Backups`.
+    #[serde(default)]
+    pub backups_slug: Option<String>,
+    /// Other devices have backups too (then `Backups` stays visible in the Drive folder, with
+    /// theirs in it; this device's own backups are always hidden there).
+    #[serde(default)]
+    pub other_devices: bool,
 }
 
 impl BackupCloud {
@@ -730,7 +738,11 @@ impl Manager {
             }
             self.watches.lock().unwrap().remove(id);
             self.sync_sources();
-            self.engine.forget_subtree(&folder.name)?;
+            // Uploads of ours still under way would land next to the on-demand engine's own
+            // (duplicates, conflicted copies): stop them before it lists the cloud copy.
+            self.engine
+                .forget_subtree_stopping_uploads(&folder.name, Duration::from_secs(60))
+                .await?;
             self.set_runtime(id, |r| *r = Runtime::default());
             (self.on_change)();
         } else {

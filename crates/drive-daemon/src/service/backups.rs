@@ -90,9 +90,20 @@ pub(super) fn backup_engine_config(cfg: &Config, main: &EngineConfig) -> EngineC
 /// Exclusions for the main engine: this device's own backups appear only through the backup
 /// engine, never as cloud files in its Drive folder.
 pub(super) fn main_exclusions(cfg: &Config, ec: &mut EngineConfig) {
-    if let Some(c) = &cfg.backup_cloud {
-        ec.exclude_remote = vec![c.device_slug.clone()];
-        ec.exclude_local = vec![c.vault_path()];
+    let Some(c) = &cfg.backup_cloud else {
+        return;
+    };
+    match &c.backups_slug {
+        // Only this device backs up: the Drive folder doesn't show `Backups` at all (they're
+        // in "Drive - Backups").
+        Some(b) if !c.other_devices => {
+            ec.exclude_remote = vec![b.clone()];
+            ec.exclude_local = vec![BACKUPS_FOLDER.to_string()];
+        }
+        _ => {
+            ec.exclude_remote = vec![c.device_slug.clone()];
+            ec.exclude_local = vec![c.vault_path()];
+        }
     }
 }
 
@@ -354,25 +365,43 @@ impl Service {
             None => remote.create_folder(vault_root, BACKUPS_FOLDER).await?.id,
         };
         let devices = remote.list(&backups_id).await?;
-        if let Some(c) = &cfg.backup_cloud
-            && devices.iter().any(|e| e.id == c.device_slug)
-        {
-            return Ok(c.clone());
-        }
-        // Same device name already there: it's this device's earlier backup (a reinstall or a
-        // new sign-in); files that didn't change are recognised instead of uploaded again.
-        let name = backup::unique_name(&cfg.device_name, &[]);
-        let slug = match devices.iter().find(|e| {
-            e.kind == Kind::Folder
-                && drive_core::db::name_key(&e.name) == drive_core::db::name_key(&name)
-        }) {
-            Some(e) => e.id.clone(),
-            None => remote.create_folder(&backups_id, &name).await?.id,
+        let known = cfg
+            .backup_cloud
+            .clone()
+            .filter(|c| devices.iter().any(|e| e.id == c.device_slug));
+        let cloud = match known {
+            Some(c) => c,
+            None => {
+                // Same device name already there: it's this device's earlier backup (a
+                // reinstall or a new sign-in); files that didn't change are recognised instead
+                // of uploaded again.
+                let name = backup::unique_name(&cfg.device_name, &[]);
+                let slug = match devices.iter().find(|e| {
+                    e.kind == Kind::Folder
+                        && drive_core::db::name_key(&e.name) == drive_core::db::name_key(&name)
+                }) {
+                    Some(e) => e.id.clone(),
+                    None => remote.create_folder(&backups_id, &name).await?.id,
+                };
+                BackupCloud {
+                    device_folder: name,
+                    device_slug: slug,
+                    backups_slug: None,
+                    other_devices: false,
+                }
+            }
         };
+        let other_devices = devices
+            .iter()
+            .any(|e| e.kind == Kind::Folder && e.id != cloud.device_slug);
         let cloud = BackupCloud {
-            device_folder: name,
-            device_slug: slug,
+            backups_slug: Some(backups_id.clone()),
+            other_devices,
+            ..cloud
         };
+        if cfg.backup_cloud.as_ref() == Some(&cloud) {
+            return Ok(cloud);
+        }
         let mut inner = self.inner.lock().await;
         inner.config.backup_cloud = Some(cloud.clone());
         inner.config.save(&self.paths)?;
@@ -437,7 +466,42 @@ impl Service {
             tokio::time::sleep(Duration::from_millis(300)).await;
             let ov = self.backup_overview().await;
             let _ = self.events.send(Event::Backups(ov));
+            let cfg = self.inner.lock().await.config.clone();
+            self.refresh_backups_folder(&cfg, None);
         }
+    }
+
+    /// Keeps "Drive - Backups" in step with the backed-up folders: one link per folder that's
+    /// backed up, and its entry in the file manager's sidebar while there are any. `login`
+    /// names the account when it's no longer in `cfg` (signing out).
+    pub(super) fn refresh_backups_folder(&self, cfg: &Config, login: Option<&str>) {
+        let Some(login) = login.or(cfg.account.as_ref().map(|a| a.login.as_str())) else {
+            return;
+        };
+        let wanted: Vec<(String, PathBuf)> = if cfg.account.is_some() {
+            cfg.backups
+                .iter()
+                .filter(|f| f.enabled)
+                .map(|f| (f.name.clone(), f.path.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let dir = backup::links::folder_for(&cfg.folder_or_default());
+        {
+            let state = (dir.clone(), wanted.clone());
+            let mut last = self.backups_folder.lock().unwrap();
+            if last.as_ref() == Some(&state) {
+                return;
+            }
+            *last = Some(state);
+        }
+        if let Err(e) = backup::links::sync(&dir, &wanted) {
+            warn!("updating {} failed: {e:#}", dir.display());
+        }
+        let key = format!("{login}|{}", self.paths.data_dir.display());
+        let show = !wanted.is_empty() && dir.is_dir();
+        crate::platform::backups_sidebar_entry(&key, show.then_some(dir.as_path()));
     }
 
     pub(super) async fn backup_overview(&self) -> BackupOverview {
@@ -481,10 +545,12 @@ impl Service {
         }
         let suggestions = if cfg.account.is_some() {
             let backed: Vec<PathBuf> = cfg.backups.iter().map(|f| f.path.clone()).collect();
+            let links_dir = backup::links::folder_for(&cfg.folder_or_default());
             let own = [
                 self.paths.data_dir.as_path(),
                 self.paths.cache_dir.as_path(),
                 self.paths.config_dir.as_path(),
+                links_dir.as_path(),
             ];
             self.suggestions
                 .list(&backed, &cfg.folder_or_default(), &own)
@@ -522,10 +588,12 @@ impl Service {
                 .map(|f| f.path.clone())
                 .collect();
             let other_refs: Vec<&Path> = others.iter().map(|p| p.as_path()).collect();
+            let links_dir = backup::links::folder_for(&inner.config.folder_or_default());
             let own = [
                 self.paths.data_dir.as_path(),
                 self.paths.cache_dir.as_path(),
                 self.paths.config_dir.as_path(),
+                links_dir.as_path(),
             ];
             if let Some(problem) =
                 backup::overlap_problem(&path, &inner.config.folder_or_default(), &own, &other_refs)

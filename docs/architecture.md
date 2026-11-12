@@ -103,6 +103,16 @@ Folders outside the Drive folder are mirrored **one way** by a second engine
   Backup ids are negative, `-(id * 1024 + slot)` (slot 0 is the mirror engine, 1.. are
   on-demand folders), so calls can be routed back to the right engine.
 
+### Drive - Backups
+
+`backup/links.rs` keeps a folder next to the Drive folder (`Drive - Backups`) with one link per
+backed-up folder: a junction on Windows (no special rights needed), a symbolic link on Linux.
+Only links are ever created or removed there, and removing one never touches its target. On
+Windows it gets a sidebar entry of its own (`platform/windows/navpane.rs`): a per-user shell
+folder that delegates to the file-system folder, the classic way cloud apps add one. The
+Drive folder hides `Backups` entirely while only this device has backups
+(`BackupCloud::other_devices`); with other devices it shows theirs.
+
 ### Save space (on-demand backed-up folders, Windows)
 
 A backed-up folder can stay where it is but become on-demand like the Drive folder
@@ -110,7 +120,11 @@ A backed-up folder can stay where it is but become on-demand like the Drive fold
 
 - **Switching on.** The mirror engine forgets the folder (its cloud copy stays). The folder gets
   its own **two-way** engine on `Backups/<device>/<name>`, linked to the main one, and its own
-  Cloud Files sync root (id `<login>~<backup id>`). `scan_before_upload` holds uploads until the
+  Cloud Files sync root (id `<login>~<backup id>`). Windows gives every sync root a sidebar
+  entry; these are unpinned (`System.IsPinnedToNameSpaceTree = 0`), so the folders are reached
+  through *Drive - Backups*. The mirror engine stops its uploads under the folder (and waits
+  for them) before the on-demand engine lists the cloud copy, so no late upload lands as a
+  duplicate. `scan_before_upload` holds uploads until the
   cloud has been listed, so files already backed up are **adopted** (same name, size and
   modification time) instead of uploaded again. The evictor then frees the files used least
   recently (new files count as last used when last modified) beyond `keep_bytes` (5 GB by

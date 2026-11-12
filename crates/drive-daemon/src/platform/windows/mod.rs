@@ -16,6 +16,7 @@
 
 mod filter;
 mod local;
+mod navpane;
 mod reconcile;
 mod register;
 mod util;
@@ -275,6 +276,18 @@ pub fn prepare(ctx: PlatformContext) -> Result<Box<dyn Platform>> {
         .with_context(|| format!("creating {}", ctx.folder.display()))?;
     let root = normalize_folder(&ctx.folder)?;
     let reg = register::register(&root, &ctx.account, &ctx.display_name)?;
+    if reg == register::Registration::Shell
+        && let Ok(id) = register::sync_root_id(&ctx.account)
+    {
+        let id = id.to_os_string().to_string_lossy().into_owned();
+        // Re-applied every start: registering again (an update) brings the entry back.
+        if let Err(e) = navpane::set_sync_root_entry_visible(&id, ctx.show_in_explorer) {
+            debug!(
+                "setting the Explorer entry of {} failed: {e:#}",
+                root.display()
+            );
+        }
+    }
     if reg == register::Registration::Native {
         warn!(
             "{} works, but won't appear in Explorer's navigation pane",
@@ -399,6 +412,22 @@ fn clear_pin_attributes(p: &Path) {
     let wide = windows::core::HSTRING::from(p.as_os_str());
     if let Err(e) = unsafe { SetFileAttributesW(&wide, FILE_FLAGS_AND_ATTRIBUTES(attrs & !pin)) } {
         debug!("clearing the pin state of {} failed: {e}", p.display());
+    }
+}
+
+pub fn backups_sidebar_entry(key: &str, folder: Option<&Path>) {
+    let clsid = navpane::clsid_for(&format!("drive-backups:{key}"));
+    match folder {
+        Some(f) => {
+            let name = crate::backup::links::FOLDER_NAME;
+            // Explorer wants the folder as Windows spells it (backslashes, no `\\?\`).
+            let f = normalize_folder(f).unwrap_or_else(|_| f.to_path_buf());
+            if let Err(e) = navpane::add_folder_entry(&clsid, name, &f, &register::icon_resource())
+            {
+                warn!("adding {name} to Explorer failed: {e:#}");
+            }
+        }
+        None => navpane::remove_folder_entry(&clsid),
     }
 }
 

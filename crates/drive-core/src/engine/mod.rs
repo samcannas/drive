@@ -2116,12 +2116,52 @@ impl Engine {
     /// Forgets everything below `path` without touching the cloud (a backup switched off:
     /// its cloud copy stays as it is). The top-level folder's row goes too.
     pub fn forget_subtree(&self, path: &str) -> Result<()> {
+        self.forget_subtree_ids(path).map(|_| ())
+    }
+
+    /// Like [`Self::forget_subtree`], and also stops uploads under `path` that are under way,
+    /// waiting (up to `wait`) until they have stopped. Use before another engine takes the
+    /// subtree over, so no late upload of ours lands in its cloud folder.
+    pub async fn forget_subtree_stopping_uploads(&self, path: &str, wait: Duration) -> Result<()> {
+        let ids = self.forget_subtree_ids(path)?;
+        let running = |me: &Self| {
+            let cancels = me.upload_cancels.lock().unwrap();
+            ids.iter().filter(|id| cancels.contains_key(id)).count()
+        };
+        {
+            let cancels = self.upload_cancels.lock().unwrap();
+            for id in &ids {
+                if let Some(c) = cancels.get(id) {
+                    c.cancel();
+                }
+            }
+        }
+        let deadline = tokio::time::Instant::now() + wait;
+        while running(self) > 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let left = running(self);
+        if left > 0 {
+            warn!("{left} uploads under {path} didn't stop in time");
+        }
+        Ok(())
+    }
+
+    fn forget_subtree_ids(&self, path: &str) -> Result<Vec<NodeId>> {
         let Some(n) = self.db.node_by_path(path)? else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         if n.id == ROOT_ID {
             return Err(EngineError::Invalid("cannot forget the root".into()));
         }
+        let ids: Vec<NodeId> = self.db.read(|c| {
+            let mut st = c.prepare(
+                "WITH RECURSIVE sub(id) AS (SELECT ?1 UNION ALL SELECT n.id FROM node n JOIN sub ON n.parent_id = sub.id)
+                 SELECT id FROM sub",
+            )?;
+            let rows = st.query_map([n.id], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<NodeId>>>()
+        })?;
         // Tombstones of the subtree aren't found by path: delete by parent links.
         self.db.write(|tx| {
             tx.execute(
@@ -2133,7 +2173,7 @@ impl Engine {
         })?;
         self.issues_changed();
         self.status_changed.notify_one();
-        Ok(())
+        Ok(ids)
     }
 
     /// Per top-level folder (by name): file counts and sizes, in one pass over the table.
@@ -2590,11 +2630,19 @@ impl Engine {
             .lock()
             .unwrap()
             .insert(n.id, cancel.clone());
-        // Paused or held for tonight after this upload was picked (before the cancel handle
-        // existed): don't start it. From here on a change cancels it through the handle.
-        if self.db.node(n.id)?.is_some_and(|cur| self.held(&cur)) {
+        // Paused, held for tonight or forgotten (a backed-up folder handed to another engine)
+        // after this upload was picked, before the cancel handle existed: don't start it. From
+        // here on a change cancels it through the handle.
+        if self
+            .db
+            .node(n.id)?
+            .is_none_or(|cur| cur.deleted || self.held(&cur))
+        {
             self.upload_cancels.lock().unwrap().remove(&n.id);
-            debug!("{} was held before its upload started", item.path);
+            debug!(
+                "{} was held or forgotten before its upload started",
+                item.path
+            );
             return Ok(());
         }
         let db = self.db.clone();
