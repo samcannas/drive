@@ -356,6 +356,9 @@ struct Scenario {
     demand: Curve,
     /// Other traffic into the same queue, bytes/s.
     other: Curve,
+    /// Other traffic that behaves like TCP: it keeps this many bytes of its own in the queue
+    /// (its window), so when we pause, the queue falls by our share only. 0 = none.
+    other_window: f64,
     /// Delay from outside this queue (download link, VPN), ms.
     extra_ms: Curve,
     /// Measurement noise, ms (≥ 0: noise only ever adds delay).
@@ -381,6 +384,7 @@ impl Scenario {
             sockbuf: 512.0 * KB,
             demand: Box::new(|_| f64::INFINITY),
             other: Box::new(|_| 0.0),
+            other_window: 0.0,
             extra_ms: Box::new(|_| 0.0),
             noise: Box::new(|r, _| r.exp(2.0)),
             probe_fails: Box::new(|_| false),
@@ -526,12 +530,23 @@ fn simulate(sc: &Scenario) -> Outcome {
         }
         // TCP moves data from the socket buffer into the bottleneck queue while it has room
         // (loss-based TCP keeps a bloated buffer full).
+        // Free buffer space goes to everyone sending, in proportion to what each offers (no
+        // flow gets to go first): ours, constant-rate traffic, and TCP-like traffic that keeps
+        // `other_window` bytes of its own queued.
         let room = (buffer - q_ours - q_other).max(0.0);
-        let send = sock.min(room).min(cap * 3.0 * dt);
+        let offer_ours = sock.min(cap * 3.0 * dt);
+        let offer_other = (sc.other)(t) * dt
+            + if sc.other_window > 0.0 {
+                (sc.other_window - q_other).max(0.0).min(cap * 3.0 * dt)
+            } else {
+                0.0
+            };
+        let offered = offer_ours + offer_other;
+        let scale = if offered > room { room / offered } else { 1.0 };
+        let send = offer_ours * scale;
         sock -= send;
         q_ours += send;
-        let room = (buffer - q_ours - q_other).max(0.0);
-        q_other += ((sc.other)(t) * dt).min(room);
+        q_other += offer_other * scale;
         // The link serves the queue.
         let total = q_ours + q_other;
         if total > 0.0 {
@@ -1066,6 +1081,7 @@ fn sim_sweep_of_random_links() {
                 sockbuf,
                 demand: Box::new(|_| f64::INFINITY),
                 other: Box::new(|_| 0.0),
+                other_window: 0.0,
                 extra_ms: Box::new(move |t| if t > extra_from { extra } else { 0.0 }),
                 noise: Box::new(move |r, _| {
                     r.exp(jitter) + if r.unit() < spikes { 300.0 } else { 0.0 }
@@ -1140,4 +1156,51 @@ fn sim_pauses_stay_rare_over_two_hours() {
         out.checks,
         out.dump()
     );
+}
+
+/// Someone else's TCP upload keeps ~600 ms of the bloated queue; ours adds the rest.
+/// Pausing ours only removes our share, so it must never be limited: not after a
+/// calibration (service started mid-upload; the real-network test caught this) and not
+/// after a normal check (started idle).
+fn someone_elses_tcp(start_s: f64, controlled: bool) -> Scenario {
+    let mut sc = Scenario::bloated();
+    sc.other_window = 0.6 * 1.25 * MB;
+    sc.start_s = start_s;
+    // "Mid-upload": measuring starts after the queue has been full for a while (as in the
+    // real-network test), so no sample ever saw it empty.
+    if start_s == 0.0 {
+        sc.enable_at = 30.0;
+    }
+    sc.secs = 1200.0;
+    sc.controlled = controlled;
+    sc
+}
+
+#[test]
+fn sim_someone_elses_tcp_upload_is_not_ours_after_calibrating() {
+    let out = simulate(&someone_elses_tcp(0.0, true));
+    let base = simulate(&someone_elses_tcp(0.0, false));
+    assert!(base.delay_mean(60.0, 1200.0) > 800.0, "{}", base.dump());
+    assert_eq!(
+        out.time_in(Mode::Limited, 0.0, 1200.0),
+        0.0,
+        "{}",
+        out.dump()
+    );
+    let (a, b) = (out.throughput(0.0, 1200.0), base.throughput(0.0, 1200.0));
+    assert!(a >= 0.97 * b, "{a} vs {b}\n{}", out.dump());
+}
+
+#[test]
+fn sim_someone_elses_tcp_upload_is_not_ours_after_a_check() {
+    let out = simulate(&someone_elses_tcp(10.0, true));
+    let base = simulate(&someone_elses_tcp(10.0, false));
+    assert_eq!(
+        out.time_in(Mode::Limited, 0.0, 1200.0),
+        0.0,
+        "{}",
+        out.dump()
+    );
+    let (a, b) = (out.throughput(20.0, 1200.0), base.throughput(20.0, 1200.0));
+    assert!(a >= 0.97 * b, "{a} vs {b}\n{}", out.dump());
 }

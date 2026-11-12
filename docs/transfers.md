@@ -113,11 +113,16 @@ limit.
 
 1. Nothing happens unless the spike-filtered delay (lowest sample over ~3 s) stays above
    120 ms for 6 s while uploads send at least 16 KB/s.
-2. Then a *check*: uploads pause (up to 8 s). Only if the delay falls back near the base
-   (or at least halves, for deep OS socket buffers) is a limit set, at 80 % of the rate
-   before. If the delay stays, something else causes it (another device, a full download
-   link, a VPN, Wi-Fi): uploads stay at full speed and no check runs for 5 minutes, then
-   10, 20, 30. A check that sees no change at all ends after 6 s.
+2. Then a *check*: uploads pause (up to 8 s). Only if the delay falls back near the base (or
+   at least halves, for deep OS socket buffers) **and the whole round trip at least halves**
+   is a limit set, at 80 % of the rate before: uploads must be the main cause. Someone
+   else's TCP keeps its own standing queue while ours pauses, so a delay that only shrinks
+   by our share is not ours (a real-network test caught exactly that: 774 -> 587 ms read as
+   "186 ms of ours"). If the delay stays, something else causes it (another device, a full
+   download link, a VPN, Wi-Fi): uploads stay at full speed and no check runs for 5 minutes,
+   then 10, 20, 30. A check that sees no change at all ends after 6 s. The trade-off: a
+   moderate queue on a link whose normal round trip is already long (satellite) isn't
+   treated, which errs towards full speed.
 3. While limited, the median of the last three samples steers the limit towards 60 ms of
    queue: above it, the link is full, so the rate that filled it is its speed and the
    limit goes to that rate minus enough to drain the excess within 3 s (an integral term

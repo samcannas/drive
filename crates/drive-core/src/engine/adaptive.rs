@@ -218,9 +218,11 @@ enum State {
         since: u64,
         rate_before: f64,
         delay_before: f64,
-        /// A calibration: the (filtered) round trip before pausing, judged against the base
-        /// learned during the pause.
-        calibrating: Option<f64>,
+        /// The (spike-filtered) round trip when the pause started.
+        rtt_before: f64,
+        /// A calibration: the base wasn't verified, so `delay_before` is judged against the
+        /// base learned during the pause.
+        calibrating: bool,
     },
     Limited {
         rate: f64,
@@ -479,7 +481,8 @@ impl Controller {
                         since: now,
                         rate_before: self.rate,
                         delay_before: 0.0,
-                        calibrating: Some(rtt),
+                        rtt_before: rtt,
+                        calibrating: true,
                     }
                 } else if high_since.is_some_and(|s| now.saturating_sub(s) >= self.p.engage_for_ms)
                 {
@@ -493,7 +496,8 @@ impl Controller {
                         since: now,
                         rate_before: self.rate,
                         delay_before: d,
-                        calibrating: None,
+                        rtt_before: self.filtered_rtt().unwrap_or_default(),
+                        calibrating: false,
                     }
                 } else {
                     State::Unlimited {
@@ -506,6 +510,7 @@ impl Controller {
                 since,
                 rate_before,
                 delay_before,
+                rtt_before,
                 calibrating,
             } => {
                 let elapsed = now.saturating_sub(since);
@@ -513,10 +518,23 @@ impl Controller {
                 // learned during it, and only a drop beyond the engage threshold counts as
                 // our queue (a small drop is ordinary noise).
                 let delay_before = match (calibrating, self.base_ms()) {
-                    (Some(rtt), Some(base)) => (rtt - base).max(0.0),
-                    _ => delay_before,
+                    (true, Some(base)) => (rtt_before - base).max(0.0),
+                    (true, None) => 0.0,
+                    (false, _) => delay_before,
                 };
-                let queue_seen = calibrating.is_none() || delay_before > self.p.engage_ms;
+                let queue_seen = !calibrating || delay_before > self.p.engage_ms;
+                // Uploads only count as the cause if pausing them at least halves the whole
+                // round trip: someone else's TCP keeps its own standing queue while ours
+                // pauses, and a base learned meanwhile includes it, so "the delay above the
+                // base fell" alone isn't enough. (Real-network test: 774 -> 587 ms looked like
+                // "186 ms of ours, drained" and limited us for nothing.)
+                let low_rtt = self
+                    .samples
+                    .iter()
+                    .filter(|(t, _)| *t >= since + self.p.check_min_ms.min(elapsed))
+                    .map(|s| s.1)
+                    .reduce(f64::min);
+                let halved = low_rtt.is_some_and(|l| l <= 0.5 * rtt_before);
                 let clear = self.p.clear_ms.max(self.p.clear_frac * delay_before);
                 let low = self.lowest_since(since + self.p.check_min_ms.min(elapsed));
                 if !fresh {
@@ -527,6 +545,7 @@ impl Controller {
                     self.cool_down(now);
                     FREE
                 } else if queue_seen
+                    && halved
                     && (elapsed >= self.p.check_min_ms && low.is_some_and(|l| l <= clear)
                         || elapsed >= self.p.check_max_ms
                             && low.is_some_and(|l| l <= 0.5 * delay_before))
@@ -538,9 +557,9 @@ impl Controller {
                     self.knee = None;
                     self.trusted_until = self.trusted_until.max(now + self.p.calibrated_for_ms);
                     self.event(format!(
-                        "the delay fell from {delay_before:.0} ms to {:.0} ms with uploads paused: \
-                         uploads cause it, limiting them to {}",
-                        low.unwrap_or_default(),
+                        "the round trip fell from {rtt_before:.0} ms to {:.0} ms with uploads \
+                         paused: uploads cause it, limiting them to {}",
+                        low_rtt.unwrap_or_default(),
                         rate_text(rate)
                     ));
                     State::Limited {
@@ -549,7 +568,7 @@ impl Controller {
                         unbound_since: None,
                         stuck_since: None,
                     }
-                } else if calibrating.is_some() && !queue_seen && elapsed >= self.p.check_abort_ms {
+                } else if calibrating && !queue_seen && elapsed >= self.p.check_abort_ms {
                     self.trusted_until = now + self.p.calibrated_for_ms;
                     self.event(format!(
                         "measured the connection with uploads paused: base {:.0} ms, no queue to fix",
@@ -655,7 +674,8 @@ impl Controller {
                             since: now,
                             rate_before: self.rate,
                             delay_before: d,
-                            calibrating: None,
+                            rtt_before: self.filtered_rtt().unwrap_or_default(),
+                            calibrating: false,
                         }
                     } else {
                         State::Limited {
