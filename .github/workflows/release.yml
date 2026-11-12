@@ -128,6 +128,17 @@ jobs:
         shell: bash
         run: corepack enable pnpm && (cd app && pnpm --version)
 
+      # The downloaded .deb files, kept for a week: apt still refreshes its lists and
+      # installs as usual, it just skips downloads it already has (the HTTPS mirror is
+      # sometimes slow). A miss or a stale file only means apt downloads it again.
+      - name: apt cache week
+        id: aptweek
+        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ~/apt-archives
+          key: apt-archives-ubuntu-22.04-${{ steps.aptweek.outputs.week }}
+
       - name: Install build dependencies
         timeout-minutes: 15 # mirrors occasionally hang; fail fast instead of stalling the job
         run: |
@@ -141,8 +152,13 @@ jobs:
           sudo rm -f /etc/apt/apt.conf.d/50command-not-found /var/lib/man-db/auto-update
           echo 'Acquire::Languages "none";' | sudo tee /etc/apt/apt.conf.d/99-no-translations >/dev/null
           apt update
+          mkdir -p ~/apt-archives/partial
           apt install -y --no-install-recommends -o Dpkg::Options::=--force-unsafe-io \
-            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev             libssl-dev patchelf file
+            -o Dir::Cache::Archives="$HOME/apt-archives" -o APT::Keep-Downloaded-Packages=true \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev \
+            libssl-dev patchelf file
+          sudo rm -rf ~/apt-archives/partial ~/apt-archives/lock
+          sudo chown -R "$USER" ~/apt-archives
 
       - name: Set version ${{ env.VERSION }}
         run: .github/release/set-version.sh "$VERSION"
@@ -184,7 +200,7 @@ jobs:
           # linuxdeploy strips every library it copies into the AppImage; Ubuntu's are
           # already stripped, so that only costs time.
           NO_STRIP: "true"
-        run: pnpm tauri bundle --ci --verbose --bundles appimage --config release.conf.json
+        run: pnpm tauri bundle --ci --bundles appimage --config release.conf.json
 
       - name: Finish the Arch package
         if: always()

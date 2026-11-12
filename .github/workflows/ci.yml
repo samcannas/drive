@@ -53,6 +53,19 @@ jobs:
         with:
           tool: cargo-nextest
 
+      # The downloaded .deb files, kept for a week: apt still refreshes its lists and
+      # installs as usual, it just skips downloads it already has (the HTTPS mirror is
+      # sometimes slow). A miss or a stale file only means apt downloads it again.
+      - name: apt cache week
+        if: runner.os == 'Linux'
+        id: aptweek
+        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        if: runner.os == 'Linux'
+        with:
+          path: ~/apt-archives
+          key: apt-archives-ubuntu-24.04-${{ steps.aptweek.outputs.week }}
+
       # (No apt package cache: cache-apt-pkgs-action installed from stale package lists,
       # reported success after 404s and saved an empty cache that later runs then "hit".)
       - name: Install Linux packages (FUSE, WebKitGTK 4.1, appindicator)
@@ -69,8 +82,13 @@ jobs:
           sudo rm -f /etc/apt/apt.conf.d/50command-not-found /var/lib/man-db/auto-update
           echo 'Acquire::Languages "none";' | sudo tee /etc/apt/apt.conf.d/99-no-translations >/dev/null
           apt update
+          mkdir -p ~/apt-archives/partial
           apt install -y --no-install-recommends -o Dpkg::Options::=--force-unsafe-io \
-            fuse3 libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev             libxdo-dev libssl-dev
+            -o Dir::Cache::Archives="$HOME/apt-archives" -o APT::Keep-Downloaded-Packages=true \
+            fuse3 libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            libxdo-dev libssl-dev
+          sudo rm -rf ~/apt-archives/partial ~/apt-archives/lock
+          sudo chown -R "$USER" ~/apt-archives
 
       - name: Make /dev/fuse usable
         if: runner.os == 'Linux'
