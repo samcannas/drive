@@ -68,6 +68,12 @@ impl Filter {
         })?;
         let size = req.file_size();
         let required = info.required_file_range();
+        debug!(
+            "{} requested {:?} of {}",
+            requester(req),
+            required,
+            req.path().display()
+        );
         let optional = info.optional_file_range();
         let start = required.start / PAGE * PAGE;
         let mut end = required.end;
@@ -151,7 +157,11 @@ impl Filter {
             Ok(())
         });
         if let Err(kind) = result {
-            info!("couldn't download {}: {kind:?}", req.path().display());
+            info!(
+                "couldn't download {} for {}: {kind:?}",
+                req.path().display(),
+                requester(req)
+            );
             return Err(kind);
         }
         engine.touch(id);
@@ -180,6 +190,20 @@ fn cloud_error(e: &EngineError) -> CloudErrorKind {
             CloudErrorKind::NotInSync
         }
         _ => CloudErrorKind::Unsuccessful,
+    }
+}
+
+/// Which program asked for a file ("Explorer (4312)"), for the log.
+fn requester(req: &Request) -> String {
+    match req.process() {
+        Some(p) => {
+            let name = p
+                .path()
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| "a program".into());
+            format!("{name} ({})", p.id())
+        }
+        None => "a program".into(),
     }
 }
 
