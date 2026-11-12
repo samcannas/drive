@@ -134,6 +134,8 @@ enum Kindish {
     File(Item),
     Dir(i64),
     Skip,
+    /// Another cloud app's online-only file (only detectable on Windows).
+    #[cfg_attr(not(windows), allow(dead_code))]
     OnlineOnly,
 }
 
