@@ -4,6 +4,8 @@ on:
   pull_request:
   push:
   workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * 1" # Mondays: includes the shaped-link upload speed tests
 
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
@@ -160,6 +162,68 @@ jobs:
             filter=(-E 'not test(cloud_files_show_up_and_download_on_demand)')
           fi
           cargo nextest run --locked --no-fail-fast -p drive-core -p drive-daemon "${filter[@]}"
+
+  # Automatic upload speed on real, kernel-shaped links (crates/drive-core/tests/adaptive_netem.rs):
+  # a bloated 8 Mbit/s link with a one-second buffer, and the same speed with a short buffer.
+  # Several minutes, so it runs on its own runner, only when the controller, the throttle or
+  # these tests change (and weekly / on demand); other pushes skip it in seconds.
+  upload-speed:
+    name: Upload speed on shaped links
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Relevant changes?
+        id: changed
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "$EVENT" = schedule ] || [ "$EVENT" = workflow_dispatch ]; then
+            echo run=true >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          base="${PR_BASE:-$BEFORE}"
+          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then base=HEAD~1; fi
+          if git diff --name-only "$base" HEAD | grep -qE 'engine/(adaptive|throttle)|tests/adaptive_netem|workflows/ci\.yml'; then
+            echo run=true >> "$GITHUB_OUTPUT"
+          else
+            echo "nothing that affects upload speed changed: skipping"
+            echo run=false >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: dtolnay/rust-toolchain@master
+        if: steps.changed.outputs.run == 'true'
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.changed.outputs.run == 'true'
+        with:
+          prefix-key: v1-rust
+          shared-key: netem
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # drive-core alone needs no system packages.
+      - name: Build the tests
+        if: steps.changed.outputs.run == 'true'
+        run: cargo test --locked -p drive-core --test adaptive_netem --no-run
+
+      - name: Shaped links
+        if: steps.changed.outputs.run == 'true'
+        timeout-minutes: 15
+        run: |
+          sudo ip link set lo mtu 1500
+          # No 64 KB "super-packets" on loopback: the shaper would drop what exceeds its burst.
+          sudo ethtool -K lo tso off gso off gro off 2>/dev/null || true
+          run() { DRIVE_NETEM="$1" cargo test --locked -p drive-core --test adaptive_netem -- --ignored --nocapture --test-threads=1; }
+          sudo tc qdisc add dev lo root tbf rate 8mbit burst 96kb limit 1000000
+          run bloated
+          sudo tc qdisc change dev lo root tbf rate 8mbit burst 96kb limit 30000
+          run healthy
+          sudo tc qdisc del dev lo root
 
   frontend:
     name: Frontend

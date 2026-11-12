@@ -36,6 +36,9 @@ export function summarize(list: TransferList, device: string): Summary {
     const eta = ups ? list.upload_eta_secs : null;
     if (eta !== null) title += ` · ${duration(eta, { about: true })} left`;
     const notes: string[] = [];
+    if (ups && list.auto_upload_checking) notes.push("Paused for a moment to check your connection.");
+    else if (ups && list.auto_upload_limit_bps)
+      notes.push(`Slowed to ${rate(list.auto_upload_limit_bps)} so your connection stays responsive.`);
     if (ups && downs) notes.push(`Also downloading ${plural(downs, "file", "files")}.`);
     if (eta !== null && eta > 5 * 60) notes.push(`Keep your ${device} on until it's done.`);
     return { title, detail: notes.join(" ") || null };

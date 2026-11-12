@@ -554,6 +554,25 @@
       </div>
     {:else if section === "network"}
       <div class="group">
+        <label class="card setting">
+          <span class="setting-text">
+            <span id="adaptive-label">Keep your connection responsive</span>
+            <span class="caption secondary" id="adaptive-desc">
+              When uploads make calls, games or browsing slow, Drive slows them down until that stops, then speeds back
+              up. It checks first, so it never slows uploads for a slowdown they don't cause.
+            </span>
+          </span>
+          <input
+            type="checkbox"
+            role="switch"
+            class="switch"
+            aria-labelledby="adaptive-label"
+            aria-describedby="adaptive-desc"
+            checked={s.adaptive_upload}
+            onchange={(e) => save({ adaptive_upload: e.currentTarget.checked })}
+          />
+        </label>
+
         {#each LIMITS as [key, label]}
           {@const value = s[key]}
           <div class="card setting">

@@ -226,6 +226,14 @@ fn print_transfers(list: &TransferList, all: bool) {
         head.push_str(&format!(" · {} left", human_duration(eta)));
     }
     println!("{head}");
+    if list.auto_upload_checking {
+        println!("Uploads paused for a few seconds: checking whether they slow your connection.");
+    } else if let Some(l) = list.auto_upload_limit_bps {
+        println!(
+            "Uploads slowed to {}/s so your connection stays responsive (auto-upload-speed).",
+            human_bytes(l)
+        );
+    }
     let shown = if all {
         list.items.len()
     } else {
@@ -475,6 +483,13 @@ async fn run_client(cmd: Command) -> Result<()> {
                     "parallel" => patch.max_parallel_transfers = Some(num()? as u32),
                     "device-name" => patch.device_name = Some(v.to_string()),
                     "api-key" => patch.app_token = Some(v.to_string()),
+                    "auto-upload-speed" => {
+                        patch.adaptive_upload = Some(match v {
+                            "on" | "true" | "yes" | "1" => true,
+                            "off" | "false" | "no" | "0" => false,
+                            _ => bail!("auto-upload-speed needs on or off"),
+                        })
+                    }
                     "auto-update" => {
                         patch.auto_update = Some(match v {
                             "on" | "true" | "yes" | "1" => true,

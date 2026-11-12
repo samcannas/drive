@@ -11,9 +11,22 @@ use futures::StreamExt;
 use crate::remote::ByteStream;
 use crate::remote::resumable::{Meter, Progress};
 
-/// Token bucket shared by all transfers in one direction. A rate of 0 means unlimited.
+/// Token bucket shared by all transfers in one direction.
+///
+/// Two limits apply, the lower one winning: the user's (`set_kbps`, 0 = none) and an
+/// automatic one with an optional pause (`set_auto`, see [`super::adaptive`]). The automatic
+/// limit and pause expire on their own unless renewed, so a stopped controller can never
+/// leave uploads slowed down or paused.
 pub struct Throttle {
     rate_bytes: AtomicU64,
+    /// Automatic limit in bytes/s (0 = none), valid until `auto_until` (ms since `epoch`).
+    auto_bytes: AtomicU64,
+    auto_until: AtomicU64,
+    /// Paused until this time (ms since `epoch`).
+    hold_until: AtomicU64,
+    /// Bytes let through so far.
+    passed: AtomicU64,
+    epoch: Instant,
     state: tokio::sync::Mutex<(f64, Instant)>,
 }
 
@@ -21,6 +34,11 @@ impl Throttle {
     pub fn new(kbps: u64) -> Self {
         Self {
             rate_bytes: AtomicU64::new(kbps * 1024),
+            auto_bytes: AtomicU64::new(0),
+            auto_until: AtomicU64::new(0),
+            hold_until: AtomicU64::new(0),
+            passed: AtomicU64::new(0),
+            epoch: Instant::now(),
             state: tokio::sync::Mutex::new((0.0, Instant::now())),
         }
     }
@@ -29,8 +47,52 @@ impl Throttle {
         self.rate_bytes.store(kbps * 1024, Ordering::Relaxed);
     }
 
+    fn now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
+    }
+
+    /// Sets the automatic limit (bytes/s) and pause, both lapsing after `valid_for`.
+    pub fn set_auto(&self, limit: Option<u64>, hold: bool, valid_for: Duration) {
+        let until = self.now_ms() + valid_for.as_millis() as u64;
+        self.auto_bytes.store(limit.unwrap_or(0), Ordering::Relaxed);
+        self.auto_until
+            .store(if limit.is_some() { until } else { 0 }, Ordering::Relaxed);
+        self.hold_until
+            .store(if hold { until } else { 0 }, Ordering::Relaxed);
+    }
+
+    /// Bytes let through so far.
+    pub fn passed(&self) -> u64 {
+        self.passed.load(Ordering::Relaxed)
+    }
+
+    /// The limit in force now, bytes/s (0 = none).
+    pub fn effective_rate(&self) -> u64 {
+        let user = self.rate_bytes.load(Ordering::Relaxed);
+        let auto = if self.now_ms() < self.auto_until.load(Ordering::Relaxed) {
+            self.auto_bytes.load(Ordering::Relaxed)
+        } else {
+            0
+        };
+        match (user, auto) {
+            (0, a) => a,
+            (u, 0) => u,
+            (u, a) => u.min(a),
+        }
+    }
+
     pub async fn consume(&self, bytes: usize) {
-        let rate = self.rate_bytes.load(Ordering::Relaxed) as f64;
+        // Paused: wait until the pause ends or lapses.
+        loop {
+            let until = self.hold_until.load(Ordering::Relaxed);
+            let now = self.now_ms();
+            if now >= until {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis((until - now).min(50))).await;
+        }
+        self.passed.fetch_add(bytes as u64, Ordering::Relaxed);
+        let rate = self.effective_rate() as f64;
         if rate <= 0.0 {
             return;
         }
@@ -95,5 +157,73 @@ mod tests {
         // The first second is free credit; the rest must wait about three seconds.
         let took = start.elapsed();
         assert!(took >= Duration::from_millis(2900), "{took:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unlimited_by_default_and_counts_bytes() {
+        let t = Throttle::new(0);
+        let start = tokio::time::Instant::now();
+        for _ in 0..100 {
+            t.consume(1024 * 1024).await;
+        }
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert_eq!(t.passed(), 100 * 1024 * 1024);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_lower_of_user_and_automatic_limit_applies() {
+        let t = Throttle::new(1000);
+        assert_eq!(t.effective_rate(), 1000 * 1024);
+        t.set_auto(Some(100 * 1024), false, Duration::from_secs(10));
+        assert_eq!(t.effective_rate(), 100 * 1024);
+        t.set_auto(Some(10_000 * 1024), false, Duration::from_secs(10));
+        assert_eq!(t.effective_rate(), 1000 * 1024);
+        t.set_kbps(0);
+        assert_eq!(t.effective_rate(), 10_000 * 1024);
+        t.set_auto(None, false, Duration::from_secs(10));
+        assert_eq!(t.effective_rate(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_automatic_limit_lapses_unless_renewed() {
+        let t = Throttle::new(0);
+        t.set_auto(Some(1024), false, Duration::from_secs(10));
+        assert_eq!(t.effective_rate(), 1024);
+        tokio::time::advance(Duration::from_secs(11)).await;
+        assert_eq!(
+            t.effective_rate(),
+            0,
+            "a stopped controller must not leave a limit"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pause_holds_uploads_until_it_lapses() {
+        let t = Throttle::new(0);
+        t.set_auto(None, true, Duration::from_secs(2));
+        let start = tokio::time::Instant::now();
+        t.consume(1).await;
+        let waited = start.elapsed();
+        assert!(
+            waited >= Duration::from_secs(2) && waited < Duration::from_millis(2100),
+            "{waited:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ending_a_pause_releases_waiting_uploads() {
+        let t = Arc::new(Throttle::new(0));
+        t.set_auto(None, true, Duration::from_secs(60));
+        let t2 = t.clone();
+        let start = tokio::time::Instant::now();
+        let h = tokio::spawn(async move { t2.consume(1).await });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        t.set_auto(None, false, Duration::ZERO);
+        h.await.unwrap();
+        assert!(
+            start.elapsed() < Duration::from_millis(600),
+            "{:?}",
+            start.elapsed()
+        );
     }
 }

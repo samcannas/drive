@@ -764,3 +764,56 @@ async fn transfer_list_explains_waits_and_estimates() {
     mem.set_chunk_delay(Duration::ZERO);
     a.sync().await;
 }
+
+// ---- Automatic upload speed: wiring ----------------------------------------------------
+
+#[tokio::test]
+async fn automatic_upload_speed_measures_and_can_be_switched_off() {
+    // Something to time handshakes against.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let _ = listener.accept().await;
+        }
+    });
+    let mut cfg = config("A");
+    cfg.probe_target = Some(addr.to_string());
+    let d = device_with(
+        Arc::new(MemRemote::new()),
+        cfg,
+        Arc::new(Db::open_in_memory().unwrap()),
+    );
+
+    // Measuring starts with the engine; nothing is limited on an idle, healthy connection.
+    let measured = wait_for(Duration::from_secs(5), || {
+        d.engine.upload_speed().base_ms.is_some()
+    })
+    .await;
+    assert!(measured, "no measurements: {:?}", d.engine.upload_speed());
+    let s = d.engine.upload_speed();
+    assert_eq!(s.mode, drive_core::engine::adaptive::Mode::Unlimited);
+    assert!(s.base_ms.unwrap() < 100.0, "{s:?}");
+    let list = d.engine.transfers();
+    assert_eq!(list.auto_upload_limit_bps, None);
+    assert!(!list.auto_upload_checking);
+
+    // Switched off: measurements stop.
+    d.engine.update_config(|c| c.adaptive_upload = false);
+    let off = wait_for(Duration::from_secs(8), || {
+        d.engine.upload_speed().base_ms.is_none()
+    })
+    .await;
+    assert!(off, "still measuring: {:?}", d.engine.upload_speed());
+}
+
+async fn wait_for(limit: Duration, mut f: impl FnMut() -> bool) -> bool {
+    let end = tokio::time::Instant::now() + limit;
+    while tokio::time::Instant::now() < end {
+        if f() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    f()
+}

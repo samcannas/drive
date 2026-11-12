@@ -51,6 +51,7 @@ const state = {
     poll_interval_secs: 60,
     upload_limit_kbps: 0,
     download_limit_kbps: 0,
+    adaptive_upload: true,
     max_parallel_transfers: 4,
     launch_at_login: true,
     notifications: true,
@@ -349,6 +350,9 @@ function transferList(): TransferList {
     upload_eta_secs: upRate > 0 ? Math.round(remaining / upRate) : null,
     night_window_opens_ms: held ? nextWindow(state.settings.night_start) : null,
     night_window_open: false,
+    // The transfers scenarios show uploads slowed to keep the connection responsive.
+    auto_upload_limit_bps: state.settings.adaptive_upload && upRate > 0 ? 1_450_000 : null,
+    auto_upload_checking: false,
   };
 }
 

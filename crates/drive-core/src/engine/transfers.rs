@@ -261,6 +261,9 @@ impl Engine {
             list.upload_eta_secs = Some(list.upload_remaining_bytes.div_ceil(list.upload_rate_bps));
         }
         list.night_window_open = cfg.night.is_some() && !gate.night_closed;
+        let speed = self.upload_speed();
+        list.auto_upload_limit_bps = speed.limit;
+        list.auto_upload_checking = speed.mode == super::adaptive::Mode::Checking;
         if let Some(w) = cfg.night.filter(|_| gate.night_closed) {
             list.night_window_opens_ms =
                 Some(w.next_open_at(&chrono::Local::now()).timestamp_millis());

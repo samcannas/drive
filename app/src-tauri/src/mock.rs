@@ -192,6 +192,7 @@ impl Mock {
                 poll_interval_secs: 60,
                 upload_limit_kbps: 0,
                 download_limit_kbps: 0,
+                adaptive_upload: true,
                 max_parallel_transfers: 4,
                 launch_at_login: true,
                 notifications: true,
@@ -429,6 +430,7 @@ impl Mock {
                 if let Some(v) = p.poll_interval_secs { s.poll_interval_secs = v }
                 if let Some(v) = p.upload_limit_kbps { s.upload_limit_kbps = v }
                 if let Some(v) = p.download_limit_kbps { s.download_limit_kbps = v }
+                if let Some(v) = p.adaptive_upload { s.adaptive_upload = v }
                 if let Some(v) = p.max_parallel_transfers { s.max_parallel_transfers = v }
                 if let Some(v) = p.launch_at_login { s.launch_at_login = v }
                 if let Some(v) = p.notifications { s.notifications = v }
@@ -916,6 +918,12 @@ fn transfers_of(st: &State) -> TransferList {
             None
         },
         night_window_open: false,
+        // The transfers scenario shows uploads slowed to keep the connection responsive.
+        auto_upload_limit_bps: (st.settings.adaptive_upload
+            && upload_rate > 0
+            && transfers_forced())
+        .then_some(1_450_000),
+        auto_upload_checking: false,
         items,
     }
 }

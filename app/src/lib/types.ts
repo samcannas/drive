@@ -28,6 +28,8 @@ export interface Settings {
   poll_interval_secs: number;
   upload_limit_kbps: number;
   download_limit_kbps: number;
+  /** Slow uploads down while they make the connection sluggish (and only then). */
+  adaptive_upload: boolean;
   max_parallel_transfers: number;
   launch_at_login: boolean;
   notifications: boolean;
@@ -91,6 +93,10 @@ export interface TransferList {
   /** Unix ms when the overnight window next opens (night uploads on and the window closed). */
   night_window_opens_ms: number | null;
   night_window_open: boolean;
+  /** Uploads are slowed to this many bytes/s to keep the connection responsive. */
+  auto_upload_limit_bps: number | null;
+  /** Uploads are paused for a few seconds to check whether they slow the connection. */
+  auto_upload_checking: boolean;
 }
 
 export type ActivityKind =

@@ -29,6 +29,9 @@ use tracing::{debug, warn};
 use crate::remote::{ByteStream, Kind, Remote, RemoteEntry, RemoteError, RemoteTree, UploadBody};
 
 pub const API_ROOT: &str = "https://apis.uloz.to";
+/// Host whose TCP handshake time measures the user's connection for the automatic upload
+/// speed (only the handshake: nothing is requested).
+pub const PROBE_TARGET: &str = "apis.uloz.to:443";
 
 /// The shared testing API key published at <https://uloz.to/apidoc/public>. uloz.to says it may
 /// change at any time and asks real applications to request a dedicated key from support;

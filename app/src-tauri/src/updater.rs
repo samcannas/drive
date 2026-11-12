@@ -508,6 +508,22 @@ async fn download_locked(app: &AppHandle) -> Result<Downloaded, String> {
     Ok(downloaded)
 }
 
+/// How long installing waits for the last-moment check for a newer version.
+const INSTALL_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Asks the feed once more right before installing. A download made hours ago may already be
+/// outdated (it once installed 0.1.19 and then 0.1.29 straight after); if a newer version is
+/// out, the check forgets the old download and `download_locked` fetches the new one. When
+/// the check fails or times out (offline), the download already made is installed.
+async fn refresh_before_install(app: &AppHandle) {
+    match tokio::time::timeout(INSTALL_CHECK_TIMEOUT, check_locked(app, false)).await {
+        Ok(Ok(Some(f))) => tracing::info!("latest version before installing: {}", f.version),
+        Ok(Ok(None)) => tracing::info!("no update on the feed any more"),
+        Ok(Err(e)) => tracing::info!("checking before installing failed, installing anyway: {e}"),
+        Err(_) => tracing::info!("checking before installing timed out, installing anyway"),
+    }
+}
+
 /// Downloads if needed, stops the service, installs and starts Drive again. Only returns
 /// when something failed (or in the mock).
 pub async fn install(app: &AppHandle, backend: &Arc<Backend>) -> Result<(), String> {
@@ -516,6 +532,7 @@ pub async fn install(app: &AppHandle, backend: &Arc<Backend>) -> Result<(), Stri
         return Err(reason.into());
     }
     let _op = u.op.lock().await;
+    refresh_before_install(app).await;
     let ready = download_locked(app).await?;
     let version = ready.found.version.clone();
     set_status(
@@ -786,8 +803,20 @@ fn mock_changelog() -> Vec<Release> {
 async fn mock_check() -> Result<Option<Found>, String> {
     tokio::time::sleep(Duration::from_millis(800)).await;
     let latest = &mock_changelog()[0];
+    // Debug builds: DRIVE_UI_MOCK_UPDATE_VERSION_FILE names a file holding the version the
+    // mock feed offers, read on every check, so a test can publish a newer version between
+    // the download and the install.
+    let version = std::env::var_os("DRIVE_UI_MOCK_UPDATE_VERSION_FILE")
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| latest.version.clone());
+    // "offline" in that file makes the check fail, as if the feed were unreachable.
+    if version == "offline" {
+        return Err("Couldn't reach the update server.".into());
+    }
     Ok(Some(Found {
-        version: latest.version.clone(),
+        version,
         date: latest.date.clone(),
         notes: latest.notes.clone(),
         update: None,

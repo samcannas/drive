@@ -240,6 +240,10 @@ pub struct Settings {
     pub upload_limit_kbps: u64,
     /// KiB/s. 0 = unlimited.
     pub download_limit_kbps: u64,
+    /// Slow uploads down automatically while they make the connection sluggish for everything
+    /// else (and only then). Applies below `upload_limit_kbps`.
+    #[serde(default = "default_true")]
+    pub adaptive_upload: bool,
     pub max_parallel_transfers: u32,
     /// Start the tray app (and service) when the user signs in.
     pub launch_at_login: bool,
@@ -298,6 +302,7 @@ pub struct SettingsPatch {
     pub poll_interval_secs: Option<u64>,
     pub upload_limit_kbps: Option<u64>,
     pub download_limit_kbps: Option<u64>,
+    pub adaptive_upload: Option<bool>,
     pub max_parallel_transfers: Option<u32>,
     pub launch_at_login: Option<bool>,
     pub notifications: Option<bool>,
@@ -395,6 +400,13 @@ pub struct TransferList {
     /// window is closed).
     pub night_window_opens_ms: Option<i64>,
     pub night_window_open: bool,
+    /// Uploads are slowed automatically to this many bytes/s to keep the connection
+    /// responsive (see `Settings::adaptive_upload`).
+    #[serde(default)]
+    pub auto_upload_limit_bps: Option<u64>,
+    /// Uploads are paused for a few seconds to check whether they slow the connection.
+    #[serde(default)]
+    pub auto_upload_checking: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

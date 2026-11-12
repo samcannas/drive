@@ -181,6 +181,11 @@ impl Service {
             max_parallel_transfers: cfg.max_parallel_transfers.clamp(1, 16) as usize,
             upload_limit_kbps: cfg.upload_limit_kbps,
             download_limit_kbps: cfg.download_limit_kbps,
+            adaptive_upload: cfg.adaptive_upload,
+            // The development backend has no network to measure.
+            probe_target: dev_remote_dir()
+                .is_none()
+                .then(|| drive_core::ulozto::PROBE_TARGET.to_string()),
             night: if cfg.night_uploads {
                 drive_core::engine::schedule::NightWindow::parse(&cfg.night_start, &cfg.night_end)
             } else {
@@ -655,6 +660,9 @@ impl Service {
         }
         if let Some(v) = patch.download_limit_kbps {
             c.download_limit_kbps = v;
+        }
+        if let Some(v) = patch.adaptive_upload {
+            c.adaptive_upload = v;
         }
         if let Some(v) = patch.max_parallel_transfers {
             c.max_parallel_transfers = v.clamp(1, 16);

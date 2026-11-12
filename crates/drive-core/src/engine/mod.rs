@@ -9,6 +9,7 @@
 //! * Platform layers report local changes through the `local_*` methods and serve file
 //!   contents through [`Engine::read`].
 
+pub mod adaptive;
 pub mod local;
 pub mod plan;
 pub mod schedule;
@@ -49,6 +50,11 @@ pub struct EngineConfig {
     pub max_parallel_transfers: usize,
     pub upload_limit_kbps: u64,
     pub download_limit_kbps: u64,
+    /// Automatic upload speed (see [`adaptive`]).
+    pub adaptive_upload: bool,
+    /// `host:port` whose TCP handshake time measures the connection's queue (the provider's
+    /// API host). `None`: no measurements, so no automatic upload speed.
+    pub probe_target: Option<String>,
     /// Wait this long after the last local change before uploading.
     pub debounce: Duration,
     /// Keep at least this much disk space free by evicting cached files.
@@ -70,6 +76,8 @@ impl Default for EngineConfig {
             max_parallel_transfers: 3,
             upload_limit_kbps: 0,
             download_limit_kbps: 0,
+            adaptive_upload: true,
+            probe_target: None,
             debounce: Duration::from_secs(3),
             min_free_bytes: 2 * 1024 * 1024 * 1024,
             night: None,
@@ -160,6 +168,8 @@ pub struct Engine {
     last_sync_ms: AtomicI64,
     up: Arc<Throttle>,
     down: Arc<Throttle>,
+    /// Latest state of the automatic upload speed.
+    upload_speed: Arc<Mutex<adaptive::Snapshot>>,
 }
 
 impl Engine {
@@ -179,6 +189,7 @@ impl Engine {
         let engine = Arc::new(Self {
             up: Arc::new(Throttle::new(cfg.upload_limit_kbps)),
             down: Arc::new(Throttle::new(cfg.download_limit_kbps)),
+            upload_speed: Arc::new(Mutex::new(adaptive::Snapshot::default())),
             hydrate_permits: Semaphore::new(cfg.max_parallel_transfers.max(1)),
             db,
             remote,
@@ -262,7 +273,39 @@ impl Engine {
         tokio::spawn(self.clone().evictor_loop());
         tokio::spawn(self.clone().housekeeping_loop());
         tokio::spawn(self.clone().status_loop());
+        self.start_upload_speed();
         self.resume_pins();
+    }
+
+    /// Runs the automatic upload speed controller while the engine runs.
+    fn start_upload_speed(self: &Arc<Self>) {
+        let Some(target) = self.config().probe_target else {
+            return;
+        };
+        let me = Arc::downgrade(self);
+        let enabled = move || {
+            me.upgrade()
+                .is_some_and(|e| e.cfg.read().unwrap().adaptive_upload)
+        };
+        let me = Arc::downgrade(self);
+        let uploads_active = move || {
+            me.upgrade()
+                .is_some_and(|e| e.transfers.lock().unwrap().values().any(|t| t.upload))
+        };
+        tokio::spawn(adaptive::run(
+            self.up.clone(),
+            adaptive::TcpProbe::new(target),
+            enabled,
+            uploads_active,
+            self.upload_speed.clone(),
+            adaptive::Params::default(),
+            self.cancel.child_token(),
+        ));
+    }
+
+    /// The automatic upload speed's current state.
+    pub fn upload_speed(&self) -> adaptive::Snapshot {
+        *self.upload_speed.lock().unwrap()
     }
 
     pub fn shutdown(&self) {
