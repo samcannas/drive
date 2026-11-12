@@ -68,6 +68,15 @@ pub enum Change {
     Resurrect { node: NodeId, generation: i64 },
     /// A locally deleted item is gone remotely too: drop the tombstone.
     DropTombstone { node: NodeId },
+    /// Mirror engines: a cloud item matches a local item that isn't uploaded yet (same name,
+    /// kind and, for files, size and modification time): record it instead of uploading.
+    Link {
+        node: NodeId,
+        generation: i64,
+        entry: RemoteEntry,
+    },
+    /// Mirror engines: a cloud item that doesn't belong in the copy; move it to the trash.
+    TrashRemote { entry: RemoteEntry },
 }
 
 #[derive(Debug, Default)]
@@ -104,6 +113,9 @@ pub struct PlanInput<'a> {
     /// change, so the listing can't be compared with them yet (an upload that finished
     /// between the listing and now would otherwise look like a conflict).
     pub busy: &'a HashSet<NodeId>,
+    /// Remote folders whose whole subtree this device doesn't sync (its own folder backups,
+    /// which a separate mirror engine maintains).
+    pub excluded: &'a HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -314,6 +326,32 @@ pub fn conflict_name(name: &str, device: &str, stamp: &str) -> String {
     format!("{stem} (conflict {device} {stamp}){ext}")
 }
 
+/// Ids of the excluded folders and everything below them.
+fn excluded_subtrees<'t>(tree: &'t RemoteTree, excluded: &HashSet<String>) -> HashSet<&'t str> {
+    if excluded.is_empty() {
+        return HashSet::new();
+    }
+    let mut kids: HashMap<&str, Vec<&str>> = HashMap::new();
+    for e in &tree.entries {
+        kids.entry(e.parent_id.as_str())
+            .or_default()
+            .push(e.id.as_str());
+    }
+    let mut out = HashSet::new();
+    let mut stack: Vec<&str> = tree
+        .entries
+        .iter()
+        .filter(|e| excluded.contains(&e.id))
+        .map(|e| e.id.as_str())
+        .collect();
+    while let Some(id) = stack.pop() {
+        if out.insert(id) {
+            stack.extend(kids.get(id).into_iter().flatten().copied());
+        }
+    }
+    out
+}
+
 pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
     let tree = input.tree;
     if tree.entries.is_empty() && !tree.skipped.is_empty() {
@@ -322,11 +360,13 @@ pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
 
     let mut m = Model::new(input.nodes);
     let mut out = Plan::default();
+    let hidden = excluded_subtrees(tree, input.excluded);
     let remote: HashMap<&str, &RemoteEntry> = tree
         .entries
         .iter()
         .filter(|e| !input.orphans.contains(&e.id))
         .filter(|e| !(e.parent_id == tree.root_id && e.name == VAULT_MARKER))
+        .filter(|e| !hidden.contains(e.id.as_str()))
         .map(|e| (e.id.as_str(), e))
         .collect();
     let mut kids: HashMap<&str, Vec<&RemoteEntry>> = HashMap::new();
@@ -722,6 +762,7 @@ mod tests {
             stamp: "2026-11-10 1200",
             allow_mass_removal: false,
             busy: &HashSet::new(),
+            excluded: &HashSet::new(),
         })
         .unwrap()
     }
@@ -951,6 +992,7 @@ mod tests {
             stamp: "x",
             allow_mass_removal: false,
             busy: &HashSet::new(),
+            excluded: &HashSet::new(),
         });
         assert_eq!(r.unwrap_err(), PlanError::WrongPassword(1));
     }
@@ -985,10 +1027,51 @@ mod tests {
             stamp: "x",
             allow_mass_removal: false,
             busy: &busy,
+            excluded: &HashSet::new(),
         })
         .unwrap();
         assert!(p.changes.is_empty(), "{:?}", p.changes);
         assert!(p.conflicts.is_empty());
+    }
+
+    #[test]
+    fn excluded_subtrees_are_ignored_and_dropped() {
+        let nodes = [
+            root(),
+            node(2, 1, "Backups", Kind::Folder, Some(("B", "R"))),
+            node(3, 2, "PC", Kind::Folder, Some(("P", "B"))),
+            node(4, 3, "old.txt", Kind::File, Some(("o", "P"))),
+        ];
+        let tree = RemoteTree {
+            root_id: "R".into(),
+            entries: vec![
+                entry("B", "R", "Backups", Kind::Folder),
+                entry("P", "B", "PC", Kind::Folder),
+                entry("o", "P", "old.txt", Kind::File),
+                entry("n", "P", "new.txt", Kind::File),
+            ],
+            skipped: vec![],
+        };
+        let excluded: HashSet<String> = ["P".to_string()].into();
+        let p = plan(&PlanInput {
+            nodes: &nodes,
+            tree: &tree,
+            scan_seq: 10,
+            orphans: &HashSet::new(),
+            valid_name: &crate::engine::local::valid_portable_name,
+            device_name: "PC",
+            stamp: "x",
+            allow_mass_removal: false,
+            busy: &HashSet::new(),
+            excluded: &excluded,
+        })
+        .unwrap();
+        // Nothing new appears, and what was shown before goes away.
+        assert!(!p.changes.iter().any(|c| matches!(c, Change::Create { .. })));
+        assert!(p.changes.contains(&Change::Remove {
+            node: 3,
+            generation: 0
+        }));
     }
 
     #[test]

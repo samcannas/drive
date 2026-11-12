@@ -319,6 +319,16 @@ fn decrypt_stream(
 
 #[async_trait]
 impl<R: Remote> Remote for CryptRemote<R> {
+    async fn list(&self, parent_id: &str) -> Result<Vec<RemoteEntry>, RemoteError> {
+        Ok(self
+            .inner
+            .list(parent_id)
+            .await?
+            .into_iter()
+            .filter_map(|e| self.decrypt_entry(e))
+            .collect())
+    }
+
     async fn scan(&self) -> Result<RemoteTree, RemoteError> {
         let raw = self.inner.scan().await?;
         let mut tree = RemoteTree {

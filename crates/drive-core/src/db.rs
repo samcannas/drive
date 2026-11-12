@@ -709,7 +709,7 @@ impl Db {
             if id % 100 == 0 {
                 tx.execute("DELETE FROM activity WHERE id <= ?1", [id - 1000])?;
             }
-            Ok(Activity { id, at_ms: at, kind, path: path.to_string(), bytes, detail: detail.map(str::to_string) })
+            Ok(Activity { id, at_ms: at, kind, path: path.to_string(), bytes, detail: detail.map(str::to_string), backup: None })
         })
     }
 
@@ -731,6 +731,7 @@ impl Db {
                     path: r.get(3)?,
                     bytes: r.get::<_, i64>(4)? as u64,
                     detail: r.get(5)?,
+                    backup: None,
                 })
             })?
             .collect()
@@ -785,7 +786,7 @@ impl Db {
                 |r| {
                     let kind = issue_kind_parse(&r.get::<_, String>(1)?);
                     Ok((
-                        Issue { id: r.get(0)?, kind, path: r.get(2)?, message: r.get(3)?, created_ms: r.get(4)?, actions: issue_actions(kind) },
+                        Issue { id: r.get(0)?, kind, path: r.get(2)?, message: r.get(3)?, created_ms: r.get(4)?, actions: issue_actions(kind), backup: None },
                         r.get(5)?,
                         r.get(6)?,
                     ))
@@ -802,7 +803,7 @@ impl Db {
             )?;
             st.query_map([], |r| {
                 let kind = issue_kind_parse(&r.get::<_, String>(1)?);
-                Ok(Issue { id: r.get(0)?, kind, path: r.get(2)?, message: r.get(3)?, created_ms: r.get(4)?, actions: issue_actions(kind) })
+                Ok(Issue { id: r.get(0)?, kind, path: r.get(2)?, message: r.get(3)?, created_ms: r.get(4)?, actions: issue_actions(kind), backup: None })
             })?
             .collect()
         })

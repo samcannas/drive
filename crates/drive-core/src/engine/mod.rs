@@ -11,6 +11,7 @@
 
 pub mod adaptive;
 pub mod local;
+pub mod mirror;
 pub mod plan;
 pub mod schedule;
 pub mod throttle;
@@ -19,7 +20,7 @@ mod transfers;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -63,6 +64,13 @@ pub struct EngineConfig {
     pub night: Option<schedule::NightWindow>,
     /// Uploads at least this large wait for the night window.
     pub night_min_bytes: u64,
+    /// Mirror engine (folder backups): the local side is the source of truth and is never
+    /// changed; the cloud copy follows it one way (see [`mirror`]).
+    pub mirror: bool,
+    /// Remote folders (ids) whose subtrees this engine ignores (this device's own backups).
+    pub exclude_remote: Vec<String>,
+    /// Local paths (relative, `/`-separated) that are never uploaded.
+    pub exclude_local: Vec<String>,
 }
 
 impl Default for EngineConfig {
@@ -82,6 +90,9 @@ impl Default for EngineConfig {
             min_free_bytes: 2 * 1024 * 1024 * 1024,
             night: None,
             night_min_bytes: 200 * 1024 * 1024,
+            mirror: false,
+            exclude_remote: Vec::new(),
+            exclude_local: Vec::new(),
         }
     }
 }
@@ -170,10 +181,91 @@ pub struct Engine {
     down: Arc<Throttle>,
     /// Latest state of the automatic upload speed.
     upload_speed: Arc<Mutex<adaptive::Snapshot>>,
+    /// Uploads running in this engine and in engines linked to it (shared with
+    /// [`Engine::new_linked`] engines so the automatic upload speed sees all of them).
+    uploads_running: Arc<AtomicUsize>,
+    /// Mirror engines: the local side has been fully read (after start, or after a backed-up
+    /// folder was added). Until then cloud items can't be judged.
+    local_ready: AtomicBool,
+    /// Mirror engines: a cloud scan was applied since `local_ready`, so local items that are
+    /// already in the cloud have been recognised. Nothing uploads before that.
+    mirror_linked: AtomicBool,
+    /// Mirror engines: name keys of the top-level folders being mirrored.
+    mirror_roots: Mutex<HashSet<String>>,
+}
+
+/// Upload resources shared between an engine and the engines linked to it.
+struct Shared {
+    up: Arc<Throttle>,
+    down: Arc<Throttle>,
+    upload_speed: Arc<Mutex<adaptive::Snapshot>>,
+    uploads_running: Arc<AtomicUsize>,
+}
+
+/// One change to a mirrored folder, for [`Engine::mirror_apply`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MirrorOp {
+    Create {
+        path: String,
+        kind: Kind,
+        size: u64,
+        mtime_ms: i64,
+    },
+    Modify {
+        path: String,
+        size: u64,
+        mtime_ms: i64,
+    },
+    Rename {
+        from: String,
+        to: String,
+    },
+    Delete {
+        path: String,
+    },
+}
+
+/// Size of a top-level folder's subtree, for [`Engine::top_level_stats`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SubtreeStats {
+    pub files: u64,
+    pub bytes: u64,
+    /// Files whose current content is in the cloud.
+    pub done_files: u64,
+    pub done_bytes: u64,
+    /// Items with work waiting (uploads, moves, removals).
+    pub pending: u32,
 }
 
 impl Engine {
     pub fn new(db: Arc<Db>, remote: Arc<dyn Remote>, cfg: EngineConfig) -> Result<Arc<Self>> {
+        Self::build(db, remote, cfg, None)
+    }
+
+    /// An engine that shares `main`'s upload and download throttles and its automatic upload
+    /// speed (folder backups next to the main vault), so the two don't compete.
+    pub fn new_linked(
+        db: Arc<Db>,
+        remote: Arc<dyn Remote>,
+        mut cfg: EngineConfig,
+        main: &Engine,
+    ) -> Result<Arc<Self>> {
+        cfg.probe_target = None; // the main engine's controller covers both
+        let shared = Shared {
+            up: main.up.clone(),
+            down: main.down.clone(),
+            upload_speed: main.upload_speed.clone(),
+            uploads_running: main.uploads_running.clone(),
+        };
+        Self::build(db, remote, cfg, Some(shared))
+    }
+
+    fn build(
+        db: Arc<Db>,
+        remote: Arc<dyn Remote>,
+        cfg: EngineConfig,
+        shared: Option<Shared>,
+    ) -> Result<Arc<Self>> {
         let max_seq: i64 = db.read(|c| {
             c.query_row("SELECT COALESCE(MAX(op_seq), 0) FROM node", [], |r| {
                 r.get(0)
@@ -186,10 +278,21 @@ impl Engine {
         let paused = db.kv_get("paused")?.as_deref() == Some("1");
         let (status_tx, _) = watch::channel(Status::default());
         let (events, _) = broadcast::channel(512);
-        let engine = Arc::new(Self {
+        let shared = shared.unwrap_or_else(|| Shared {
             up: Arc::new(Throttle::new(cfg.upload_limit_kbps)),
             down: Arc::new(Throttle::new(cfg.download_limit_kbps)),
             upload_speed: Arc::new(Mutex::new(adaptive::Snapshot::default())),
+            uploads_running: Arc::new(AtomicUsize::new(0)),
+        });
+        let mirror = cfg.mirror;
+        let engine = Arc::new(Self {
+            up: shared.up,
+            down: shared.down,
+            upload_speed: shared.upload_speed,
+            uploads_running: shared.uploads_running,
+            local_ready: AtomicBool::new(!mirror),
+            mirror_linked: AtomicBool::new(!mirror),
+            mirror_roots: Mutex::new(HashSet::new()),
             hydrate_permits: Semaphore::new(cfg.max_parallel_transfers.max(1)),
             db,
             remote,
@@ -253,8 +356,11 @@ impl Engine {
     pub fn update_config(&self, f: impl FnOnce(&mut EngineConfig)) {
         let mut cfg = self.cfg.write().unwrap();
         f(&mut cfg);
-        self.up.set_kbps(cfg.upload_limit_kbps);
-        self.down.set_kbps(cfg.download_limit_kbps);
+        if !cfg.mirror {
+            // Mirror engines share the main engine's throttles; it owns the limits.
+            self.up.set_kbps(cfg.upload_limit_kbps);
+            self.down.set_kbps(cfg.download_limit_kbps);
+        }
         drop(cfg);
         self.wake_scanner.notify_one();
         self.wake_evictor.notify_one();
@@ -268,13 +374,19 @@ impl Engine {
             self.local.get().is_some(),
             "Engine::set_local must be called before start"
         );
+        let mirror = self.config().mirror;
         tokio::spawn(self.clone().scanner_loop());
         tokio::spawn(self.clone().worker_loop());
-        tokio::spawn(self.clone().evictor_loop());
+        if !mirror {
+            // Mirror engines never hold cloud content locally: nothing to evict or pin.
+            tokio::spawn(self.clone().evictor_loop());
+        }
         tokio::spawn(self.clone().housekeeping_loop());
         tokio::spawn(self.clone().status_loop());
         self.start_upload_speed();
-        self.resume_pins();
+        if !mirror {
+            self.resume_pins();
+        }
     }
 
     /// Runs the automatic upload speed controller while the engine runs.
@@ -287,11 +399,8 @@ impl Engine {
             me.upgrade()
                 .is_some_and(|e| e.cfg.read().unwrap().adaptive_upload)
         };
-        let me = Arc::downgrade(self);
-        let uploads_active = move || {
-            me.upgrade()
-                .is_some_and(|e| e.transfers.lock().unwrap().values().any(|t| t.upload))
-        };
+        let running = self.uploads_running.clone();
+        let uploads_active = move || running.load(Ordering::Relaxed) > 0;
         tokio::spawn(adaptive::run(
             self.up.clone(),
             adaptive::TcpProbe::new(target),
@@ -628,6 +737,34 @@ impl Engine {
         self.create_in(parent_id, name, Kind::Folder, 0, now_ms())
     }
 
+    /// Whether `path` is (inside) a local path this engine never uploads.
+    fn excluded_path(&self, path: &str) -> bool {
+        let cfg = self.cfg.read().unwrap();
+        let key = name_key(path.trim_matches('/'));
+        cfg.exclude_local.iter().any(|ex| {
+            let ex = name_key(ex.trim_matches('/'));
+            !ex.is_empty() && (key == ex || key.starts_with(&format!("{ex}/")))
+        })
+    }
+
+    fn excluded_child(&self, parent: NodeId, name: &str) -> bool {
+        if self.cfg.read().unwrap().exclude_local.is_empty() {
+            return false;
+        }
+        match self.db.path_of(parent) {
+            Ok(Some(p)) if p.is_empty() => self.excluded_path(name),
+            Ok(Some(p)) => self.excluded_path(&format!("{p}/{name}")),
+            _ => false,
+        }
+    }
+
+    fn excluded_node(&self, id: NodeId) -> bool {
+        if self.cfg.read().unwrap().exclude_local.is_empty() {
+            return false;
+        }
+        matches!(self.db.path_of(id), Ok(Some(p)) if self.excluded_path(&p))
+    }
+
     /// A new file or folder appeared locally at `path`. If it already exists, this is treated
     /// as a modification.
     pub fn local_create(&self, path: &str, kind: Kind, size: u64, mtime_ms: i64) -> Result<NodeId> {
@@ -654,7 +791,7 @@ impl Engine {
         if name.is_empty() || name.contains('/') {
             return Err(EngineError::Invalid(format!("invalid name {name:?}")));
         }
-        let syncs = !is_ignored_name(name);
+        let syncs = !is_ignored_name(name) && !self.excluded_child(parent, name);
         let now = now_ms();
         let id = self.db.write(|tx| {
             let p = db::get_node(tx, parent)?.filter(|p| !p.deleted && p.is_folder());
@@ -726,6 +863,12 @@ impl Engine {
             )?;
             Ok(())
         })?;
+        if self.excluded_node(id) {
+            self.db.write(|tx| {
+                tx.execute("UPDATE node SET pending = pending & ~1 WHERE id = ?1", [id])
+                    .map(|_| ())
+            })?;
+        }
         self.clear_issue(&format!("transfer:{id}"));
         self.wake_worker.notify_one();
         self.status_changed.notify_one();
@@ -915,6 +1058,9 @@ impl Engine {
         resumable: bool,
     ) -> u64 {
         let id = self.next_transfer.fetch_add(1, Ordering::Relaxed);
+        if upload {
+            self.uploads_running.fetch_add(1, Ordering::Relaxed);
+        }
         let last_done = progress.done();
         self.transfers.lock().unwrap().insert(
             id,
@@ -935,7 +1081,11 @@ impl Engine {
     }
 
     fn end_transfer(&self, id: u64) {
-        self.transfers.lock().unwrap().remove(&id);
+        if let Some(t) = self.transfers.lock().unwrap().remove(&id)
+            && t.upload
+        {
+            self.uploads_running.fetch_sub(1, Ordering::Relaxed);
+        }
         self.status_changed.notify_one();
     }
 
@@ -1223,6 +1373,9 @@ impl Engine {
     }
 
     fn apply_scan(&self, tree: crate::remote::RemoteTree, scan_seq: i64) -> Result<()> {
+        if self.config().mirror {
+            return self.apply_mirror_scan(tree, scan_seq);
+        }
         // Snapshot in-flight work *before* reading the rows: anything that finishes in
         // between is then either still marked busy or already recorded in its row.
         let busy: HashSet<NodeId> = self.in_flight.lock().unwrap().clone();
@@ -1259,6 +1412,7 @@ impl Engine {
             stamp: &stamp,
             allow_mass_removal: now_ms() < self.allow_remote_removal_until.load(Ordering::Relaxed),
             busy: &busy,
+            excluded: &cfg.exclude_remote.iter().cloned().collect(),
         });
         let plan = match plan {
             Ok(p) => {
@@ -1645,8 +1799,301 @@ impl Engine {
                         .map(|_| ())
                 })?;
             }
+            Change::Link {
+                node,
+                generation,
+                entry,
+            } => {
+                self.db.write(|tx| {
+                    let changed = tx.execute(
+                        "UPDATE node SET remote_id = ?2, remote_parent_id = ?3, remote_name = ?4,
+                             pending = pending & ~1,
+                             dirty = CASE WHEN kind = 0 THEN 0 ELSE dirty END,
+                             attempts = 0, last_error = NULL, retry_at_ms = 0
+                         WHERE id = ?1 AND remote_id IS NULL AND deleted = 0 AND generation = ?5",
+                        params![node, entry.id, entry.parent_id, entry.name, generation],
+                    )?;
+                    if changed > 0 {
+                        recompute_move(tx, node)?;
+                    }
+                    Ok(())
+                })?;
+            }
+            Change::TrashRemote { entry } => {
+                self.db.write(|tx| db::add_orphan(tx, &entry))?;
+            }
         }
         Ok(())
+    }
+
+    /// Mirror engines: plans the cloud copy against the local rows (see [`mirror`]).
+    fn apply_mirror_scan(&self, tree: crate::remote::RemoteTree, scan_seq: i64) -> Result<()> {
+        if !self.local_ready.load(Ordering::SeqCst) {
+            debug!("mirror scan skipped: the local folders are still being read");
+            return Ok(());
+        }
+        let busy: HashSet<NodeId> = self.in_flight.lock().unwrap().clone();
+        let nodes = self.db.all_nodes()?;
+        let mut orphans = self.db.orphan_ids()?;
+        for s in self.db.upload_sessions()? {
+            if let Some(id) = self
+                .remote
+                .resume_info(&s.state)
+                .and_then(|i| i.assembled_id)
+            {
+                orphans.insert(id);
+            }
+        }
+        orphans.extend(
+            self.recently_gone
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, s)| **s > scan_seq)
+                .map(|(k, _)| k.clone()),
+        );
+        let roots = self.mirror_roots.lock().unwrap().clone();
+        let plan = mirror::plan_mirror(&mirror::MirrorInput {
+            nodes: &nodes,
+            tree: &tree,
+            scan_seq,
+            orphans: &orphans,
+            busy: &busy,
+            roots: &roots,
+            allow_mass_removal: now_ms() < self.allow_remote_removal_until.load(Ordering::Relaxed),
+        });
+        let plan = match plan {
+            Ok(p) => {
+                if self.wrong_password.swap(false, Ordering::Relaxed) {
+                    self.clear_issue("wrong_password");
+                }
+                p
+            }
+            Err(PlanError::WrongPassword(n)) => {
+                self.wrong_password.store(true, Ordering::Relaxed);
+                self.issue(
+                    IssueKind::WrongPassword,
+                    "wrong_password",
+                    None,
+                    None,
+                    &format!(
+                        "None of the {n} items in your backups can be decrypted with the saved encryption password. Nothing was changed."
+                    ),
+                );
+                return Ok(());
+            }
+        };
+        let mut ids: HashMap<i64, NodeId> = HashMap::new();
+        let total = plan.changes.len();
+        for change in plan.changes {
+            if let Err(e) = self.apply_change(change, &mut ids) {
+                warn!("applying a backup change failed: {e}");
+            }
+        }
+        if total > 0 {
+            info!("applied {total} changes to the backup copy");
+        }
+        self.held_remote_removals
+            .store(plan.held_removal_files, Ordering::Relaxed);
+        if plan.held_removal_files > 0 {
+            self.issue(
+                IssueKind::MassDelete,
+                "mass_delete:remote",
+                None,
+                None,
+                &format!(
+                    "{} files in the cloud copy of your backups aren't on this device anymore. Remove them from the cloud copy? They stay in the uloz.to trash for 30 days.",
+                    plan.held_removal_files
+                ),
+            );
+        } else {
+            self.clear_issue("mass_delete:remote");
+        }
+        self.mirror_linked.store(true, Ordering::SeqCst);
+        let now = now_ms();
+        self.last_sync_ms.store(now, Ordering::Relaxed);
+        let _ = self.db.kv_set("last_sync_ms", &now.to_string());
+        self.status_changed.notify_one();
+        self.wake_worker.notify_one();
+        Ok(())
+    }
+
+    // ---- mirror engines (folder backups) -------------------------------------------------
+
+    /// Mirror engines: marks the local side as fully read (or not, while a folder is being
+    /// read for the first time). Uploads wait until a cloud scan after that has run, so files
+    /// that are already in the cloud are recognised instead of uploaded again.
+    pub fn set_local_ready(&self, ready: bool) {
+        if ready {
+            self.local_ready.store(true, Ordering::SeqCst);
+            self.wake_scanner.notify_one();
+        } else {
+            self.local_ready.store(false, Ordering::SeqCst);
+            self.mirror_linked.store(false, Ordering::SeqCst);
+        }
+        self.status_changed.notify_one();
+    }
+
+    /// Mirror engines: whether the cloud copy has been matched up with the local folders.
+    pub fn mirror_linked(&self) -> bool {
+        self.mirror_linked.load(Ordering::SeqCst)
+    }
+
+    /// Mirror engines: the top-level folders being mirrored. Cloud items under other top-level
+    /// folders are left alone.
+    pub fn set_mirror_roots(&self, names: impl IntoIterator<Item = String>) {
+        *self.mirror_roots.lock().unwrap() = names.into_iter().map(|n| name_key(&n)).collect();
+    }
+
+    /// Mirror engines: applies a batch of local changes. Creates of new items run in large
+    /// transactions (a first backup of a big folder is hundreds of thousands of rows).
+    pub fn mirror_apply(&self, ops: &[MirrorOp]) -> Result<()> {
+        let now = now_ms();
+        let mut pending_creates: Vec<&MirrorOp> = Vec::new();
+        let flush = |creates: &mut Vec<&MirrorOp>| -> Result<()> {
+            if creates.is_empty() {
+                return Ok(());
+            }
+            self.db.write(|tx| {
+                let mut ids: HashMap<String, NodeId> = HashMap::new();
+                for op in creates.iter() {
+                    let MirrorOp::Create {
+                        path,
+                        kind,
+                        size,
+                        mtime_ms,
+                    } = op
+                    else {
+                        continue;
+                    };
+                    let (parent_path, name) = Self::split_path(path);
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let parent = match ids.get(&name_key(parent_path)) {
+                        Some(id) => *id,
+                        None => match resolve_path(tx, parent_path)? {
+                            Some(id) => id,
+                            None => continue, // parent missing: the next full scan retries
+                        },
+                    };
+                    if let Some(existing) = db::get_child(tx, parent, name)? {
+                        if *kind == Kind::Folder && existing.is_folder() {
+                            ids.insert(name_key(path), existing.id);
+                        }
+                        continue;
+                    }
+                    let syncs = !is_ignored_name(name);
+                    tx.execute(
+                        "INSERT INTO node (parent_id, name, name_key, kind, size, mtime_ms, dirty, pending,
+                                           changed_ms, hydrated, pinned, accessed_ms, created_ms)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?7, 0, ?9, ?9)",
+                        params![
+                            parent,
+                            name,
+                            name_key(name),
+                            kind_int(*kind),
+                            *size as i64,
+                            *mtime_ms,
+                            *kind == Kind::File,
+                            if syncs { pending::PUSH } else { 0 },
+                            now,
+                        ],
+                    )?;
+                    if *kind == Kind::Folder {
+                        ids.insert(name_key(path), tx.last_insert_rowid());
+                    }
+                }
+                Ok(())
+            })?;
+            creates.clear();
+            Ok(())
+        };
+        for op in ops {
+            match op {
+                MirrorOp::Create { .. } => {
+                    pending_creates.push(op);
+                    if pending_creates.len() >= 2_000 {
+                        flush(&mut pending_creates)?;
+                    }
+                }
+                other => {
+                    flush(&mut pending_creates)?;
+                    let r = match other {
+                        MirrorOp::Modify {
+                            path,
+                            size,
+                            mtime_ms,
+                        } => self.local_modified(path, *size, *mtime_ms),
+                        MirrorOp::Rename { from, to } => self.local_rename(from, to),
+                        MirrorOp::Delete { path } => self.local_delete(path),
+                        MirrorOp::Create { .. } => unreachable!(),
+                    };
+                    if let Err(e) = r {
+                        debug!("backup change {other:?} not applied: {e}");
+                    }
+                }
+            }
+        }
+        flush(&mut pending_creates)?;
+        self.wake_worker.notify_one();
+        self.status_changed.notify_one();
+        Ok(())
+    }
+
+    /// Forgets everything below `path` without touching the cloud (a backup switched off:
+    /// its cloud copy stays as it is). The top-level folder's row goes too.
+    pub fn forget_subtree(&self, path: &str) -> Result<()> {
+        let Some(n) = self.db.node_by_path(path)? else {
+            return Ok(());
+        };
+        if n.id == ROOT_ID {
+            return Err(EngineError::Invalid("cannot forget the root".into()));
+        }
+        // Tombstones of the subtree aren't found by path: delete by parent links.
+        self.db.write(|tx| {
+            tx.execute(
+                "WITH RECURSIVE sub(id) AS (SELECT ?1 UNION ALL SELECT n.id FROM node n JOIN sub ON n.parent_id = sub.id)
+                 DELETE FROM node WHERE id IN (SELECT id FROM sub)",
+                [n.id],
+            )
+            .map(|_| ())
+        })?;
+        self.issues_changed();
+        self.status_changed.notify_one();
+        Ok(())
+    }
+
+    /// Per top-level folder (by name): file counts and sizes, in one pass over the table.
+    pub fn top_level_stats(&self) -> Result<HashMap<String, SubtreeStats>> {
+        Ok(self.db.read(|c| {
+            let mut st = c.prepare_cached(
+                "WITH RECURSIVE t(id, top) AS (
+                     SELECT id, id FROM node WHERE parent_id = 1
+                     UNION ALL SELECT n.id, t.top FROM node n JOIN t ON n.parent_id = t.id)
+                 SELECT tn.name,
+                        COUNT(*) FILTER (WHERE n.kind = 0 AND n.deleted = 0),
+                        COALESCE(SUM(n.size) FILTER (WHERE n.kind = 0 AND n.deleted = 0), 0),
+                        COUNT(*) FILTER (WHERE n.kind = 0 AND n.deleted = 0 AND n.remote_id IS NOT NULL AND n.pending & 1 = 0),
+                        COALESCE(SUM(n.size) FILTER (WHERE n.kind = 0 AND n.deleted = 0 AND n.remote_id IS NOT NULL AND n.pending & 1 = 0), 0),
+                        COUNT(*) FILTER (WHERE n.pending != 0)
+                 FROM t JOIN node n ON n.id = t.id JOIN node tn ON tn.id = t.top
+                 GROUP BY t.top",
+            )?;
+            let rows = st.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    SubtreeStats {
+                        files: r.get::<_, i64>(1)? as u64,
+                        bytes: r.get::<_, i64>(2)? as u64,
+                        done_files: r.get::<_, i64>(3)? as u64,
+                        done_bytes: r.get::<_, i64>(4)? as u64,
+                        pending: r.get::<_, i64>(5)? as u32,
+                    },
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<HashMap<_, _>>>()
+        })?)
     }
 
     fn subtree_has_changes(&self, id: NodeId) -> Result<bool> {
@@ -1701,6 +2148,9 @@ impl Engine {
     /// Starts as many due work items as the parallelism limit allows. Returns how many.
     fn dispatch(self: &Arc<Self>) -> usize {
         let cfg = self.config();
+        if cfg.mirror && !self.mirror_linked.load(Ordering::SeqCst) {
+            return 0;
+        }
         let now = now_ms();
         let max = cfg.max_parallel_transfers.max(1);
         let debounce_before = now - cfg.debounce.as_millis() as i64;
@@ -1716,7 +2166,11 @@ impl Engine {
                     "mass_delete:local",
                     None,
                     None,
-                    &format!("You deleted {n} files on this device. Delete them from uloz.to too? They'll stay in the uloz.to trash for 30 days."),
+                    &if cfg.mirror {
+                        format!("You deleted {n} files from backed-up folders. Remove them from the cloud copy too? They'll stay in the uloz.to trash for 30 days.")
+                    } else {
+                        format!("You deleted {n} files on this device. Delete them from uloz.to too? They'll stay in the uloz.to trash for 30 days.")
+                    },
                 );
             } else {
                 self.clear_issue("mass_delete:local");
@@ -2186,9 +2640,10 @@ impl Engine {
     pub fn issues(&self) -> Result<Vec<crate::ipc::Issue>> {
         let mut list = self.db.issues()?;
         // The remote mass-delete guard can only be confirmed (or left waiting).
+        let mirror = self.config().mirror;
         for i in &mut list {
             if i.kind == IssueKind::MassDelete
-                && i.message.contains("deleted from your uloz.to vault")
+                && (mirror || i.message.contains("deleted from your uloz.to vault"))
             {
                 i.actions = vec![IssueAction::ConfirmDelete, IssueAction::Dismiss];
             }
@@ -2278,6 +2733,18 @@ enum UploadOutcome {
     Clean,
     ChangedMeanwhile,
     Gone,
+}
+
+/// Node id of a `/`-separated path ("" is the root), inside a transaction.
+fn resolve_path(tx: &rusqlite::Connection, path: &str) -> rusqlite::Result<Option<NodeId>> {
+    let mut cur = ROOT_ID;
+    for part in path.split('/').filter(|p| !p.is_empty()) {
+        match db::get_child(tx, cur, part)? {
+            Some(n) if n.is_folder() => cur = n.id,
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(cur))
 }
 
 /// Sets or clears the MOVE bit depending on whether the local location differs from the

@@ -30,6 +30,9 @@ bytes.workspace = true
 rpassword = "7"
 fs4 = { version = "0.13", features = ["sync"] }
 
+notify = "8"
+tokio-util.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 cloud-filter = "0.0.7"
 windows = { version = "0.62", features = [

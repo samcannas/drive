@@ -25,6 +25,9 @@ use tracing::{error, info, warn};
 use crate::config::{Account, Config, Paths, Secrets};
 use crate::platform::{self, Platform, PlatformContext};
 
+mod backups;
+use backups::{BackupRuntime, RawBackend};
+
 /// Name of the vault folder in the uloz.to account root.
 pub const VAULT_FOLDER: &str = "Drive vault";
 
@@ -32,6 +35,11 @@ struct Running {
     engine: Arc<Engine>,
     platform: Box<dyn Platform>,
     relay: tokio::task::JoinHandle<()>,
+    /// What the main engine's remote is built from (the backup engine reuses it).
+    raw: RawBackend,
+    cipher: Cipher,
+    /// Remote id of the vault folder.
+    vault_root: String,
 }
 
 struct Inner {
@@ -46,6 +54,14 @@ pub struct Service {
     inner: Mutex<Inner>,
     events: broadcast::Sender<Event>,
     pub shutdown: Notify,
+    /// The folder backup engine, when any folder is backed up.
+    backups: std::sync::Mutex<Option<BackupRuntime>>,
+    /// Serialises starting backups and adding/removing/toggling folders.
+    backup_ops: Mutex<()>,
+    backups_changed: Notify,
+    suggestions: Arc<crate::backup::Suggestions>,
+    /// Latest transfer list of the main and the backup engine.
+    last_transfers: std::sync::Mutex<[drive_core::ipc::TransferList; 2]>,
 }
 
 fn rpc(code: ErrorCode, msg: impl Into<String>) -> RpcError {
@@ -116,6 +132,11 @@ impl Service {
             }),
             events,
             shutdown: Notify::new(),
+            backups: std::sync::Mutex::new(None),
+            backup_ops: Mutex::new(()),
+            backups_changed: Notify::new(),
+            suggestions: Arc::new(crate::backup::Suggestions::default()),
+            last_transfers: std::sync::Mutex::new(Default::default()),
         }))
     }
 
@@ -125,6 +146,7 @@ impl Service {
 
     /// Starts syncing if an account is configured.
     pub async fn start(self: &Arc<Self>) {
+        tokio::spawn(self.clone().backups_loop());
         let mut inner = self.inner.lock().await;
         if inner.config.account.is_none() {
             info!("no account connected yet");
@@ -151,6 +173,7 @@ impl Service {
     }
 
     pub async fn stop(&self) {
+        self.stop_backups();
         let mut inner = self.inner.lock().await;
         if let Some(r) = inner.running.take() {
             stop_running(r);
@@ -172,6 +195,12 @@ impl Service {
     }
 
     fn engine_config(&self, cfg: &Config, account: &Account) -> EngineConfig {
+        let mut ec = self.base_engine_config(cfg, account);
+        backups::main_exclusions(cfg, &mut ec);
+        ec
+    }
+
+    fn base_engine_config(&self, cfg: &Config, account: &Account) -> EngineConfig {
         EngineConfig {
             device_name: cfg.device_name.clone(),
             account: account.login.clone(),
@@ -201,29 +230,36 @@ impl Service {
         let account = cfg.account.clone().context("no account")?;
         let cipher = Cipher::new(&secrets.encryption_password, &account.salt)
             .context("deriving encryption keys")?;
-        let remote: Arc<dyn Remote> = if let Some(dir) = dev_remote_dir() {
-            warn!(
-                "development mode: using {} instead of uloz.to",
-                dir.display()
-            );
-            Arc::new(CryptRemote::new(
-                dev_remote(&dir).map_err(|e| anyhow::anyhow!(e.message))?,
-                cipher,
-            ))
-        } else {
-            let client = self
-                .client_for(
-                    &cfg,
-                    &account.login,
-                    &secrets.uloz_password,
-                    cfg.app_token.as_deref(),
+        let (remote, raw, vault_root): (Arc<dyn Remote>, RawBackend, String) =
+            if let Some(dir) = dev_remote_dir() {
+                warn!(
+                    "development mode: using {} instead of uloz.to",
+                    dir.display()
+                );
+                let mem = dev_remote(&dir).map_err(|e| anyhow::anyhow!(e.message))?;
+                (
+                    Arc::new(CryptRemote::new(mem.clone(), cipher.clone())),
+                    RawBackend::Mem(mem),
+                    MEM_ROOT.to_string(),
                 )
-                .map_err(|e| anyhow::anyhow!(e.message))?;
-            Arc::new(CryptRemote::new(
-                Arc::new(UlozRemote::new(client, account.vault_slug.clone())),
-                cipher,
-            ))
-        };
+            } else {
+                let client = self
+                    .client_for(
+                        &cfg,
+                        &account.login,
+                        &secrets.uloz_password,
+                        cfg.app_token.as_deref(),
+                    )
+                    .map_err(|e| anyhow::anyhow!(e.message))?;
+                (
+                    Arc::new(CryptRemote::new(
+                        Arc::new(UlozRemote::new(client.clone(), account.vault_slug.clone())),
+                        cipher.clone(),
+                    )),
+                    RawBackend::Uloz(client),
+                    account.vault_slug.clone(),
+                )
+            };
 
         // A database from another vault would be meaningless (and dangerous): start fresh.
         let db_path = self.paths.db_file();
@@ -266,20 +302,8 @@ impl Service {
             return Err(e).context("connecting the Drive folder");
         }
 
-        // Forward engine events to IPC subscribers.
-        let mut rx = engine.subscribe();
-        let tx = self.events.clone();
-        let relay = tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(ev) => {
-                        let _ = tx.send(ev);
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
+        // Forward engine events to IPC subscribers (merged with the backup engine's).
+        let relay = self.spawn_relay(engine.subscribe(), false);
         info!(
             "syncing {} with uloz.to account {}",
             folder.display(),
@@ -289,15 +313,27 @@ impl Service {
             engine,
             platform,
             relay,
+            raw,
+            cipher,
+            vault_root,
         });
         inner.start_error = None;
+        // Folder backups run next to the main engine (and restart with it).
+        if !cfg.backups.is_empty() {
+            let me = self.clone();
+            tokio::spawn(async move {
+                if let Err(e) = me.start_backups().await {
+                    warn!("starting folder backups failed: {e:#}");
+                }
+            });
+        }
         Ok(())
     }
 
     async fn status(&self) -> Status {
         let inner = self.inner.lock().await;
         if let Some(r) = &inner.running {
-            return r.engine.status();
+            return self.merged_status(r.engine.status());
         }
         let account = inner.config.account.as_ref().map(|a| a.login.clone());
         match (&account, &inner.start_error) {
@@ -374,14 +410,24 @@ impl Service {
                 .map(|r| serde_json::to_value(r).unwrap_or_default()),
             Call::Pause => {
                 self.engine().await?.pause();
+                if let Some(m) = self.backup_manager() {
+                    m.engine().pause();
+                }
                 ok(Value::Null)
             }
             Call::Resume => {
                 self.engine().await?.resume();
+                if let Some(m) = self.backup_manager() {
+                    m.engine().resume();
+                }
                 ok(Value::Null)
             }
             Call::SyncNow => {
                 self.engine().await?.sync_now();
+                if let Some(m) = self.backup_manager() {
+                    m.engine().sync_now();
+                    m.rescan_all();
+                }
                 ok(Value::Null)
             }
             Call::GetSettings => ok(serde_json::to_value(
@@ -391,20 +437,20 @@ impl Service {
             Call::UpdateSettings(patch) => self.update_settings(patch).await,
             Call::RecentActivity { limit } => {
                 let e = self.engine().await?;
-                ok(serde_json::to_value(
-                    e.db()
-                        .recent_activity(limit.clamp(1, 200), None)
-                        .map_err(internal)?,
-                )
-                .map_err(internal)?)
+                let limit = limit.clamp(1, 200);
+                let list = e.db().recent_activity(limit, None).map_err(internal)?;
+                ok(serde_json::to_value(self.merged_activity(list, limit)?).map_err(internal)?)
             }
             Call::ListIssues => match self.engine().await {
-                Ok(e) => ok(serde_json::to_value(e.issues().map_err(internal)?).map_err(internal)?),
+                Ok(e) => ok(serde_json::to_value(
+                    self.merged_issues(e.issues().map_err(internal)?)?,
+                )
+                .map_err(internal)?),
                 Err(_) => ok(Value::Array(vec![])),
             },
             Call::ResolveIssue { id, action } => {
-                self.engine()
-                    .await?
+                let (engine, id) = self.engine_for_id(self.engine().await?, id)?;
+                engine
                     .resolve_issue(id, action)
                     .map_err(|e| rpc(ErrorCode::NotFound, e.to_string()))?;
                 ok(Value::Null)
@@ -440,18 +486,46 @@ impl Service {
                 self.shutdown.notify_one();
                 ok(Value::Null)
             }
-            Call::Transfers => match self.engine().await {
-                Ok(e) => ok(serde_json::to_value(e.transfers()).map_err(internal)?),
-                Err(_) => ok(
-                    serde_json::to_value(drive_core::ipc::TransferList::default())
-                        .map_err(internal)?,
-                ),
-            },
+            Call::Transfers => {
+                match self.engine().await {
+                    Ok(e) => ok(serde_json::to_value(self.merged_transfers(e.transfers()))
+                        .map_err(internal)?),
+                    Err(_) => ok(
+                        serde_json::to_value(drive_core::ipc::TransferList::default())
+                            .map_err(internal)?,
+                    ),
+                }
+            }
             Call::SetTransferMode { id, mode } => {
-                self.engine()
-                    .await?
+                let (engine, id) = self.engine_for_id(self.engine().await?, id)?;
+                engine
                     .set_transfer_mode(id, mode)
                     .map_err(|e| rpc(ErrorCode::NotFound, e.to_string()))?;
+                ok(Value::Null)
+            }
+            Call::Backups => {
+                ok(serde_json::to_value(self.backup_overview().await).map_err(internal)?)
+            }
+            Call::AddBackup { path } => {
+                ok(serde_json::to_value(self.add_backup(&path).await?).map_err(internal)?)
+            }
+            Call::SetBackupEnabled { id, enabled } => {
+                self.set_backup_enabled(&id, enabled).await?;
+                ok(Value::Null)
+            }
+            Call::RemoveBackup {
+                id,
+                delete_from_cloud,
+            } => {
+                self.remove_backup(&id, delete_from_cloud).await?;
+                ok(Value::Null)
+            }
+            Call::SetBackupExcludes { id, excludes } => ok(serde_json::to_value(
+                self.set_backup_excludes(&id, excludes).await?,
+            )
+            .map_err(internal)?),
+            Call::DismissBackupSuggestions => {
+                self.dismiss_backup_suggestions().await?;
                 ok(Value::Null)
             }
         }
@@ -741,7 +815,12 @@ impl Service {
     }
 
     async fn sign_out(&self) -> Result<()> {
+        self.stop_backups();
+        remove_db(&self.paths.data_dir.join("backups.db"));
         let mut inner = self.inner.lock().await;
+        // Backups belong to the account: a different account must not start receiving them.
+        inner.config.backups.clear();
+        inner.config.backup_cloud = None;
         let folder = inner.config.folder_or_default();
         if let Some(r) = inner.running.take() {
             stop_running(r);

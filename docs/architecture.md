@@ -68,6 +68,40 @@ The **evictor** keeps downloaded-but-unpinned files under the cache limit (LRU) 
 more when the disk gets low. Pinned files ("Always keep on this device") are never
 evicted.
 
+## Folder backups
+
+Folders outside the Drive folder are mirrored **one way** by a second engine
+(`crates/drive-daemon/src/backup/`, `drive-core/src/engine/mirror.rs`):
+
+```
+ Documents, Desktop, …  ──read only──►  backup engine (mirror)  ──►  vault: Backups/<device>/<name>/…
+                                          │ shares upload throttle + automatic upload speed
+ Drive folder  ◄──two-way──►  main engine ┘ (excludes Backups/<this device>)
+```
+
+- **Mirror planner.** The local folder is the source of truth. Cloud items we uploaded that
+  went missing are uploaded again. Items someone moved are moved back. Unknown items in a
+  backed-up folder go to the trash, unless they match a not-yet-uploaded local file (same
+  name, size and modification time); those are adopted without uploading. That makes
+  "switch off and on again" and "reinstall" free. More than 200 removals that make up a
+  quarter of the copy wait for confirmation.
+- **Local side** (`backup/local.rs`) only reads. Every write method is a no-op, so even a
+  planner bug can't touch the user's files.
+- **Reading folders** (`backup/scan.rs`) prunes skipped folders without entering them
+  (`node_modules`, `CACHEDIR.TAG`, `pyvenv.cfg`, the user's skip list). Junctions and
+  symlinks are never followed, and other cloud apps' online-only files are skipped.
+  Unreadable folders count as unknown, not deleted. A missing backed-up folder is reported
+  and nothing is changed.
+- **Change detection.** A recursive watch on Windows, one inotify watch per included folder on
+  Linux, debounced and diffed against the database (shallow for changed folders, deep for
+  new ones). A move becomes a move instead of a delete plus an upload. A full rescan runs
+  every 30 minutes as a safety net, or every 5 minutes if the folders can't be watched.
+- **Main engine exclusion.** `EngineConfig::exclude_remote/exclude_local` hide this device's
+  own `Backups/<device>` from its Drive folder, so it isn't shown twice. Other devices see it
+  as normal cloud files.
+- **One view.** The service merges both engines' status, activity, issues and transfers.
+  Backup ids are negated so calls can be routed back to the right engine.
+
 ## Encryption
 
 Everything in the vault is encrypted on the device before upload, in exactly the format

@@ -93,6 +93,11 @@ pub struct Config {
     pub night_min_bytes: u64,
     /// A dedicated uloz.to API key; `None` uses the shared default.
     pub app_token: Option<String>,
+    /// Folders outside the Drive folder that are backed up (see [`crate::backup`]).
+    pub backups: Vec<crate::backup::BackupFolder>,
+    /// Where this device's backups are in the vault, once the first one was added.
+    pub backup_cloud: Option<crate::backup::BackupCloud>,
+    pub backup_suggestions_dismissed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +131,9 @@ impl Default for Config {
             night_end: drive_core::ipc::default_night_end(),
             night_min_bytes: drive_core::ipc::default_night_min_bytes(),
             app_token: None,
+            backups: Vec::new(),
+            backup_cloud: None,
+            backup_suggestions_dismissed: false,
         }
     }
 }

@@ -63,6 +63,26 @@ Run `drive --help` for the list.
 - **Your disk fills up:** cached copies are cleared first. Files you've pinned are never
   removed.
 
+## Back up other folders
+
+Desktop, Documents, Downloads or any other folder can be backed up **without moving it**.
+OneDrive's "Known Folder Move" relocates folders; Drive doesn't. Each folder is copied,
+encrypted, into your vault under `Backups/<this PC>/<folder>`. On your other devices it shows
+up in the Drive folder, so a dual-boot Linux can open the Windows Documents backup.
+
+- Set it up in **Settings → Backups**, or with `drive backup add <folder>` and `drive backup list`.
+- Drive never moves, changes or deletes anything in a backed-up folder. Files you delete there
+  are removed from the cloud copy too, but stay in the uloz.to trash for 30 days.
+- Build and dependency folders are skipped: `node_modules`, Python virtual environments,
+  folders tagged with `CACHEDIR.TAG` (Rust `target`, many tool caches), `.next`, `.cache` and
+  others. On a developer's Documents folder this is usually the bulk of the files. Edit the
+  skip list per folder in Settings, or with `drive backup skip`.
+- Each folder has an off switch (`drive backup off`) that keeps the cloud copy. Turning it
+  back on doesn't upload unchanged files again. **Stop backing up** can keep the cloud copy
+  or move it to the uloz.to trash.
+- If a backed-up folder disappears (an unplugged drive, a renamed folder), Drive reports it and
+  leaves the cloud copy alone.
+
 ## uloz.to notes
 
 - Downloading through the API needs a uloz.to account that allows fast downloads (a paid

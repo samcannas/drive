@@ -94,6 +94,31 @@ pub enum Call {
         id: i64,
         mode: TransferMode,
     },
+    /// Backed-up folders and suggestions. Returns [`BackupOverview`].
+    Backups,
+    /// Starts backing up a folder (absolute path). Returns [`BackupInfo`].
+    AddBackup {
+        path: String,
+    },
+    /// The per-folder off switch: pauses (keeps the cloud copy) or resumes a backup.
+    SetBackupEnabled {
+        id: String,
+        enabled: bool,
+    },
+    /// Stops backing up a folder for good. The folder on this device is never touched; the
+    /// cloud copy is kept unless `delete_from_cloud` (then it goes to the uloz.to trash).
+    RemoveBackup {
+        id: String,
+        #[serde(default)]
+        delete_from_cloud: bool,
+    },
+    /// Replaces a backup's skip list (see [`BackupInfo::excludes`]). Returns [`BackupInfo`].
+    SetBackupExcludes {
+        id: String,
+        excludes: Vec<String>,
+    },
+    /// Hides the "these folders aren't backed up" suggestion.
+    DismissBackupSuggestions,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +160,8 @@ pub enum Event {
     /// Sent about once a second while anything is transferring or queued, and once more when the
     /// list becomes empty. Only to subscribed clients.
     Transfers(TransferList),
+    /// Sent when backups are added, removed, toggled, or their progress changes.
+    Backups(BackupOverview),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -427,8 +454,12 @@ pub struct Activity {
     pub id: i64,
     pub at_ms: i64,
     pub kind: ActivityKind,
-    /// Relative to the Drive folder, `/`-separated.
+    /// Relative to the Drive folder, `/`-separated. For backups ([`Activity::backup`] set):
+    /// relative to that backed-up folder.
     pub path: String,
+    /// The [`BackupInfo::id`] this happened in, if it's about a backed-up folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup: Option<String>,
     pub bytes: u64,
     pub detail: Option<String>,
 }
@@ -459,7 +490,11 @@ pub enum IssueKind {
 pub struct Issue {
     pub id: i64,
     pub kind: IssueKind,
+    /// Like [`Activity::path`].
     pub path: Option<String>,
+    /// Like [`Activity::backup`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup: Option<String>,
     /// Plain-language explanation for the user.
     pub message: String,
     pub created_ms: i64,
@@ -507,6 +542,99 @@ impl Response {
             }),
         }
     }
+}
+
+/// Backups of folders outside the Drive folder (Desktop, Documents, …).
+///
+/// Each backed-up folder is mirrored one way into the vault under
+/// `Backups/<device>/<name>`: Drive only ever reads the folder on this device, never moves,
+/// changes or deletes anything in it. Files deleted from it are removed from the cloud copy
+/// too (they stay in the uloz.to trash for 30 days).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct BackupOverview {
+    pub folders: Vec<BackupInfo>,
+    /// Well-known folders that aren't backed up yet, largest first.
+    pub suggestions: Vec<FolderSuggestion>,
+    pub suggestions_dismissed: bool,
+    /// Where backups appear in the vault, e.g. `Backups/DESKTOP-FA1NIS8`. `None` until the
+    /// first backup is added.
+    pub cloud_folder: Option<String>,
+    /// The skip list new backups start with.
+    pub default_excludes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BackupInfo {
+    /// Stable id (survives renames of the display name).
+    pub id: String,
+    /// Display name, also the folder name in the vault (e.g. "Documents").
+    pub name: String,
+    /// The folder on this device (absolute).
+    pub path: String,
+    /// Which well-known folder this is, if any.
+    pub known: Option<KnownFolder>,
+    /// The per-folder off switch.
+    pub enabled: bool,
+    pub state: BackupState,
+    /// Plain-language detail for the state ("Scanning 12,400 files…", "Folder not found").
+    pub detail: Option<String>,
+    /// Names or `*` patterns skipped anywhere in the folder (files and folders), e.g.
+    /// `node_modules`, `*.tmp`. Folders tagged as caches (`CACHEDIR.TAG`) and Python virtual
+    /// environments are always skipped.
+    pub excludes: Vec<String>,
+    /// Files and bytes in the folder that are backed up (after skips).
+    pub files: u64,
+    pub bytes: u64,
+    /// Of those, how many are safely in the cloud.
+    pub done_files: u64,
+    pub done_bytes: u64,
+    /// Files waiting to upload, move or be removed from the cloud copy.
+    pub pending: u32,
+    /// Online-only files of other cloud apps (e.g. OneDrive) that were skipped.
+    pub skipped_online_only: u64,
+    pub added_ms: i64,
+    /// When the backup was last fully up to date.
+    pub last_complete_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupState {
+    /// Looking through the folder for the first time (or after a restart).
+    Scanning,
+    /// Uploading or updating the cloud copy.
+    BackingUp,
+    UpToDate,
+    /// Switched off by the user; the cloud copy is kept.
+    Off,
+    /// Drive is paused, offline or signed out.
+    Waiting,
+    /// The folder is missing or unreadable (see `detail`).
+    Problem,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum KnownFolder {
+    Desktop,
+    Documents,
+    Downloads,
+    Pictures,
+    Videos,
+    Music,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FolderSuggestion {
+    pub known: KnownFolder,
+    pub name: String,
+    pub path: String,
+    /// Size after the default skips; `None` while still measuring.
+    pub files: Option<u64>,
+    pub bytes: Option<u64>,
+    /// Why it can't be backed up as is (e.g. "Contains your Drive folder"); the UI shows it
+    /// instead of an Add button.
+    pub blocked: Option<String>,
 }
 
 #[cfg(test)]

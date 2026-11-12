@@ -3,6 +3,7 @@
 //! `drive daemon` runs the service (the tray app starts it automatically). Every other
 //! subcommand talks to the running service over its local socket.
 
+mod backup;
 mod config;
 mod ipc_server;
 mod platform;
@@ -13,8 +14,9 @@ use std::io::{BufRead, Write};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use drive_core::ipc::{
-    Activity, Call, ErrorCode, Issue, IssueAction, RecoveryKit, Settings, SettingsPatch,
-    SetupRequest, SetupResult, Status, TransferList, TransferMode, TransferState,
+    Activity, BackupInfo, BackupOverview, Call, ErrorCode, Issue, IssueAction, RecoveryKit,
+    Settings, SettingsPatch, SetupRequest, SetupResult, Status, TransferList, TransferMode,
+    TransferState,
 };
 use drive_core::ipc_client::{Client, ClientError};
 use tracing::{error, info};
@@ -96,6 +98,33 @@ enum Command {
         action: String,
         /// The file's path, or its id from `drive transfers`.
         target: String,
+    },
+    /// Back up folders outside the Drive folder (they stay where they are).
+    #[command(subcommand)]
+    Backup(BackupCommand),
+}
+
+#[derive(Subcommand)]
+enum BackupCommand {
+    /// Show backed-up folders and suggestions.
+    List,
+    /// Start backing up a folder.
+    Add { path: String },
+    /// Pause a backup (the cloud copy is kept).
+    Off { folder: String },
+    /// Resume a paused backup.
+    On { folder: String },
+    /// Stop backing up a folder. Its files on this device are never touched.
+    Remove {
+        folder: String,
+        /// Also move the cloud copy to the uloz.to trash.
+        #[arg(long)]
+        delete_from_cloud: bool,
+    },
+    /// Replace a folder's skip list, e.g. `drive backup skip Documents node_modules '*.iso'`.
+    Skip {
+        folder: String,
+        patterns: Vec<String>,
     },
 }
 
@@ -276,6 +305,134 @@ fn print_transfers(list: &TransferList, all: bool) {
             list.items.len() - shown
         );
     }
+}
+
+/// Finds a backup by id, name or path.
+async fn find_backup(client: &Client, key: &str) -> Result<BackupInfo> {
+    let ov: BackupOverview = client.call(Call::Backups).await?;
+    let path = absolute(key);
+    ov.folders
+        .into_iter()
+        .find(|f| {
+            f.id == key || f.name.eq_ignore_ascii_case(key) || f.path.eq_ignore_ascii_case(&path)
+        })
+        .with_context(|| format!("No backed-up folder called {key}. Run `drive backup list`."))
+}
+
+async fn run_backup(client: &Client, cmd: BackupCommand) -> Result<()> {
+    match cmd {
+        BackupCommand::List => {
+            let ov: BackupOverview = client.call(Call::Backups).await?;
+            if ov.folders.is_empty() {
+                println!("No folders are backed up yet.");
+            }
+            for f in &ov.folders {
+                println!(
+                    "{:<12} {:?}{}
+             {}
+             {} of {} files ({} of {}) in the cloud",
+                    f.name,
+                    f.state,
+                    f.detail
+                        .as_deref()
+                        .map(|d| format!(" · {d}"))
+                        .unwrap_or_default(),
+                    f.path,
+                    f.done_files,
+                    f.files,
+                    human_bytes(f.done_bytes),
+                    human_bytes(f.bytes),
+                );
+            }
+            if let Some(c) = &ov.cloud_folder {
+                println!(
+                    "
+In the vault: {c}"
+                );
+            }
+            if !ov.suggestions.is_empty() {
+                println!(
+                    "
+Not backed up yet:"
+                );
+                for s in &ov.suggestions {
+                    let size = match (s.files, s.bytes) {
+                        (Some(f), Some(b)) => format!("{f} files, {}", human_bytes(b)),
+                        _ => "measuring…".into(),
+                    };
+                    match &s.blocked {
+                        Some(why) => println!("  {:<10} {}  ({why})", s.name, s.path),
+                        None => println!(
+                            "  {:<10} {}  ({size})  drive backup add \"{}\"",
+                            s.name, s.path, s.path
+                        ),
+                    }
+                }
+            }
+        }
+        BackupCommand::Add { path } => {
+            let info: BackupInfo = client
+                .call(Call::AddBackup {
+                    path: absolute(&path),
+                })
+                .await?;
+            println!(
+                "Backing up {} as \"{}\". The folder stays where it is.",
+                info.path, info.name
+            );
+        }
+        BackupCommand::Off { folder } => {
+            let f = find_backup(client, &folder).await?;
+            client
+                .call_value(Call::SetBackupEnabled {
+                    id: f.id,
+                    enabled: false,
+                })
+                .await?;
+            println!("Paused. The cloud copy of {} is kept.", f.name);
+        }
+        BackupCommand::On { folder } => {
+            let f = find_backup(client, &folder).await?;
+            client
+                .call_value(Call::SetBackupEnabled {
+                    id: f.id,
+                    enabled: true,
+                })
+                .await?;
+            println!("Backing up {} again.", f.name);
+        }
+        BackupCommand::Remove {
+            folder,
+            delete_from_cloud,
+        } => {
+            let f = find_backup(client, &folder).await?;
+            client
+                .call_value(Call::RemoveBackup {
+                    id: f.id,
+                    delete_from_cloud,
+                })
+                .await?;
+            if delete_from_cloud {
+                println!(
+                    "Stopped backing up {}. The cloud copy is in the uloz.to trash for 30 days.",
+                    f.name
+                );
+            } else {
+                println!("Stopped backing up {}. The cloud copy is kept.", f.name);
+            }
+        }
+        BackupCommand::Skip { folder, patterns } => {
+            let f = find_backup(client, &folder).await?;
+            let info: BackupInfo = client
+                .call(Call::SetBackupExcludes {
+                    id: f.id,
+                    excludes: patterns,
+                })
+                .await?;
+            println!("{} now skips: {}", info.name, info.excludes.join(", "));
+        }
+    }
+    Ok(())
 }
 
 fn human_bytes(b: u64) -> String {
@@ -517,6 +674,7 @@ async fn run_client(cmd: Command) -> Result<()> {
             };
             println!("{}", serde_json::to_string_pretty(&s)?);
         }
+        Command::Backup(cmd) => run_backup(&client, cmd).await?,
         Command::Recovery => {
             let kit: RecoveryKit = client.call(Call::ExportRecovery).await?;
             println!("{}", kit.rclone_config);

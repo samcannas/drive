@@ -10,6 +10,7 @@
 pub mod crypt;
 pub mod mem;
 pub mod resumable;
+pub mod subtree;
 
 use std::io;
 use std::pin::Pin;
@@ -144,6 +145,18 @@ pub trait Remote: Send + Sync + 'static {
     /// Whether a file still exists (not deleted or trashed). Used before uploading an edit to
     /// make sure the version it was based on is still the current one.
     async fn exists(&self, entry: &RemoteEntry) -> Result<bool, RemoteError>;
+
+    /// The direct children of a folder. The default filters a full [`Remote::scan`]; backends
+    /// override it with a cheap listing.
+    async fn list(&self, parent_id: &str) -> Result<Vec<RemoteEntry>, RemoteError> {
+        Ok(self
+            .scan()
+            .await?
+            .entries
+            .into_iter()
+            .filter(|e| e.parent_id == parent_id)
+            .collect())
+    }
 
     /// Uploads from a random-access source, picking up where an earlier attempt stopped when
     /// `upload.state` holds that attempt's resume state. Backends that can't resume read the

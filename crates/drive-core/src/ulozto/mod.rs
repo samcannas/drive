@@ -1088,6 +1088,30 @@ impl UlozRemote {
 
 #[async_trait]
 impl Remote for UlozRemote {
+    async fn list(&self, parent_id: &str) -> Result<Vec<RemoteEntry>, RemoteError> {
+        let mut out: Vec<RemoteEntry> = self
+            .client
+            .list_folders(parent_id, false)
+            .await?
+            .into_iter()
+            .map(Self::folder_entry)
+            .collect();
+        out.extend(
+            self.client
+                .list_files(parent_id, false)
+                .await?
+                .into_iter()
+                .filter(|f| !f.is_in_trash && !f.is_incomplete)
+                .map(Self::file_entry),
+        );
+        for e in &mut out {
+            if e.parent_id.is_empty() {
+                e.parent_id = parent_id.to_string();
+            }
+        }
+        Ok(out)
+    }
+
     async fn scan(&self) -> Result<RemoteTree, RemoteError> {
         let (folders, files) = self.client.list_tree(&self.root).await?;
         let mut entries: Vec<RemoteEntry> = folders.into_iter().map(Self::folder_entry).collect();
