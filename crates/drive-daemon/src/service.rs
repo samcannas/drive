@@ -561,6 +561,10 @@ impl Service {
                     .await?,
             )
             .map_err(internal)?),
+            Call::Space { .. }
+            | Call::CancelSpaceScan
+            | Call::SaveSpace { .. }
+            | Call::FreeDriveCache => Err(rpc(ErrorCode::BadRequest, "Not available yet")),
         }
     }
 

@@ -299,7 +299,7 @@ pub fn issue_actions(kind: IssueKind) -> Vec<IssueAction> {
         }
         IssueKind::MassDelete => vec![IssueAction::ConfirmDelete, IssueAction::RestoreDeleted],
         IssueKind::Auth | IssueKind::WrongPassword => vec![IssueAction::SignIn],
-        IssueKind::DiskFull => vec![IssueAction::Retry],
+        IssueKind::DiskFull => vec![IssueAction::FindSpace, IssueAction::Retry],
         IssueKind::InvalidName | IssueKind::Conflict | IssueKind::Other => {
             vec![IssueAction::Dismiss]
         }

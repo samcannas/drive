@@ -188,6 +188,9 @@ pub struct Engine {
     allow_local_deletes_until: AtomicI64,
     held_remote_removals: AtomicU32,
     last_sync_ms: AtomicI64,
+    /// Free and total bytes of the disk holding the folder (0 = not measured yet).
+    disk_free: AtomicU64,
+    disk_total: AtomicU64,
     up: Arc<Throttle>,
     down: Arc<Throttle>,
     /// Latest state of the automatic upload speed.
@@ -351,6 +354,8 @@ impl Engine {
             allow_local_deletes_until: AtomicI64::new(0),
             held_remote_removals: AtomicU32::new(0),
             last_sync_ms: AtomicI64::new(last_sync),
+            disk_free: AtomicU64::new(0),
+            disk_total: AtomicU64::new(0),
         });
         engine.refresh_status();
         Ok(engine)
@@ -617,7 +622,53 @@ impl Engine {
             cloud_files: totals.cloud_files,
             last_sync_ms: (last > 0).then_some(last),
             pending_delete_confirmation: delete_confirm,
+            disk_free_bytes: Some(self.disk_free.load(Ordering::Relaxed))
+                .filter(|_| self.disk_total.load(Ordering::Relaxed) > 0),
+            disk_total_bytes: Some(self.disk_total.load(Ordering::Relaxed)).filter(|t| *t > 0),
         }
+    }
+
+    /// Measures the disk holding the folder (free and total space) for the status.
+    fn measure_disk(&self, folder: &std::path::Path) -> Option<u64> {
+        let free = fs4::available_space(folder).ok()?;
+        self.disk_free.store(free, Ordering::Relaxed);
+        if let Ok(total) = fs4::total_space(folder) {
+            self.disk_total.store(total, Ordering::Relaxed);
+        }
+        Some(free)
+    }
+
+    /// Frees every downloaded file that isn't pinned and is safely in the cloud ("Free up space"
+    /// for the whole folder, without changing what's set to stay on this device). Returns the
+    /// bytes freed.
+    pub async fn free_unpinned(self: &Arc<Self>) -> u64 {
+        let mut freed = 0u64;
+        let mut tried = std::collections::HashSet::new();
+        loop {
+            let Ok(batch) = self.db.eviction_candidates(256) else {
+                break;
+            };
+            let batch: Vec<_> = batch.into_iter().filter(|n| tried.insert(n.id)).collect();
+            if batch.is_empty() {
+                break;
+            }
+            for n in batch {
+                freed += self.evict_one(n.id).await;
+            }
+        }
+        if freed > 0 {
+            info!("freed {freed} bytes of downloaded files");
+            self.activity(
+                ActivityKind::Evicted,
+                "Downloaded files",
+                freed,
+                Some("Freed up space on this device"),
+            );
+        }
+        let folder = self.config().folder;
+        self.measure_disk(&folder);
+        self.status_changed.notify_one();
+        freed
     }
 
     async fn status_loop(self: Arc<Self>) {
@@ -1282,7 +1333,7 @@ impl Engine {
         if totals.cache_bytes <= cfg.cache_limit_bytes {
             need = 0;
         }
-        let free = fs4::available_space(&cfg.folder).ok();
+        let free = self.measure_disk(&cfg.folder);
         let low_disk = free.is_some_and(|f| f < cfg.min_free_bytes);
         if let Some(f) = free
             && low_disk
@@ -2815,7 +2866,7 @@ impl Engine {
             return Err(EngineError::NotFound(format!("issue {id}")));
         };
         match action {
-            IssueAction::Dismiss | IssueAction::SignIn => {}
+            IssueAction::Dismiss | IssueAction::SignIn | IssueAction::FindSpace => {}
             IssueAction::Retry => {
                 if let Some(node) = node {
                     self.db.write(|tx| {

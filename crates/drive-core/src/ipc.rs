@@ -129,6 +129,26 @@ pub enum Call {
         #[serde(default)]
         keep_bytes: Option<u64>,
     },
+    /// The disk space report ([`SpaceReport`]). Starts a scan when there is no report yet or
+    /// `rescan` is set, and returns at once with the current state; progress and the finished
+    /// report arrive as [`Event::Space`].
+    Space {
+        #[serde(default)]
+        rescan: bool,
+    },
+    /// Stops a running disk scan (the previous report, if any, is kept).
+    CancelSpaceScan,
+    /// Saves space in a folder in one step: backs it up if it isn't yet and makes it on-demand
+    /// (files stay where they are; the ones not used lately live only in the cloud). Windows
+    /// only. `keep_bytes` is how much stays on this device (default 5 GB). Returns [`BackupInfo`].
+    SaveSpace {
+        path: String,
+        #[serde(default)]
+        keep_bytes: Option<u64>,
+    },
+    /// Frees every downloaded file in the Drive folder that isn't set to stay on this device
+    /// (pinned files and files waiting to upload are kept). Returns `{ "freed_bytes": n }`.
+    FreeDriveCache,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,6 +192,8 @@ pub enum Event {
     Transfers(TransferList),
     /// Sent when backups are added, removed, toggled, or their progress changes.
     Backups(BackupOverview),
+    /// Disk scan progress (about twice a second) and the finished report.
+    Space(SpaceReport),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -227,6 +249,11 @@ pub struct Status {
     pub last_sync_ms: Option<i64>,
     /// Deletions waiting for confirmation by the mass-delete guard.
     pub pending_delete_confirmation: Option<u32>,
+    /// Free and total space of the disk holding the Drive folder (`None` until measured).
+    #[serde(default)]
+    pub disk_free_bytes: Option<u64>,
+    #[serde(default)]
+    pub disk_total_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -522,6 +549,8 @@ pub enum IssueAction {
     /// Mass-delete guard: restore the deleted items locally from the cloud.
     RestoreDeleted,
     SignIn,
+    /// Disk almost full: open the disk space advisor (handled by the app).
+    FindSpace,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -661,6 +690,139 @@ pub struct FolderSuggestion {
     /// Why it can't be backed up as is (e.g. "Contains your Drive folder"); the UI shows it
     /// instead of an Add button.
     pub blocked: Option<String>,
+}
+
+// ---- Disk space ------------------------------------------------------------------------------
+
+/// Where the space on this device's disks goes, and what Drive can free.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct SpaceReport {
+    pub scan: SpaceScan,
+    /// This device's fixed disks; the scanned ones first.
+    pub disks: Vec<DiskUsage>,
+    /// What Drive already keeps off this device (files that are only in the cloud).
+    pub saved: SpaceSaved,
+    /// The biggest uses of space on the scanned disks, largest first. Each has its largest
+    /// subfolders as `children` (one level).
+    pub items: Vec<SpaceItem>,
+    /// Sum of `frees_bytes` over the items Drive can act on: "Drive can free up to …".
+    pub can_free_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct SpaceScan {
+    pub state: SpaceScanState,
+    /// Progress of the running scan (or totals of the last one).
+    pub scanned_bytes: u64,
+    pub scanned_files: u64,
+    /// Folder being read right now, for the progress line.
+    pub current: Option<String>,
+    pub started_ms: Option<i64>,
+    /// When the report was made; the UI says "Checked 2 hours ago".
+    pub finished_ms: Option<i64>,
+    /// Plain-language reason when `state` is `failed`.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SpaceScanState {
+    /// Never scanned on this device.
+    #[default]
+    Idle,
+    /// Reading the disk; `items` are the previous report's (if any) until it finishes.
+    Scanning,
+    Done,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct DiskUsage {
+    /// Where it is mounted: `C:\` or `/`.
+    pub path: String,
+    /// Display name: "Local Disk (C:)", "/home".
+    pub name: String,
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+    /// Whether the report's items cover this disk.
+    pub scanned: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct SpaceSaved {
+    /// Files in the Drive folder that are only in the cloud.
+    pub drive_folder_bytes: u64,
+    /// Files of on-demand backed-up folders that are only in the cloud.
+    pub backups_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SpaceItem {
+    /// Absolute path; empty for buckets that aren't one folder (e.g. "Windows and system").
+    pub path: String,
+    pub name: String,
+    /// Space it takes on the disk (online-only files of cloud apps count as 0).
+    pub bytes: u64,
+    pub files: u64,
+    pub category: SpaceCategory,
+    pub known: Option<KnownFolder>,
+    /// The backup this folder is (or is inside of), if any.
+    pub backup_id: Option<String>,
+    /// Already saving space (an on-demand backed-up folder).
+    pub on_demand: bool,
+    /// What Drive can do here, if anything.
+    pub action: Option<SpaceAction>,
+    /// About how much the action would free (0 for actions that only protect).
+    pub frees_bytes: u64,
+    /// Shown before acting ("Contains code projects: developer tools read every file, so …").
+    pub caution: Option<String>,
+    /// Plain-language explanation for items Drive can't act on ("Managed by OneDrive").
+    pub note: Option<String>,
+    pub children: Vec<SpaceItem>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SpaceCategory {
+    /// Your own files (Documents, Videos, a folder on the disk, …).
+    UserFolder,
+    /// The Drive folder (what's downloaded of it).
+    DriveFolder,
+    /// A backed-up folder.
+    Backup,
+    /// Code projects (git repositories).
+    Developer,
+    /// Installed programs and games.
+    Apps,
+    /// Settings and caches apps keep (AppData, ~/.local, ~/.cache, ProgramData).
+    AppData,
+    /// Temporary files.
+    Temporary,
+    RecycleBin,
+    /// Another cloud app's folder (OneDrive, Dropbox, …).
+    OtherCloud,
+    /// Other people's accounts on this device.
+    OtherUsers,
+    /// Windows or Linux itself: system files, page and hibernation files, and anything Drive
+    /// isn't allowed to read.
+    System,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SpaceAction {
+    /// Back up the folder and save space in it ([`Call::SaveSpace`]).
+    SaveSpace,
+    /// Already backed up as a full copy: save space in it ([`Call::SaveSpace`] works too).
+    TurnOnSaveSpace,
+    /// Saving space isn't available on this device: back it up so it's safe ([`Call::AddBackup`]).
+    /// Frees nothing.
+    BackUp,
+    /// Free downloaded files in the Drive folder ([`Call::FreeDriveCache`]).
+    FreeDriveCache,
+    /// Opened by the app: the system's own cleanup (Windows Storage settings).
+    OpenSystemCleanup,
 }
 
 #[cfg(test)]
