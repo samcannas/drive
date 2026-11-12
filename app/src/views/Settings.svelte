@@ -1,15 +1,17 @@
 <script lang="ts">
-  import { onMount } from "svelte";
-  import { api, closeWindow, env, errorOf } from "../lib/api";
-  import { connect, drive, updateVersion } from "../lib/drive.svelte";
+  import { onMount, tick } from "svelte";
+  import { api, closeWindow, env, errorOf, EVENTS, listen } from "../lib/api";
+  import { progressOf, stateLine, suggestionSize } from "../lib/backups";
+  import { connect, drive, refreshBackups, updateVersion } from "../lib/drive.svelte";
   import { bytes, clockOf, GB, plural, relative } from "../lib/format";
   import Icon, { type IconName } from "../lib/Icon.svelte";
   import ReleaseNotes from "../lib/ReleaseNotes.svelte";
-  import type { AppInfo, SettingsPatch } from "../lib/types";
+  import type { AppInfo, BackupInfo, SettingsPatch } from "../lib/types";
 
-  type Section = "general" | "storage" | "network" | "account" | "recovery" | "updates" | "about";
+  type Section = "general" | "backups" | "storage" | "network" | "account" | "recovery" | "updates" | "about";
   const SECTIONS: { id: Section; label: string; icon: IconName }[] = [
     { id: "general", label: "General", icon: "gear" },
+    { id: "backups", label: "Backups", icon: "backup" },
     { id: "storage", label: "Storage", icon: "storage" },
     { id: "network", label: "Network", icon: "network" },
     { id: "account", label: "Account", icon: "user" },
@@ -19,7 +21,10 @@
   ];
   const windows = env().platform === "windows";
 
-  let section = $state<Section>("general");
+  const isSection = (id: unknown): id is Section => SECTIONS.some((x) => x.id === id);
+  // Opened from the popover's "Back up…": start at that section.
+  const opened = env().section;
+  let section = $state<Section>(isSection(opened) ? opened : "general");
   let info = $state<AppInfo | null>(null);
   let saveError = $state<string | null>(null);
   let announce = $state("");
@@ -30,8 +35,12 @@
   const setUp = $derived(connected && status !== null && status.state !== "not_set_up");
 
   onMount(() => {
-    connect({ settings: true });
+    connect({ settings: true, backups: true });
     api.appInfo().then((i) => (info = i));
+    // Already open when the popover asks for a section.
+    listen<string>(EVENTS.settingsSection, (id) => {
+      if (isSection(id)) section = id;
+    });
   });
 
   async function save(patch: SettingsPatch, label = "Setting saved") {
@@ -60,6 +69,145 @@
     }
     deviceError = null;
     save({ device_name: name }, "Device name saved");
+  }
+
+  // ----- Backups
+  const ov = $derived(drive.backups);
+  const cloudFolder = $derived(ov?.cloud_folder ?? `Backups/${s?.device_name ?? "this device"}`);
+  let backupBusy = $state<string | null>(null);
+  /** An error from the service, shown next to what caused it (`key`: a backup id, a suggestion, or "pick"). */
+  let backupError = $state<{ key: string; text: string } | null>(null);
+  let addButton = $state<HTMLButtonElement>();
+
+  function say(text: string) {
+    announce = "";
+    queueMicrotask(() => (announce = text));
+  }
+
+  async function addBackup(path: string, key: string) {
+    if (backupBusy) return;
+    backupBusy = `add:${key}`;
+    backupError = null;
+    try {
+      const info = await api.addBackup(path);
+      await refreshBackups();
+      say(`Backing up ${info.name}`);
+      await tick();
+      document.getElementById(`backup-${info.id}-name`)?.focus();
+    } catch (e) {
+      const name = path.split(/[\\/]/).filter(Boolean).pop() ?? path;
+      backupError = { key, text: `Couldn't back up ${name}. ${errorOf(e).message}` };
+    } finally {
+      backupBusy = null;
+    }
+  }
+
+  async function pickAndAdd() {
+    if (backupBusy) return;
+    backupError = null;
+    let path: string | null;
+    try {
+      path = await api.pickBackupFolder();
+    } catch (e) {
+      backupError = { key: "pick", text: errorOf(e).message };
+      return;
+    }
+    if (path) await addBackup(path, "pick");
+  }
+
+  async function setBackupEnabled(b: BackupInfo, input: HTMLInputElement) {
+    const enabled = input.checked;
+    backupError = null;
+    try {
+      drive.backups = await api.setBackupEnabled(b.id, enabled);
+      say(enabled ? `Backing up ${b.name} again` : `${b.name} backup is off. The cloud copy is kept.`);
+    } catch (e) {
+      input.checked = !enabled;
+      backupError = {
+        key: b.id,
+        text: `Couldn't turn ${enabled ? "on" : "off"} the backup. ${errorOf(e).message}`,
+      };
+    }
+  }
+
+  // Skipped items
+  let skipDialog = $state<HTMLDialogElement>();
+  let skipFor = $state<BackupInfo | null>(null);
+  let skipText = $state("");
+  let skipError = $state<string | null>(null);
+  let skipSaving = $state(false);
+  const lines = (t: string) => t.split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
+  const skipIsDefault = $derived(
+    ov !== null && lines(skipText).join("\n") === ov.default_excludes.join("\n"),
+  );
+
+  function openSkip(b: BackupInfo) {
+    skipFor = b;
+    skipText = b.excludes.join("\n");
+    skipError = null;
+    skipDialog?.showModal();
+  }
+
+  function resetSkip() {
+    if (!ov) return;
+    skipText = ov.default_excludes.join("\n");
+    skipError = null;
+    say("Standard list restored. Save to keep it.");
+  }
+
+  async function saveSkip(e: SubmitEvent) {
+    e.preventDefault();
+    if (!skipFor || skipSaving) return;
+    skipSaving = true;
+    skipError = null;
+    try {
+      const name = skipFor.name;
+      await api.setBackupExcludes(skipFor.id, lines(skipText));
+      await refreshBackups();
+      skipDialog?.close();
+      say(`Saved. Drive is checking ${name} again.`);
+    } catch (err) {
+      skipError = errorOf(err).message;
+    } finally {
+      skipSaving = false;
+    }
+  }
+
+  // Stop backing up
+  let stopDialog = $state<HTMLDialogElement>();
+  let stopFor = $state<BackupInfo | null>(null);
+  let stopDelete = $state(false);
+  let stopping = $state(false);
+  let stopError = $state<string | null>(null);
+
+  function openStop(b: BackupInfo) {
+    stopFor = b;
+    stopDelete = false;
+    stopError = null;
+    stopDialog?.showModal();
+  }
+
+  async function stopBackup() {
+    if (!stopFor || stopping) return;
+    stopping = true;
+    stopError = null;
+    const { id, name } = stopFor;
+    try {
+      drive.backups = await api.removeBackup(id, stopDelete);
+      stopDialog?.close();
+      say(
+        stopDelete
+          ? `Stopped backing up ${name}. The cloud copy is in the uloz.to trash for 30 days.`
+          : `Stopped backing up ${name}. The cloud copy is kept.`,
+      );
+      // The folder's card is gone: continue from the button that adds one.
+      await tick();
+      addButton?.focus();
+    } catch (e) {
+      stopError = `Couldn't stop the backup. ${errorOf(e).message}`;
+    } finally {
+      stopping = false;
+    }
   }
 
   // ----- Storage
@@ -476,6 +624,216 @@
           />
         </div>
       </div>
+    {:else if section === "backups"}
+      <div class="group intro">
+        <p>
+          Drive can keep a copy of folders like Desktop and Documents in your encrypted cloud without moving them. The
+          folders stay where they are, and Drive never changes or deletes anything in them.
+        </p>
+        <p class="secondary">
+          When you delete a file from a backed-up folder, Drive removes it from the cloud copy too. It stays in the
+          uloz.to trash for 30 days. The copies are in <span class="selectable cloud-path">{cloudFolder}</span> in your Drive
+          folder, on each of your devices.
+        </p>
+      </div>
+
+      {#if drive.backupsUnsupported}
+        <div class="callout info">
+          <Icon name="info" size={18} />
+          <p>The Drive service running now can't back up folders. Quit Drive and open it again to finish updating.</p>
+        </div>
+      {:else if !ov}
+        <p class="secondary" role="status">Loading backups…</p>
+      {:else}
+        {#if ov.folders.length}
+          <section class="group" aria-labelledby="backed-up-title">
+            <h2 id="backed-up-title" class="body-strong group-title">Backed-up folders</h2>
+            <ul class="group plain" role="list">
+              {#each ov.folders as b (b.id)}
+                {@const line = stateLine(b, drive.now)}
+                <li class="card backup">
+                  <div class="backup-head">
+                    <span class="avatar" aria-hidden="true"><Icon name="folder" /></span>
+                    <div class="setting-text">
+                      <h3 id="backup-{b.id}-name" class="body-strong" tabindex="-1">{b.name}</h3>
+                      <p class="caption secondary path selectable">{b.path}</p>
+                    </div>
+                    <input
+                      type="checkbox"
+                      role="switch"
+                      class="switch"
+                      aria-label="Back up {b.name}"
+                      aria-describedby="backup-{b.id}-state"
+                      checked={b.enabled}
+                      onchange={(e) => setBackupEnabled(b, e.currentTarget)}
+                    />
+                  </div>
+                  <div class="backup-body">
+                    <p class="caption backup-state {line.tone}" id="backup-{b.id}-state">
+                      <Icon name={line.icon} size={14} /><span class="numeric">{line.text}</span>
+                    </p>
+                    {#if b.state === "backing_up"}
+                      <div class="meter" aria-hidden="true">
+                        <span style:width="{progressOf(b) * 100}%"></span>
+                      </div>
+                    {/if}
+                    {#if b.skipped_online_only > 0}
+                      <p class="caption secondary">
+                        Skipped {plural(b.skipped_online_only, "online-only file", "online-only files")} from another cloud
+                        app. To back {b.skipped_online_only === 1 ? "it" : "them"} up, make {b.skipped_online_only === 1
+                          ? "it"
+                          : "them"} available offline in that app.
+                      </p>
+                    {/if}
+                    {#if backupError?.key === b.id}
+                      <p class="error-text" role="alert"><Icon name="alert" size={14} />{backupError.text}</p>
+                    {/if}
+                    <div class="backup-actions">
+                      <button class="btn subtle" onclick={() => openSkip(b)}>
+                        Edit skipped items…<span class="visually-hidden"> in {b.name}</span>
+                      </button>
+                      <button class="btn subtle" onclick={() => openStop(b)}>
+                        Stop backing up…<span class="visually-hidden"> {b.name}</span>
+                      </button>
+                    </div>
+                  </div>
+                </li>
+              {/each}
+            </ul>
+          </section>
+        {/if}
+
+        {#if ov.suggestions.length}
+          <section class="group" aria-labelledby="suggested-title">
+            <h2 id="suggested-title" class="body-strong group-title">
+              {ov.folders.length ? "Not backed up yet" : "Suggested folders"}
+            </h2>
+            <ul class="group plain" role="list">
+              {#each ov.suggestions as f (f.known)}
+                <li class="card setting">
+                  <span class="avatar" aria-hidden="true"><Icon name="folder" /></span>
+                  <div class="setting-text">
+                    <p>{f.name}</p>
+                    <p class="caption secondary path selectable">{f.path}</p>
+                    {#if f.blocked}
+                      <p class="caption secondary with-icon"><Icon name="info" size={14} />{f.blocked}</p>
+                    {:else}
+                      <p class="caption secondary numeric">{suggestionSize(f)}</p>
+                    {/if}
+                    {#if backupError?.key === f.known}
+                      <p class="error-text" role="alert"><Icon name="alert" size={14} />{backupError.text}</p>
+                    {/if}
+                  </div>
+                  {#if !f.blocked}
+                    <button class="btn" aria-disabled={backupBusy !== null} onclick={() => addBackup(f.path, f.known)}>
+                      {backupBusy === `add:${f.known}` ? "Adding…" : "Back up"}<span class="visually-hidden"> {f.name}</span>
+                    </button>
+                  {/if}
+                </li>
+              {/each}
+            </ul>
+          </section>
+        {/if}
+
+        <div class="group add-folder">
+          <div>
+            <button class="btn" bind:this={addButton} aria-disabled={backupBusy !== null} onclick={pickAndAdd}>
+              <Icon name="folder-plus" size={16} />
+              {backupBusy === "add:pick" ? "Adding…" : ov.folders.length || ov.suggestions.length ? "Add another folder…" : "Choose a folder…"}
+            </button>
+          </div>
+          {#if backupError?.key === "pick"}
+            <p class="error-text" role="alert"><Icon name="alert" size={14} />{backupError.text}</p>
+          {/if}
+        </div>
+      {/if}
+
+      <dialog bind:this={skipDialog} aria-labelledby="skip-title" aria-describedby="skip-help">
+        <form onsubmit={saveSkip} novalidate>
+          <div class="dialog-body">
+            <h2 id="skip-title" class="subtitle">Skipped items in {skipFor?.name ?? "this folder"}</h2>
+            <div class="dialog-text">
+              <p id="skip-help">
+                Drive doesn't back up files or folders with these names, wherever they are in the folder. Use * to match
+                any characters, like *.tmp.
+              </p>
+              <div class="field">
+                <label for="skip-list">One name or pattern per line</label>
+                <textarea
+                  id="skip-list"
+                  class="input mono skip-list"
+                  rows="8"
+                  spellcheck="false"
+                  autocomplete="off"
+                  bind:value={skipText}
+                  aria-invalid={skipError ? "true" : undefined}
+                  aria-describedby={skipError ? "skip-always skip-error" : "skip-always"}
+                ></textarea>
+                <p class="hint" id="skip-always">
+                  Always skipped too: build and cache folders (ones with a CACHEDIR.TAG file, like Rust's target folder)
+                  and Python virtual environments.
+                </p>
+                {#if skipError}
+                  <p class="error-text" id="skip-error" role="alert"><Icon name="alert" size={14} />{skipError}</p>
+                {/if}
+              </div>
+              <div>
+                <button class="btn subtle reset" type="button" aria-disabled={skipIsDefault} onclick={() => !skipIsDefault && resetSkip()}>
+                  <Icon name="retry" size={16} />
+                  {skipIsDefault ? "Using the standard list" : "Use the standard list"}
+                </button>
+              </div>
+            </div>
+          </div>
+          <div class="dialog-actions">
+            <button class="btn primary" type="submit" aria-disabled={skipSaving}>{skipSaving ? "Saving…" : "Save"}</button>
+            <button class="btn" type="button" onclick={() => skipDialog?.close()}>Cancel</button>
+          </div>
+        </form>
+      </dialog>
+
+      <dialog bind:this={stopDialog} aria-labelledby="stop-title" aria-describedby="stop-body">
+        <div class="dialog-body">
+          <h2 id="stop-title" class="subtitle">Stop backing up {stopFor?.name ?? "this folder"}?</h2>
+          <div class="dialog-text">
+            <p id="stop-body">
+              Drive stops copying changes from <span class="selectable path">{stopFor?.path}</span>. Nothing in that
+              folder changes.
+            </p>
+            <fieldset class="choices">
+              <legend class="body-strong">The copy in the cloud</legend>
+              <label class="choice">
+                <input type="radio" name="stop-copy" value="keep" checked={!stopDelete} onchange={() => (stopDelete = false)} />
+                <span>
+                  <span>Keep it</span>
+                  <span class="caption secondary">
+                    It stays in {cloudFolder}/{stopFor?.name} in your Drive folder. You can delete it there later.
+                  </span>
+                </span>
+              </label>
+              <label class="choice">
+                <input type="radio" name="stop-copy" value="delete" checked={stopDelete} onchange={() => (stopDelete = true)} />
+                <span>
+                  <span>Delete it from the cloud</span>
+                  <span class="caption secondary">
+                    It moves to the uloz.to trash. You can restore it from there for 30 days.
+                  </span>
+                </span>
+              </label>
+            </fieldset>
+            {#if stopError}
+              <p class="error-text" role="alert"><Icon name="alert" size={14} />{stopError}</p>
+            {/if}
+          </div>
+        </div>
+        <div class="dialog-actions">
+          <button class="btn" class:danger={stopDelete} aria-disabled={stopping} onclick={stopBackup}>
+            {stopping ? "Stopping…" : stopDelete ? "Stop and delete copy" : "Stop backing up"}
+          </button>
+          <!-- svelte-ignore a11y_autofocus -->
+          <button class="btn" onclick={() => stopDialog?.close()} autofocus>Cancel</button>
+        </div>
+      </dialog>
     {:else if section === "storage"}
       <div class="group">
         {#if status}
@@ -1060,6 +1418,115 @@
     display: grid;
     gap: var(--s3);
     padding: var(--s4);
+  }
+
+  .intro {
+    gap: var(--s2);
+    max-width: 640px;
+  }
+  .cloud-path {
+    font-weight: 600;
+    color: var(--text);
+    overflow-wrap: break-word;
+  }
+  .plain {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .backup {
+    display: grid;
+    gap: var(--s2);
+    padding: var(--s3) var(--s4);
+  }
+  .backup-head {
+    display: flex;
+    align-items: center;
+    gap: var(--s4);
+  }
+  .backup-body {
+    display: grid;
+    gap: var(--s2);
+    /* Text lines up with the name, past the 40px avatar. */
+    padding-inline-start: calc(40px + var(--s4));
+  }
+  .backup-state {
+    display: flex;
+    gap: var(--s1);
+    align-items: flex-start;
+    color: var(--text-2);
+  }
+  .backup-state :global(.icon) {
+    margin-block-start: 1px;
+  }
+  .backup-state.accent :global(.icon) {
+    color: var(--accent-text);
+  }
+  .backup-state.success :global(.icon) {
+    color: var(--success-text);
+  }
+  .backup-state.warning {
+    color: var(--warning-text);
+  }
+  .backup-state.warning :global(.icon) {
+    color: var(--warning-icon);
+  }
+  .backup-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--s1);
+    /* Subtle buttons: the text, not the padding, lines up with the lines above. */
+    margin-inline-start: -12px;
+  }
+  .with-icon {
+    display: flex;
+    gap: var(--s1);
+    align-items: flex-start;
+  }
+  .with-icon :global(.icon) {
+    margin-block-start: 1px;
+  }
+  .add-folder {
+    gap: var(--s2);
+    margin-block-start: var(--s2);
+  }
+  .skip-list {
+    resize: vertical;
+    min-height: 160px;
+    line-height: 1.5;
+  }
+  .reset {
+    margin-inline-start: -10px;
+  }
+  .choices {
+    display: grid;
+    gap: var(--s2);
+    margin: 0;
+    padding: 0;
+    border: 0;
+  }
+  .choices legend {
+    padding: 0;
+    margin-block-end: var(--s2);
+  }
+  .choice {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: var(--s3);
+    padding: var(--s3);
+    border: 1px solid var(--stroke-card);
+    border-radius: var(--radius-card);
+  }
+  .choice:has(input:checked) {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+  }
+  .choice input {
+    margin: 2px 0 0;
+  }
+  .choice > span {
+    display: grid;
+    gap: 2px;
   }
 
   .about {

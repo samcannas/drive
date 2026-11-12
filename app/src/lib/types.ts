@@ -113,7 +113,10 @@ export interface Activity {
   id: number;
   at_ms: number;
   kind: ActivityKind;
+  /** Relative to the Drive folder, or with `backup` set, to that backed-up folder. */
   path: string;
+  /** The `BackupInfo.id` this happened in, when it's about a backed-up folder. */
+  backup?: string | null;
   bytes: number;
   detail: string | null;
 }
@@ -134,10 +137,70 @@ export type IssueAction = "retry" | "dismiss" | "confirm_delete" | "restore_dele
 export interface Issue {
   id: number;
   kind: IssueKind;
+  /** Like `Activity.path`. */
   path: string | null;
+  /** Like `Activity.backup`. */
+  backup?: string | null;
   message: string;
   created_ms: number;
   actions: IssueAction[];
+}
+
+// ----- Backups of folders outside the Drive folder (ipc `BackupOverview`)
+
+export type BackupState = "scanning" | "backing_up" | "up_to_date" | "off" | "waiting" | "problem";
+export type KnownFolder = "desktop" | "documents" | "downloads" | "pictures" | "videos" | "music";
+
+export interface BackupInfo {
+  /** Stable id (survives renames of the display name). */
+  id: string;
+  /** Display name, also the folder name in the vault ("Documents"). */
+  name: string;
+  /** The folder on this device (absolute). */
+  path: string;
+  known: KnownFolder | null;
+  /** The per-folder off switch. */
+  enabled: boolean;
+  state: BackupState;
+  /** Plain-language detail for the state ("Scanning 12,400 files…", "Folder not found"). */
+  detail: string | null;
+  /** Names or `*` patterns skipped anywhere in the folder. */
+  excludes: string[];
+  /** Files and bytes that are backed up (after skips)… */
+  files: number;
+  bytes: number;
+  /** …and how many of them are safely in the cloud. */
+  done_files: number;
+  done_bytes: number;
+  /** Files waiting to upload, move or be removed from the cloud copy. */
+  pending: number;
+  /** Online-only files of other cloud apps (OneDrive…) that were skipped. */
+  skipped_online_only: number;
+  added_ms: number;
+  /** When the backup was last fully up to date. */
+  last_complete_ms: number | null;
+}
+
+export interface FolderSuggestion {
+  known: KnownFolder;
+  name: string;
+  path: string;
+  /** Size after the default skips; null while still measuring. */
+  files: number | null;
+  bytes: number | null;
+  /** Why it can't be backed up as is; shown instead of the Back up button. */
+  blocked: string | null;
+}
+
+export interface BackupOverview {
+  folders: BackupInfo[];
+  /** Well-known folders that aren't backed up yet, largest first. */
+  suggestions: FolderSuggestion[];
+  suggestions_dismissed: boolean;
+  /** Where backups appear in the vault, e.g. `Backups/DESKTOP-FA1NIS8`; null until the first backup. */
+  cloud_folder: string | null;
+  /** The skip list new backups start with. */
+  default_excludes: string[];
 }
 
 export interface AccountCheck {
@@ -209,4 +272,6 @@ export interface DriveEnv {
   view: View;
   material: Material;
   platform: string;
+  /** Settings only: the section to open at (e.g. "backups"). */
+  section?: string | null;
 }

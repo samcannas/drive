@@ -352,9 +352,28 @@ fn show_or_create(
 }
 
 pub fn open_settings(app: &AppHandle) {
+    open_settings_at(app, None);
+}
+
+/// Event telling an open settings window to switch to a section (e.g. `"backups"`).
+pub const EV_SETTINGS_SECTION: &str = "drive://settings-section";
+
+/// Opens settings, optionally at a section. A new window reads the section from
+/// `window.__DRIVE_SECTION__`; an open one is told with [`EV_SETTINGS_SECTION`].
+pub fn open_settings_at(app: &AppHandle, section: Option<&str>) {
+    // Section ids are short lowercase words; anything else is ignored.
+    let section = section.filter(|s| s.len() <= 32 && s.bytes().all(|b| b.is_ascii_lowercase()));
     hide_popover(app);
+    if let (Some(sec), Some(_)) = (section, app.get_webview_window(SETTINGS)) {
+        use tauri::Emitter;
+        let _ = app.emit_to(SETTINGS, EV_SETTINGS_SECTION, sec);
+    }
     show_or_create(app, SETTINGS, || {
         builder(app, SETTINGS, "settings", backdrop("mica"))
+            .initialization_script(format!(
+                "window.__DRIVE_SECTION__ = {};",
+                serde_json::json!(section)
+            ))
             .title("Drive settings")
             .inner_size(780.0, 600.0)
             .min_inner_size(520.0, 440.0)

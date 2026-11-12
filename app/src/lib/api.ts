@@ -5,6 +5,8 @@ import type {
   AccountCheck,
   Activity,
   AppInfo,
+  BackupInfo,
+  BackupOverview,
   CallError,
   ConnectionInfo,
   DriveEnv,
@@ -34,6 +36,10 @@ export const EVENTS = {
   connection: "drive://connection",
   settings: "drive://settings",
   update: "drive://update",
+  /** Backed-up folders and suggestions, on every change and about once a second during progress. */
+  backups: "drive://backups",
+  /** Settings only: switch to a section (opened from the popover). */
+  settingsSection: "drive://settings-section",
   popoverShown: "drive://popover-shown",
 } as const;
 
@@ -72,13 +78,14 @@ export function errorOf(e: unknown): CallError {
 
 /** Window environment injected by the backend; query parameters stand in for it in a browser. */
 export function env(): DriveEnv {
-  const injected = (window as unknown as { __DRIVE_ENV__?: DriveEnv }).__DRIVE_ENV__;
-  if (injected) return injected;
+  const w = window as unknown as { __DRIVE_ENV__?: DriveEnv; __DRIVE_SECTION__?: string | null };
+  if (w.__DRIVE_ENV__) return { ...w.__DRIVE_ENV__, section: w.__DRIVE_SECTION__ ?? null };
   const q = new URLSearchParams(location.search);
   return {
     view: (q.get("view") as View) ?? "popover",
     material: (q.get("material") as Material) ?? "none",
     platform: q.get("platform") ?? "windows",
+    section: q.get("section"),
   };
 }
 
@@ -104,9 +111,22 @@ export const api = {
   saveRecoveryKit: () => invoke<string | null>("save_recovery_kit"),
   signOut: () => invoke<void>("sign_out"),
   openFolder: () => invoke<void>("open_folder"),
-  revealItem: (path: string) => invoke<void>("reveal_item", { path }),
+  /** Shows a file in the file manager; with `backup`, `path` is relative to that backed-up folder. */
+  revealItem: (path: string, backup: string | null = null) => invoke<void>("reveal_item", { path, backup }),
   openUrl: (url: string) => invoke<void>("open_url", { url }),
-  showWindow: (name: View) => invoke<void>("show_window", { name }),
+  /** Opens a window; settings can open at a section ("backups"). */
+  showWindow: (name: View, section: string | null = null) => invoke<void>("show_window", { name, section }),
+  backups: () => invoke<BackupOverview>("backups"),
+  addBackup: (path: string) => invoke<BackupInfo>("add_backup", { path }),
+  /** The per-folder off switch; resolves to the new overview. */
+  setBackupEnabled: (id: string, enabled: boolean) => invoke<BackupOverview>("set_backup_enabled", { id, enabled }),
+  /** Stops backing up a folder (never touches it); the cloud copy is kept unless `deleteFromCloud`. */
+  removeBackup: (id: string, deleteFromCloud: boolean) =>
+    invoke<BackupOverview>("remove_backup", { id, deleteFromCloud }),
+  setBackupExcludes: (id: string, excludes: string[]) => invoke<BackupInfo>("set_backup_excludes", { id, excludes }),
+  dismissBackupSuggestions: () => invoke<BackupOverview>("dismiss_backup_suggestions"),
+  /** Native folder picker; null when cancelled. */
+  pickBackupFolder: () => invoke<string | null>("pick_backup_folder"),
   finishOnboarding: () => invoke<void>("finish_onboarding"),
   hidePopover: () => invoke<void>("hide_popover"),
   /** The X button: hides Drive to the tray or quits, depending on Settings. */

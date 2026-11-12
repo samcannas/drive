@@ -2,7 +2,17 @@
 // kept current from backend events.
 
 import { api, EVENTS, listen } from "./api";
-import type { Activity, ConnectionInfo, Issue, Release, Settings, Status, TransferList, UpdateState } from "./types";
+import type {
+  Activity,
+  BackupOverview,
+  ConnectionInfo,
+  Issue,
+  Release,
+  Settings,
+  Status,
+  TransferList,
+  UpdateState,
+} from "./types";
 
 export const drive = $state({
   status: null as Status | null,
@@ -12,6 +22,10 @@ export const drive = $state({
   settings: null as Settings | null,
   /** Per-file transfers. Null until loaded, or when the service is too old to list them. */
   transfers: null as TransferList | null,
+  /** Backed-up folders and suggestions. Null until loaded, or when the service is too old for backups. */
+  backups: null as BackupOverview | null,
+  /** The service is too old to back up folders. */
+  backupsUnsupported: false,
   update: null as UpdateState | null,
   /** Newer releases for the version on offer (see `updateVersion`). */
   changelog: [] as Release[],
@@ -52,6 +66,19 @@ export async function refreshTransfers() {
   }
 }
 
+export async function refreshBackups() {
+  try {
+    drive.backups = await api.backups();
+    drive.backupsUnsupported = false;
+  } catch (e) {
+    // An older service doesn't know the call: backups stay hidden.
+    if ((e as { code?: string })?.code === "bad_request") {
+      drive.backups = null;
+      drive.backupsUnsupported = true;
+    }
+  }
+}
+
 /** The version an update state is about, if any. */
 export function updateVersion(u: UpdateState | null): string | null {
   if (!u) return null;
@@ -86,7 +113,7 @@ export async function refreshUpdate() {
   }
 }
 
-type Opts = { activity?: boolean; issues?: boolean; settings?: boolean; transfers?: boolean };
+type Opts = { activity?: boolean; issues?: boolean; settings?: boolean; transfers?: boolean; backups?: boolean };
 
 async function refreshAll(opts: Opts) {
   try {
@@ -99,6 +126,7 @@ async function refreshAll(opts: Opts) {
     opts.activity ? refreshActivity() : null,
     opts.settings ? refreshSettings() : null,
     opts.transfers ? refreshTransfers() : null,
+    opts.backups ? refreshBackups() : null,
   ]);
 }
 
@@ -125,6 +153,7 @@ export async function connect(opts: Opts) {
   if (opts.settings) await listen<Settings>(EVENTS.settings, (s) => (drive.settings = s));
   // The backend only sends these while the popover is visible; showing it fetches the list once.
   if (opts.transfers) await listen<TransferList>(EVENTS.transfers, (t) => (drive.transfers = t));
+  if (opts.backups) await listen<BackupOverview>(EVENTS.backups, (b) => (drive.backups = b));
   await listen<UpdateState>(EVENTS.update, setUpdate);
   await listen(EVENTS.popoverShown, () => {
     refreshAll(opts);

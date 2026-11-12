@@ -2,6 +2,7 @@
   import { onMount, tick } from "svelte";
   import { api, env, errorOf, startDragging } from "../lib/api";
   import { connect, drive, refreshIssues, refreshTransfers } from "../lib/drive.svelte";
+  import { isBusy, offerable, offerBytes, offerTitle, progressOf, splitBackupPath } from "../lib/backups";
   import { basename, bytes, count, dirname, plural, relative } from "../lib/format";
   import Icon from "../lib/Icon.svelte";
   import StateBadge from "../lib/StateBadge.svelte";
@@ -9,7 +10,7 @@
   import { ACTION_MODE, actionDone, groupsOf, ordered, summarize, type RowAction } from "../lib/transfers";
   import UpdateButton from "../lib/UpdateButton.svelte";
   import { ACTION_LABEL, ACTIVITY, ISSUE_TITLE, stateVisual } from "../lib/status";
-  import type { Issue, IssueAction, TransferItem } from "../lib/types";
+  import type { Activity, BackupInfo, Issue, IssueAction, TransferItem } from "../lib/types";
 
   const flyout = env().platform === "windows";
 
@@ -39,6 +40,19 @@
   const device = flyout ? "PC" : "computer";
   const fileManager = flyout ? "File Explorer" : "the file manager";
   const summary = $derived(transfers && transfers.items.length ? summarize(transfers, device) : null);
+  const backups = $derived(drive.backups);
+  /** Backups worth a line on the home panel: scanning, uploading, or stuck. */
+  const backupRows = $derived(backups?.folders.filter((b) => isBusy(b) || b.state === "problem") ?? []);
+  /** The one calm suggestion to back up Desktop, Documents…; never while something else needs attention. */
+  const offer = $derived.by(() => {
+    if (!backups || backups.suggestions_dismissed || backups.folders.length >= 2) return null;
+    if (!status || !["up_to_date", "syncing"].includes(status.state) || status.pending_delete_confirmation) return null;
+    const items = offerable(backups);
+    if (!items.length) return null;
+    const size = offerBytes(items);
+    return { title: offerTitle(items), size };
+  });
+  let recentHeading = $state<HTMLHeadingElement>();
   // Ticks every second while something waits to retry, so its countdown stays honest.
   let clock = $state(Date.now());
   $effect(() => {
@@ -48,7 +62,7 @@
   });
 
   onMount(() => {
-    connect({ activity: true, issues: true, settings: true, transfers: true });
+    connect({ activity: true, issues: true, settings: true, transfers: true, backups: true });
     if (flyout) {
       const onKey = (e: KeyboardEvent) => {
         // An open dialog handles Escape itself.
@@ -97,8 +111,53 @@
     else issuesButton?.focus();
   }
 
+  function backupOf(id: string | null | undefined): BackupInfo | null {
+    return (id && backups?.folders.find((f) => f.id === id)) || null;
+  }
+
+  /** What happened where: "Uploaded in Projects/Garden", or for a backup "Backed up from Documents". */
+  function activityCaption(item: Activity): string {
+    const kind = ACTIVITY[item.kind];
+    if (item.backup) {
+      const name = backupOf(item.backup)?.name;
+      const backup = name ? `the ${name} backup` : "a backup";
+      // "Uploaded" reads oddly for a backup; say what happened to the copy.
+      if (item.kind === "uploaded") return name ? `Backed up from ${name}` : "Backed up";
+      if (item.kind === "deleted") return `Removed from ${backup}`;
+      return `${kind.verb} in ${backup}`;
+    }
+    const dir = dirname(item.path);
+    return `${kind.verb}${dir ? ` in ${dir}` : ""}`;
+  }
+
+  function activityPath(item: Activity): string {
+    const name = item.backup ? backupOf(item.backup)?.name : null;
+    return name ? `${name} › ${item.path}` : item.path;
+  }
+
+  function issuePath(issue: Issue): string | null {
+    if (!issue.path) return null;
+    const name = issue.backup ? backupOf(issue.backup)?.name : null;
+    return name ? `${name} › ${issue.path}` : issue.path;
+  }
+
+  function dismissOffer() {
+    return run("offer", async () => {
+      drive.backups = await api.dismissBackupSuggestions();
+      announce = "";
+      queueMicrotask(() => (announce = "Suggestion hidden. You can back up folders anytime from Settings."));
+      await tick();
+      recentHeading?.focus();
+    });
+  }
+
   function transferAction(item: TransferItem, action: RowAction) {
-    if (action === "reveal") return run(`reveal:t${item.id}`, () => api.revealItem(item.path));
+    if (action === "reveal") {
+      const inBackup = splitBackupPath(item.path, backups);
+      return run(`reveal:t${item.id}`, () =>
+        inBackup ? api.revealItem(inBackup.rel, inBackup.backup.id) : api.revealItem(item.path),
+      );
+    }
     return run(`t${item.id}:${action}`, async () => {
       drive.transfers = await api.setTransferMode(item.id, ACTION_MODE[action]);
       announce = "";
@@ -224,8 +283,8 @@
               <div class="issue-text">
                 <h3 class="body-strong">{ISSUE_TITLE[issue.kind]}</h3>
                 <p class="selectable">{issue.message}</p>
-                {#if issue.path}
-                  <p class="caption secondary path selectable">{issue.path}</p>
+                {#if issuePath(issue)}
+                  <p class="caption secondary path selectable">{issuePath(issue)}</p>
                 {/if}
                 {#if issue.actions.length}
                   <div class="issue-actions">
@@ -372,6 +431,64 @@
           </section>
         {/if}
 
+        {#if backupRows.length}
+          <section class="card block backups" aria-label="Backups">
+            <ul class="backup-list" role="list">
+              {#each backupRows as b (b.id)}
+                {@const share = progressOf(b)}
+                <li class="backup-row">
+                  {#if b.state === "problem"}
+                    <p class="with-icon problem">
+                      <Icon name="warning" size={16} /><span><span class="body-strong">{b.name}</span> can't be backed up</span>
+                    </p>
+                    {#if b.detail}<p class="caption secondary indent">{b.detail}</p>{/if}
+                  {:else if b.state === "scanning"}
+                    <p class="with-icon"><Icon name="backup" size={16} />Getting {b.name} ready to back up</p>
+                    {#if b.detail}<p class="caption secondary indent numeric">{b.detail}</p>{/if}
+                  {:else}
+                    <div class="row">
+                      <span class="with-icon truncate"><Icon name="backup" size={16} />Backing up {b.name}</span>
+                      <span class="caption secondary numeric">{count(b.done_files)} of {plural(b.files, "file", "files")}</span>
+                    </div>
+                    <div
+                      class="meter"
+                      role="progressbar"
+                      aria-label="Backing up {b.name}"
+                      aria-valuemin="0"
+                      aria-valuemax="100"
+                      aria-valuenow={Math.round(share * 100)}
+                      aria-valuetext="{count(b.done_files)} of {plural(b.files, 'file', 'files')}, {bytes(b.done_bytes)} of {bytes(b.bytes)}"
+                    >
+                      <span style:width="{share * 100}%"></span>
+                    </div>
+                  {/if}
+                </li>
+              {/each}
+            </ul>
+            <button class="btn subtle show-all" onclick={() => api.showWindow("settings", "backups")}>
+              <span>Manage backups</span>
+              <Icon name="chevron-right" size={16} />
+            </button>
+          </section>
+        {/if}
+
+        {#if offer}
+          <section class="card block offer" aria-labelledby="offer-title" aria-describedby="offer-desc">
+            <Icon name="backup" size={18} />
+            <div class="offer-text">
+              <h2 id="offer-title" class="body-strong">{offer.title}</h2>
+              <p id="offer-desc" class="caption secondary">
+                {offer.size !== null ? `${bytes(offer.size)} on this ${device}. ` : ""}Drive can keep a copy in the cloud
+                without moving them.
+              </p>
+              <div class="offer-actions">
+                <button class="btn" onclick={() => api.showWindow("settings", "backups")}>Back up…</button>
+                <button class="btn subtle" aria-disabled={busy === "offer"} onclick={dismissOffer}>Not now</button>
+              </div>
+            </div>
+          </section>
+        {/if}
+
         <section class="card block storage" aria-label="Storage">
           <div class="row">
             <span class="with-icon"><Icon name="storage" size={16} />On this PC</span>
@@ -400,25 +517,26 @@
         </section>
 
         <section class="recent" aria-labelledby="recent-title">
-          <h2 id="recent-title" class="caption secondary section-label">Recent activity</h2>
+          <h2 id="recent-title" class="caption secondary section-label" tabindex="-1" bind:this={recentHeading}>
+            Recent activity
+          </h2>
           {#if drive.activity.length === 0}
             <p class="secondary empty">Changes to your Drive folder show up here.</p>
           {:else}
             <ul class="activity" role="list">
               {#each drive.activity as item (item.id)}
                 {@const kind = ACTIVITY[item.kind]}
-                {@const dir = dirname(item.path)}
                 <li>
                   <button
                     class="activity-row"
-                    title="Show {item.path} in {flyout ? 'File Explorer' : 'the file manager'}"
-                    onclick={() => run(`reveal:${item.id}`, () => api.revealItem(item.path))}
+                    title="Show {activityPath(item)} in {fileManager}"
+                    onclick={() => run(`reveal:${item.id}`, () => api.revealItem(item.path, item.backup ?? null))}
                   >
-                    <Icon name={kind.icon} size={18} class="kind {item.kind}" />
+                    <Icon name={item.backup && item.kind === "uploaded" ? "backup" : kind.icon} size={18} class="kind {item.kind}" />
                     <span class="activity-text">
                       <span class="truncate name">{basename(item.path)}</span>
                       <span class="truncate caption secondary">
-                        {kind.verb}{dir ? ` in ${dir}` : ""} · {relative(item.at_ms, drive.now)}
+                        {activityCaption(item)} · {relative(item.at_ms, drive.now)}
                       </span>
                     </span>
                   </button>
@@ -537,6 +655,54 @@
   }
   .cloud-row {
     margin-block-start: var(--s1);
+  }
+
+  .backups {
+    gap: var(--s3);
+  }
+  .backup-list {
+    display: grid;
+    gap: var(--s3);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .backup-row {
+    display: grid;
+    gap: var(--s2);
+  }
+  .backup-row > p.with-icon {
+    display: flex;
+  }
+  .backup-row .with-icon :global(.icon) {
+    align-self: flex-start;
+    margin-block-start: 2px;
+  }
+  .problem :global(.icon) {
+    color: var(--warning-icon);
+  }
+  .indent {
+    margin-block-start: calc(-1 * var(--s1));
+    padding-inline-start: 24px;
+  }
+
+  .offer {
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: var(--s3);
+  }
+  .offer > :global(.icon) {
+    color: var(--accent-text);
+    margin-block-start: 1px;
+  }
+  .offer-text {
+    display: grid;
+    gap: 2px;
+  }
+  .offer-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--s2);
+    margin-block-start: var(--s2);
   }
 
   .attention {

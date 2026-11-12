@@ -6,8 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use drive_core::ipc::{
-    AccountCheck, AccountCredentials, Activity, Call, Issue, IssueAction, RecoveryKit, Settings,
-    SettingsPatch, SetupRequest, SetupResult, Status, TransferList, TransferMode,
+    AccountCheck, AccountCredentials, Activity, BackupInfo, BackupOverview, Call, Issue,
+    IssueAction, RecoveryKit, Settings, SettingsPatch, SetupRequest, SetupResult, Status,
+    TransferList, TransferMode,
 };
 use serde::Serialize;
 use tauri::{AppHandle, State};
@@ -250,35 +251,129 @@ pub fn open_folder(app: AppHandle, svc: Svc<'_>) -> Res<()> {
 }
 
 /// Shows an item from the activity list in the file manager. `path` is relative to the
-/// Drive folder.
+/// Drive folder, or with `backup` (a `BackupInfo::id`) relative to that backed-up folder.
 #[tauri::command]
-pub fn reveal_item(app: AppHandle, svc: Svc<'_>, path: String) -> Res<()> {
-    let folder = svc
-        .status()
-        .folder
-        .ok_or_else(|| CallError::new("not_set_up", "Drive isn't set up yet."))?;
+pub async fn reveal_item(
+    app: AppHandle,
+    svc: Svc<'_>,
+    path: String,
+    backup: Option<String>,
+) -> Res<()> {
+    let (root, outside) = match backup {
+        Some(id) => {
+            let overview: BackupOverview = svc.call(Call::Backups).await?;
+            let folder = overview
+                .folders
+                .into_iter()
+                .find(|f| f.id == id)
+                .ok_or_else(|| {
+                    CallError::new("not_found", "That folder isn't backed up anymore.")
+                })?;
+            (
+                PathBuf::from(folder.path),
+                "That path isn't inside the backed-up folder.",
+            )
+        }
+        None => {
+            let folder = svc
+                .status()
+                .folder
+                .ok_or_else(|| CallError::new("not_set_up", "Drive isn't set up yet."))?;
+            (
+                PathBuf::from(folder),
+                "That path isn't inside the Drive folder.",
+            )
+        }
+    };
     let rel = Path::new(&path);
     if rel.components().any(|c| !matches!(c, Component::Normal(_))) {
-        return Err(CallError::new(
-            "bad_request",
-            "That path isn't inside the Drive folder.",
-        ));
+        return Err(CallError::new("bad_request", outside));
     }
-    let root = PathBuf::from(&folder);
     let full = root.join(rel);
-    let result = if full.exists() {
+    let result = if full.exists() && full != root {
         app.opener().reveal_item_in_dir(&full)
     } else {
         // Deleted or moved since: open the closest folder that still exists.
         let dir = full
             .ancestors()
-            .skip(1)
             .find(|p| p.starts_with(&root) && p.is_dir())
             .unwrap_or(&root)
             .to_path_buf();
         app.opener().open_path(dir.to_string_lossy(), None::<&str>)
     };
     result.map_err(|e| CallError::new("internal", format!("Couldn't show the file: {e}")))
+}
+
+// ----- Backups of folders outside the Drive folder
+
+/// Backed-up folders and suggestions. Changes also arrive as `drive://backups`.
+#[tauri::command]
+pub async fn backups(svc: Svc<'_>) -> Res<BackupOverview> {
+    svc.call(Call::Backups).await
+}
+
+/// Starts backing up a folder (absolute path).
+#[tauri::command]
+pub async fn add_backup(svc: Svc<'_>, path: String) -> Res<BackupInfo> {
+    svc.call(Call::AddBackup { path }).await
+}
+
+/// The per-folder off switch. Returns the new overview.
+#[tauri::command]
+pub async fn set_backup_enabled(svc: Svc<'_>, id: String, enabled: bool) -> Res<BackupOverview> {
+    svc.call_value(Call::SetBackupEnabled { id, enabled })
+        .await?;
+    svc.call(Call::Backups).await
+}
+
+/// Stops backing up a folder. The folder itself is never touched; the cloud copy is kept
+/// unless `delete_from_cloud` (it then goes to the uloz.to trash). Returns the new overview.
+#[tauri::command]
+pub async fn remove_backup(
+    svc: Svc<'_>,
+    id: String,
+    delete_from_cloud: bool,
+) -> Res<BackupOverview> {
+    svc.call_value(Call::RemoveBackup {
+        id,
+        delete_from_cloud,
+    })
+    .await?;
+    svc.call(Call::Backups).await
+}
+
+/// Replaces a backup's skip list.
+#[tauri::command]
+pub async fn set_backup_excludes(
+    svc: Svc<'_>,
+    id: String,
+    excludes: Vec<String>,
+) -> Res<BackupInfo> {
+    svc.call(Call::SetBackupExcludes { id, excludes }).await
+}
+
+/// Hides the "these folders aren't backed up" suggestion. Returns the new overview.
+#[tauri::command]
+pub async fn dismiss_backup_suggestions(svc: Svc<'_>) -> Res<BackupOverview> {
+    svc.call_value(Call::DismissBackupSuggestions).await?;
+    svc.call(Call::Backups).await
+}
+
+/// Native folder picker for a new backup. Returns the path, or `None` if cancelled.
+#[tauri::command]
+pub async fn pick_backup_folder(app: AppHandle) -> Res<Option<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let mut dialog = app.dialog().file().set_title("Choose a folder to back up");
+    if let Some(home) = dirs::home_dir() {
+        dialog = dialog.set_directory(home);
+    }
+    dialog.pick_folder(move |p| {
+        let _ = tx.send(p);
+    });
+    let picked = rx.await.ok().flatten();
+    Ok(picked
+        .and_then(|p| p.into_path().ok())
+        .map(|p| p.to_string_lossy().into_owned()))
 }
 
 #[tauri::command]
@@ -306,9 +401,9 @@ pub fn open_url(app: AppHandle, url: String) -> Res<()> {
 // Window-creating commands must be async: a synchronous command runs on the main thread,
 // and building a webview there deadlocks on Windows.
 #[tauri::command]
-pub async fn show_window(app: AppHandle, name: String) -> Res<()> {
+pub async fn show_window(app: AppHandle, name: String, section: Option<String>) -> Res<()> {
     match name.as_str() {
-        windows::SETTINGS => windows::open_settings(&app),
+        windows::SETTINGS => windows::open_settings_at(&app, section.as_deref()),
         windows::ONBOARDING => windows::open_onboarding(&app),
         windows::POPOVER => windows::show_main(&app, None),
         _ => {

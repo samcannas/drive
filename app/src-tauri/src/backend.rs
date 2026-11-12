@@ -23,6 +23,9 @@ pub const EV_SETTINGS: &str = "drive://settings";
 /// service pushes it about once a second during transfers, and a hidden popover has no use
 /// for it (it fetches the list once with the `transfers` command when it is shown).
 pub const EV_TRANSFERS: &str = "drive://transfers";
+/// Backed-up folders and suggestions (`ipc::BackupOverview`), on every change and about once
+/// a second while a backup makes progress. Sent to every window (popover and settings).
+pub const EV_BACKUPS: &str = "drive://backups";
 
 /// Error returned to the webview. `code` is an `ipc::ErrorCode` in snake_case, or
 /// `unavailable` / `timeout` when the service could not be reached.
@@ -348,6 +351,9 @@ impl Backend {
                 crate::notify::check_issues(self).await;
             }
             Event::Transfers(list) => self.forward_transfers(&list),
+            Event::Backups(overview) => {
+                let _ = self.app.emit(EV_BACKUPS, overview);
+            }
         }
     }
 

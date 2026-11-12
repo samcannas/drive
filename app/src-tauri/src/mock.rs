@@ -10,16 +10,21 @@
 //! * `DRIVE_UI_MOCK_TRANSFERS=1` starts with a long transfer list: one item in every state,
 //!   a paused upload, large files held for the overnight window and a partly done one that
 //!   resumes. Progress moves, and items finish and come back.
+//! * `DRIVE_UI_MOCK_BACKUPS=1` starts with backed-up folders in every state: one backing up,
+//!   one up to date, one switched off and one whose folder is missing. Without it there are no
+//!   backups and the suggestions show; adding one scans, backs up and finishes in about 20 s.
 //! * `DRIVE_UI_MOCK_UPDATE=1` offers a made-up update (see `updater`); installing it only
 //!   pretends. Works with or without the mock service.
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use drive_core::ipc::{
-    AccountCheck, Activity, ActivityKind, Call, ErrorCode, Event, Hello, Issue, IssueAction,
-    IssueKind, RecoveryKit, RpcError, Settings, SetupResult, Status, SyncState, TransferDirection,
-    TransferItem, TransferList, TransferMode, TransferState,
+    AccountCheck, Activity, ActivityKind, BackupInfo, BackupOverview, BackupState, Call, ErrorCode,
+    Event, FolderSuggestion, Hello, Issue, IssueAction, IssueKind, KnownFolder, RecoveryKit,
+    RpcError, Settings, SetupResult, Status, SyncState, TransferDirection, TransferItem,
+    TransferList, TransferMode, TransferState,
 };
 use rand::Rng;
 use serde_json::{Value, json};
@@ -44,6 +49,11 @@ pub fn update_forced() -> bool {
     cfg!(debug_assertions) && std::env::var("DRIVE_UI_MOCK_UPDATE").is_ok_and(|v| v == "1")
 }
 
+/// Whether to start with backed-up folders in every state. Always false in release builds.
+fn backups_forced() -> bool {
+    cfg!(debug_assertions) && std::env::var("DRIVE_UI_MOCK_BACKUPS").is_ok_and(|v| v == "1")
+}
+
 struct State {
     set_up: bool,
     paused: bool,
@@ -58,6 +68,25 @@ struct State {
     batch: Vec<(&'static str, u64, bool)>,
     /// The long transfer list (`DRIVE_UI_MOCK_TRANSFERS=1`); replaces `batch` when set.
     transfers: Option<Vec<MockTransfer>>,
+    backups: Vec<MockBackup>,
+    suggestions_dismissed: bool,
+    /// A backup was added at some point, so the vault has a `Backups/<device>` folder.
+    backups_ever: bool,
+    next_backup: u32,
+}
+
+/// A backed-up folder and how the mock moves it along.
+struct MockBackup {
+    info: BackupInfo,
+    /// Ticks left while scanning.
+    scan: u32,
+    /// Ticks a full backup takes once scanning is done.
+    ticks: u64,
+    /// What the folder holds after skips (`info.files` grows towards it while scanning).
+    total_files: u64,
+    total_bytes: u64,
+    /// Which sample file uploads next.
+    cursor: usize,
 }
 
 #[derive(Clone)]
@@ -171,6 +200,7 @@ impl Mock {
             id: 1,
             kind: IssueKind::FileLocked,
             path: Some("Documents/Budget 2026.xlsx".into()),
+            backup: None,
             message:
                 "Budget 2026.xlsx is open in another app. Drive will upload it after you close it."
                     .into(),
@@ -179,6 +209,27 @@ impl Mock {
         }];
         if mass {
             issues.push(mass_issue(2, 1_240, now));
+        }
+        let backups = if backups_forced() {
+            rich_backups(now)
+        } else {
+            Vec::new()
+        };
+        let mut activity = activity;
+        if backups_forced() {
+            for (id, mins, kind, path) in [
+                (
+                    7,
+                    1,
+                    ActivityKind::Uploaded,
+                    "Taxes/2025/Receipts/Pharmacy.pdf",
+                ),
+                (6, 9, ActivityKind::Deleted, "Drafts/Old cover letter.docx"),
+            ] {
+                let mut a = act(id, now - mins * 60_000, kind, path, 120_000);
+                a.backup = Some("b1".into());
+                activity.insert(0, a);
+            }
         }
         let state = State {
             set_up,
@@ -210,6 +261,10 @@ impl Mock {
             pending_delete: mass.then_some(1_240),
             batch: Vec::new(),
             transfers: transfers_forced().then(|| rich_transfers(now)),
+            backups_ever: !backups.is_empty(),
+            backups,
+            suggestions_dismissed: false,
+            next_backup: 10,
         };
         let (events, _) = broadcast::channel(64);
         let mock = Arc::new(Self {
@@ -239,6 +294,69 @@ impl Mock {
         let _ = self.events.send(Event::Transfers(transfers_of(st)));
     }
 
+    fn emit_backups(&self, st: &State) {
+        let _ = self.events.send(Event::Backups(overview_of(st)));
+    }
+
+    /// Moves scanning and backing-up folders along by one tick (0.7 s).
+    fn tick_backups(&self, st: &mut State) {
+        let now = now_ms();
+        let mut changed = false;
+        let mut done = Vec::new();
+        for b in st.backups.iter_mut() {
+            match b.info.state {
+                BackupState::Scanning => {
+                    changed = true;
+                    b.scan = b.scan.saturating_sub(1);
+                    if b.scan == 0 {
+                        b.info.files = b.total_files;
+                        b.info.bytes = b.total_bytes;
+                        b.info.state = BackupState::BackingUp;
+                        b.info.detail = None;
+                    } else {
+                        let seen = b.total_files * u64::from(8 - b.scan.min(7)) / 8;
+                        b.info.files = seen;
+                        b.info.bytes = b.total_bytes * u64::from(8 - b.scan.min(7)) / 8;
+                        b.info.detail = Some(format!("Looking through {} files…", thousands(seen)));
+                    }
+                    b.info.pending = (b.info.files - b.info.done_files.min(b.info.files)) as u32;
+                }
+                BackupState::BackingUp => {
+                    changed = true;
+                    let step = (b.total_files / b.ticks).max(1);
+                    b.info.done_files = (b.info.done_files + step).min(b.info.files);
+                    b.info.done_bytes = if b.info.done_files == b.info.files {
+                        b.info.bytes
+                    } else {
+                        b.info.bytes / b.info.files.max(1) * b.info.done_files
+                    };
+                    b.info.pending = (b.info.files - b.info.done_files) as u32;
+                    if b.info.done_files == b.info.files {
+                        b.info.state = BackupState::UpToDate;
+                        b.info.last_complete_ms = Some(now);
+                    }
+                    if b.cursor % 3 == 0 || b.info.state == BackupState::UpToDate {
+                        done.push((b.info.id.clone(), sample_file(b.info.known, b.cursor / 3)));
+                    }
+                    b.cursor += 1;
+                }
+                _ => {}
+            }
+        }
+        for (id, (path, bytes)) in done {
+            st.next_id += 1;
+            let mut a = act(st.next_id, now, ActivityKind::Uploaded, path, bytes);
+            a.backup = Some(id);
+            st.activity.insert(0, a.clone());
+            st.activity.truncate(50);
+            let _ = self.events.send(Event::Activity(a));
+        }
+        if changed {
+            self.emit_backups(st);
+            self.emit_status(st);
+        }
+    }
+
     /// Cycles between "syncing" (about 10 s) and "up to date" (about 12 s).
     fn tick(&self) {
         let mut st = self.state.lock().unwrap();
@@ -246,6 +364,7 @@ impl Mock {
             return;
         }
         st.tick += 1;
+        self.tick_backups(&mut st);
         if st.transfers.is_some() {
             self.tick_transfers(&mut st);
             self.emit_status(&st);
@@ -412,11 +531,13 @@ impl Mock {
             Call::Pause => {
                 st.paused = true;
                 self.emit_status(&st);
+                self.emit_backups(&st);
                 Value::Null
             }
             Call::Resume => {
                 st.paused = false;
                 self.emit_status(&st);
+                self.emit_backups(&st);
                 Value::Null
             }
             Call::SyncNow => {
@@ -493,6 +614,63 @@ impl Mock {
                 self.emit_transfers(&st);
                 Value::Null
             }
+            Call::Backups => json!(overview_of(&st)),
+            Call::AddBackup { path } => {
+                let info = add_backup(&mut st, &path)?;
+                self.emit_backups(&st);
+                self.emit_status(&st);
+                json!(info)
+            }
+            Call::SetBackupEnabled { id, enabled } => {
+                let b = backup_mut(&mut st, &id)?;
+                b.info.enabled = enabled;
+                b.info.state = match (enabled, b.info.state) {
+                    (false, _) => BackupState::Off,
+                    (true, BackupState::Problem) => BackupState::Problem,
+                    (true, _) => {
+                        // Looks through the folder again for what changed while it was off.
+                        b.scan = 3;
+                        BackupState::Scanning
+                    }
+                };
+                if !enabled {
+                    b.info.detail = None;
+                }
+                self.emit_backups(&st);
+                self.emit_status(&st);
+                Value::Null
+            }
+            Call::RemoveBackup { id, delete_from_cloud } => {
+                let Some(pos) = st.backups.iter().position(|b| b.info.id == id) else {
+                    return Err(err(ErrorCode::NotFound, "That folder isn't backed up anymore."));
+                };
+                let b = st.backups.remove(pos);
+                tracing::info!(
+                    "[mock] stopped backing up {} ({})",
+                    b.info.name,
+                    if delete_from_cloud { "cloud copy moved to the trash" } else { "cloud copy kept" }
+                );
+                self.emit_backups(&st);
+                self.emit_status(&st);
+                Value::Null
+            }
+            Call::SetBackupExcludes { id, excludes } => {
+                let excludes = clean_excludes(excludes)?;
+                let b = backup_mut(&mut st, &id)?;
+                b.info.excludes = excludes;
+                if b.info.enabled && b.info.state != BackupState::Problem {
+                    b.info.state = BackupState::Scanning;
+                    b.scan = 3;
+                }
+                let info = b.info.clone();
+                self.emit_backups(&st);
+                json!(info)
+            }
+            Call::DismissBackupSuggestions => {
+                st.suggestions_dismissed = true;
+                self.emit_backups(&st);
+                Value::Null
+            }
         };
         Ok(v)
     }
@@ -512,6 +690,7 @@ fn act(id: i64, at_ms: i64, kind: ActivityKind, path: &str, bytes: u64) -> Activ
         at_ms,
         kind,
         path: path.into(),
+        backup: None,
         bytes,
         detail,
     }
@@ -522,6 +701,7 @@ fn mass_issue(id: i64, count: u32, now: i64) -> Issue {
         id,
         kind: IssueKind::MassDelete,
         path: Some("Photos".into()),
+        backup: None,
         message: format!(
             "{count} items were deleted from your Drive folder. Drive is waiting for you before deleting them from the cloud."
         ),
@@ -572,8 +752,18 @@ fn status_of(st: &State) -> Status {
         let done = if syncing { total * phase / 15 } else { 0 };
         (syncing, total, done, up, st.batch.len() as u32 - up)
     };
+    let backing_up: Vec<&MockBackup> = st
+        .backups
+        .iter()
+        .filter(|b| b.info.state == BackupState::BackingUp)
+        .collect();
     let (state, headline) = if st.paused {
         (SyncState::Paused, "Syncing paused".to_string())
+    } else if !syncing && !backing_up.is_empty() {
+        (
+            SyncState::Syncing,
+            format!("Backing up {}…", backing_up[0].info.name),
+        )
     } else if syncing {
         let n = (up + down) as usize;
         (
@@ -588,7 +778,13 @@ fn status_of(st: &State) -> Status {
         headline,
         account: st.account.clone(),
         folder: Some(st.settings.folder.clone()),
-        uploading: if syncing { up } else { 0 },
+        uploading: if syncing {
+            up
+        } else if st.paused {
+            0
+        } else {
+            backing_up.len() as u32
+        },
         downloading: if syncing { down } else { 0 },
         pending: if syncing { up + down } else { 0 },
         transfer_bytes_total: if syncing { total } else { 0 },
@@ -926,4 +1122,363 @@ fn transfers_of(st: &State) -> TransferList {
         auto_upload_checking: false,
         items,
     }
+}
+
+// ---- backups -----------------------------------------------------------------------------
+
+const DEFAULT_EXCLUDES: &[&str] = &[
+    "node_modules",
+    "__pycache__",
+    ".cache",
+    ".gradle",
+    ".tox",
+    "bower_components",
+    "*.tmp",
+    "~$*",
+    "Thumbs.db",
+    "desktop.ini",
+    ".DS_Store",
+];
+
+/// 12400 → "12,400".
+fn thousands(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The well-known folders of this user with made-up sizes (after the default skips).
+/// A well-known folder: which one, its name, where it is, and (files, bytes) once measured.
+type Known = (KnownFolder, &'static str, PathBuf, Option<(u64, u64)>);
+
+fn known_folders() -> Vec<Known> {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("C:\\Users\\alex"));
+    let dir = |d: Option<PathBuf>, name: &str| d.unwrap_or_else(|| home.join(name));
+    vec![
+        (
+            KnownFolder::Desktop,
+            "Desktop",
+            dir(dirs::desktop_dir(), "Desktop"),
+            Some((449, 410 * MB)),
+        ),
+        (
+            KnownFolder::Documents,
+            "Documents",
+            dir(dirs::document_dir(), "Documents"),
+            Some((98_000, 14 * GB)),
+        ),
+        (
+            KnownFolder::Downloads,
+            "Downloads",
+            dir(dirs::download_dir(), "Downloads"),
+            Some((400, 22 * GB)),
+        ),
+        (
+            KnownFolder::Pictures,
+            "Pictures",
+            dir(dirs::picture_dir(), "Pictures"),
+            Some((3_120, 6 * GB + 300 * MB)),
+        ),
+        // Still being measured.
+        (
+            KnownFolder::Videos,
+            "Videos",
+            dir(dirs::video_dir(), "Videos"),
+            None,
+        ),
+    ]
+}
+
+/// A file the mock "backs up" next, relative to the backed-up folder.
+fn sample_file(known: Option<KnownFolder>, i: usize) -> (&'static str, u64) {
+    const DOCS: &[(&str, u64)] = &[
+        ("Taxes/2025/Receipts/Pharmacy.pdf", 220_000),
+        ("Thesis/Chapter 3 - Methods.docx", 1_400_000),
+        ("Recipes/Grandma's apple cake.txt", 3_000),
+        ("Insurance/Home policy 2026.pdf", 640_000),
+    ];
+    const PICS: &[(&str, u64)] = &[
+        ("2026/Lisbon/IMG_4901.HEIC", 3_400_000),
+        ("2026/Lisbon/IMG_4902.HEIC", 3_100_000),
+        ("Screenshots/Screenshot 2026-11-10 093112.png", 420_000),
+    ];
+    const MISC: &[(&str, u64)] = &[
+        ("Notes.txt", 2_000),
+        ("Project plan.xlsx", 88_000),
+        ("Setup files/installer.msi", 48 * MB),
+    ];
+    let list = match known {
+        Some(KnownFolder::Pictures | KnownFolder::Videos) => PICS,
+        Some(KnownFolder::Documents) => DOCS,
+        _ => MISC,
+    };
+    list[i % list.len()]
+}
+
+fn backup_info(
+    id: &str,
+    name: &str,
+    path: &Path,
+    known: Option<KnownFolder>,
+    now: i64,
+) -> BackupInfo {
+    BackupInfo {
+        id: id.into(),
+        name: name.into(),
+        path: path.to_string_lossy().into_owned(),
+        known,
+        enabled: true,
+        state: BackupState::Scanning,
+        detail: Some("Looking through the folder…".into()),
+        excludes: DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect(),
+        files: 0,
+        bytes: 0,
+        done_files: 0,
+        done_bytes: 0,
+        pending: 0,
+        skipped_online_only: 0,
+        added_ms: now,
+        last_complete_ms: None,
+    }
+}
+
+fn rich_backups(now: i64) -> Vec<MockBackup> {
+    let known = known_folders();
+    let find = |k: KnownFolder| known.iter().find(|f| f.0 == k).unwrap();
+    let mut out = Vec::new();
+
+    let (k, name, path, _) = find(KnownFolder::Documents);
+    let mut info = backup_info("b1", name, path, Some(*k), now - 3_600_000);
+    info.state = BackupState::BackingUp;
+    info.detail = None;
+    info.files = 98_000;
+    info.bytes = 14 * GB;
+    info.done_files = 1_204;
+    info.done_bytes = 900 * MB;
+    info.pending = 98_000 - 1_204;
+    info.skipped_online_only = 12;
+    out.push(MockBackup {
+        info,
+        scan: 0,
+        ticks: 400,
+        total_files: 98_000,
+        total_bytes: 14 * GB,
+        cursor: 0,
+    });
+
+    let (k, name, path, _) = find(KnownFolder::Desktop);
+    let mut info = backup_info("b2", name, path, Some(*k), now - 2 * 86_400_000);
+    info.state = BackupState::UpToDate;
+    info.detail = None;
+    info.files = 449;
+    info.bytes = 410 * MB;
+    info.done_files = 449;
+    info.done_bytes = 410 * MB;
+    info.last_complete_ms = Some(now - 5 * 60_000);
+    out.push(MockBackup {
+        info,
+        scan: 0,
+        ticks: 20,
+        total_files: 449,
+        total_bytes: 410 * MB,
+        cursor: 0,
+    });
+
+    let (k, name, path, _) = find(KnownFolder::Pictures);
+    let mut info = backup_info("b3", name, path, Some(*k), now - 9 * 86_400_000);
+    info.enabled = false;
+    info.state = BackupState::Off;
+    info.detail = None;
+    info.files = 3_120;
+    info.bytes = 6 * GB + 300 * MB;
+    info.done_files = 3_120;
+    info.done_bytes = 6 * GB + 300 * MB;
+    info.last_complete_ms = Some(now - 3 * 86_400_000);
+    out.push(MockBackup {
+        info,
+        scan: 0,
+        ticks: 20,
+        total_files: 3_120,
+        total_bytes: 6 * GB + 300 * MB,
+        cursor: 0,
+    });
+
+    let mut info = backup_info(
+        "b4",
+        "Old projects",
+        Path::new("D:\\Old projects"),
+        None,
+        now - 30 * 86_400_000,
+    );
+    info.state = BackupState::Problem;
+    info.detail =
+        Some("Folder not found. If it's on a removable drive, plug the drive back in.".into());
+    info.files = 12_400;
+    info.bytes = 31 * GB;
+    info.done_files = 12_400;
+    info.done_bytes = 31 * GB;
+    info.last_complete_ms = Some(now - 6 * 86_400_000);
+    out.push(MockBackup {
+        info,
+        scan: 0,
+        ticks: 20,
+        total_files: 12_400,
+        total_bytes: 31 * GB,
+        cursor: 0,
+    });
+    out
+}
+
+fn overview_of(st: &State) -> BackupOverview {
+    let mut folders: Vec<BackupInfo> = st.backups.iter().map(|b| b.info.clone()).collect();
+    if st.paused {
+        for f in &mut folders {
+            if matches!(f.state, BackupState::Scanning | BackupState::BackingUp) {
+                f.state = BackupState::Waiting;
+                f.detail = Some("Syncing is paused. The backup continues when you resume.".into());
+            }
+        }
+    }
+    let drive = PathBuf::from(&st.settings.folder);
+    let mut suggestions: Vec<FolderSuggestion> = known_folders()
+        .into_iter()
+        .filter(|(k, ..)| !st.backups.iter().any(|b| b.info.known == Some(*k)))
+        .map(|(known, name, path, size)| FolderSuggestion {
+            known,
+            name: name.into(),
+            blocked: drive
+                .starts_with(&path)
+                .then(|| "Contains your Drive folder".to_string()),
+            path: path.to_string_lossy().into_owned(),
+            files: size.map(|s| s.0),
+            bytes: size.map(|s| s.1),
+        })
+        .collect();
+    // Largest first; still measuring last.
+    suggestions.sort_by_key(|s| std::cmp::Reverse(s.bytes.map(|b| b + 1).unwrap_or(0)));
+    BackupOverview {
+        folders,
+        suggestions,
+        suggestions_dismissed: st.suggestions_dismissed,
+        cloud_folder: st
+            .backups_ever
+            .then(|| format!("Backups/{}", st.settings.device_name)),
+        default_excludes: DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+fn backup_mut<'a>(st: &'a mut State, id: &str) -> Result<&'a mut MockBackup, RpcError> {
+    st.backups
+        .iter_mut()
+        .find(|b| b.info.id == id)
+        .ok_or_else(|| err(ErrorCode::NotFound, "That folder isn't backed up anymore."))
+}
+
+fn clean_excludes(excludes: Vec<String>) -> Result<Vec<String>, RpcError> {
+    let mut out: Vec<String> = Vec::new();
+    for e in excludes {
+        let e = e.trim().to_string();
+        if e.is_empty() || out.contains(&e) {
+            continue;
+        }
+        if e.contains(['/', '\\']) {
+            return Err(err(
+                ErrorCode::BadRequest,
+                &format!(
+                    "\"{e}\" has a slash. Enter just a name, like node_modules, or a pattern like *.tmp."
+                ),
+            ));
+        }
+        out.push(e);
+    }
+    Ok(out)
+}
+
+fn add_backup(st: &mut State, raw: &str) -> Result<BackupInfo, RpcError> {
+    let path = PathBuf::from(raw.trim());
+    if raw.trim().is_empty() || !path.is_absolute() {
+        return Err(err(ErrorCode::BadRequest, "Choose a folder to back up."));
+    }
+    let drive = PathBuf::from(&st.settings.folder);
+    if path.starts_with(&drive) {
+        return Err(err(
+            ErrorCode::BadRequest,
+            "That folder is inside your Drive folder, so it's already in the cloud.",
+        ));
+    }
+    if drive.starts_with(&path) {
+        return Err(err(
+            ErrorCode::BadRequest,
+            "That folder contains your Drive folder. Choose a folder inside it instead, like Documents.",
+        ));
+    }
+    for b in &st.backups {
+        let other = Path::new(&b.info.path);
+        if other == path {
+            return Err(err(
+                ErrorCode::BadRequest,
+                "That folder is already backed up.",
+            ));
+        }
+        if path.starts_with(other) {
+            return Err(err(
+                ErrorCode::BadRequest,
+                &format!(
+                    "That folder is inside {}, which is already backed up.",
+                    b.info.name
+                ),
+            ));
+        }
+        if other.starts_with(&path) {
+            return Err(err(
+                ErrorCode::BadRequest,
+                &format!(
+                    "That folder contains {}, which is already backed up. Stop backing up {} first.",
+                    b.info.name, b.info.name
+                ),
+            ));
+        }
+    }
+    let known = known_folders().into_iter().find(|f| f.2 == path);
+    let base = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| raw.trim().to_string());
+    let mut name = base.clone();
+    let mut n = 2;
+    while st.backups.iter().any(|b| b.info.name == name) {
+        name = format!("{base} ({n})");
+        n += 1;
+    }
+    let (total_files, total_bytes) = match known.as_ref().and_then(|k| k.3) {
+        Some(size) => size,
+        None => {
+            let mut rng = rand::thread_rng();
+            (rng.gen_range(800..20_000), rng.gen_range(1..8) * GB)
+        }
+    };
+    st.next_backup += 1;
+    let info = backup_info(
+        &format!("b{}", st.next_backup),
+        &name,
+        &path,
+        known.map(|k| k.0),
+        now_ms(),
+    );
+    st.backups.push(MockBackup {
+        info: info.clone(),
+        scan: 7,
+        ticks: 22,
+        total_files,
+        total_bytes,
+        cursor: 0,
+    });
+    st.backups_ever = true;
+    Ok(info)
 }

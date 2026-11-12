@@ -7,10 +7,16 @@
 //            transfers (a long transfer list: one item in every state, a paused upload, large
 //            files held for tonight, a partly done one that resumes) | transfers-night (only
 //            uploads held for tonight) | transfers-paused (only paused uploads)
+//            backups (backed-up folders in every state: backing up, up to date, off, folder missing)
+//            backup-suggest (no backups yet; the popover suggests backing up Desktop, Documents…)
 
 import type {
   Activity,
+  BackupInfo,
+  BackupOverview,
+  FolderSuggestion,
   Issue,
+  KnownFolder,
   Release,
   Settings,
   Status,
@@ -84,6 +90,13 @@ const state = {
   pendingDelete: null as number | null,
 };
 
+if (scenario === "backups") {
+  state.activity.unshift(
+    { id: 6, at_ms: now - 9 * 60_000, kind: "deleted", path: "Drafts/Old cover letter.docx", backup: "b1", bytes: 31_000, detail: null },
+    { id: 7, at_ms: now - 60_000, kind: "uploaded", path: "Taxes/2025/Receipts/Pharmacy.pdf", backup: "b1", bytes: 220_000, detail: null },
+  );
+  state.activity.sort((x, y) => y.at_ms - x.at_ms);
+}
 if (scenario === "massdelete") {
   state.pendingDelete = 1240;
   state.issues.push({
@@ -99,6 +112,288 @@ if (scenario === "signedout") {
   state.issues = [
     { id: 3, kind: "auth", path: null, message: "uloz.to stopped accepting your password. Sign in again to keep syncing.", created_ms: now - 600_000, actions: ["sign_in"] },
   ];
+}
+
+// ----- Backups of folders outside the Drive folder
+
+const DEFAULT_EXCLUDES = [
+  "node_modules",
+  "__pycache__",
+  ".cache",
+  ".gradle",
+  ".tox",
+  "bower_components",
+  "*.tmp",
+  "~$*",
+  "Thumbs.db",
+  "desktop.ini",
+  ".DS_Store",
+];
+const HOME = "C:\\Users\\alex";
+const KNOWN: FolderSuggestion[] = [
+  { known: "desktop", name: "Desktop", path: `${HOME}\\Desktop`, files: 449, bytes: 410 * MB, blocked: null },
+  { known: "documents", name: "Documents", path: `${HOME}\\Documents`, files: 98_000, bytes: 14 * GB, blocked: null },
+  { known: "downloads", name: "Downloads", path: `${HOME}\\Downloads`, files: 400, bytes: 22 * GB, blocked: null },
+  { known: "pictures", name: "Pictures", path: `${HOME}\\Pictures`, files: 3_120, bytes: 6.3 * GB, blocked: null },
+  // Still being measured.
+  { known: "videos", name: "Videos", path: `${HOME}\\Videos`, files: null, bytes: null, blocked: null },
+];
+const SAMPLE_FILES = [
+  "Taxes/2025/Receipts/Pharmacy.pdf",
+  "Thesis/Chapter 3 - Methods.docx",
+  "Recipes/Grandma's apple cake.txt",
+  "Insurance/Home policy 2026.pdf",
+];
+/** What the folder picker returns, in turn: a fine folder, one holding the Drive folder, one inside it. */
+const PICKS = ["D:\\Photo archive", HOME, `${HOME}\\Drive\\Projects`, "E:\\Music"];
+let picks = 0;
+
+interface MockBackup {
+  info: BackupInfo;
+  /** Ticks left while scanning. */
+  scan: number;
+  /** Ticks a full backup takes. */
+  ticks: number;
+  totalFiles: number;
+  totalBytes: number;
+  cursor: number;
+}
+
+function backupInfo(id: string, name: string, path: string, known: KnownFolder | null, added: number): BackupInfo {
+  return {
+    id,
+    name,
+    path,
+    known,
+    enabled: true,
+    state: "scanning",
+    detail: "Looking through the folder…",
+    excludes: [...DEFAULT_EXCLUDES],
+    files: 0,
+    bytes: 0,
+    done_files: 0,
+    done_bytes: 0,
+    pending: 0,
+    skipped_online_only: 0,
+    added_ms: added,
+    last_complete_ms: null,
+  };
+}
+
+function richBackups(): MockBackup[] {
+  const k = (known: KnownFolder) => KNOWN.find((f) => f.known === known)!;
+  const done = (info: BackupInfo, files: number, bytes: number) => ({
+    ...info,
+    detail: null,
+    files,
+    bytes,
+    done_files: files,
+    done_bytes: bytes,
+  });
+  const docs = k("documents");
+  const desk = k("desktop");
+  const pics = k("pictures");
+  return [
+    {
+      info: {
+        ...backupInfo("b1", docs.name, docs.path, "documents", now - 3_600_000),
+        state: "backing_up",
+        detail: null,
+        files: 98_000,
+        bytes: 14 * GB,
+        done_files: 1_204,
+        done_bytes: 900 * MB,
+        pending: 98_000 - 1_204,
+        skipped_online_only: 12,
+      },
+      scan: 0,
+      ticks: 400,
+      totalFiles: 98_000,
+      totalBytes: 14 * GB,
+      cursor: 0,
+    },
+    {
+      info: {
+        ...done(backupInfo("b2", desk.name, desk.path, "desktop", now - 2 * 86_400_000), 449, 410 * MB),
+        state: "up_to_date",
+        last_complete_ms: now - 5 * 60_000,
+      },
+      scan: 0,
+      ticks: 20,
+      totalFiles: 449,
+      totalBytes: 410 * MB,
+      cursor: 0,
+    },
+    {
+      info: {
+        ...done(backupInfo("b3", pics.name, pics.path, "pictures", now - 9 * 86_400_000), 3_120, 6.3 * GB),
+        enabled: false,
+        state: "off",
+        last_complete_ms: now - 3 * 86_400_000,
+      },
+      scan: 0,
+      ticks: 20,
+      totalFiles: 3_120,
+      totalBytes: 6.3 * GB,
+      cursor: 0,
+    },
+    {
+      info: {
+        ...done(backupInfo("b4", "Old projects", "D:\\Old projects", null, now - 30 * 86_400_000), 12_400, 31 * GB),
+        state: "problem",
+        detail: "Folder not found. If it's on a removable drive, plug the drive back in.",
+        last_complete_ms: now - 6 * 86_400_000,
+      },
+      scan: 0,
+      ticks: 20,
+      totalFiles: 12_400,
+      totalBytes: 31 * GB,
+      cursor: 0,
+    },
+  ];
+}
+
+const backupState = {
+  folders: scenario === "backups" ? richBackups() : ([] as MockBackup[]),
+  // Outside the backup scenarios the popover stays as it was; Settings still lists the suggestions.
+  dismissed: scenario !== "backup-suggest",
+  ever: scenario === "backups",
+  next: 10,
+};
+
+function overview(): BackupOverview {
+  const folders = backupState.folders.map((b) => {
+    const info = { ...b.info, excludes: [...b.info.excludes] };
+    if (state.paused && (info.state === "scanning" || info.state === "backing_up")) {
+      info.state = "waiting";
+      info.detail = "Syncing is paused. The backup continues when you resume.";
+    }
+    return info;
+  });
+  const suggestions = KNOWN.filter((k) => !backupState.folders.some((b) => b.info.known === k.known))
+    .map((k) => ({ ...k }))
+    .sort((a, b) => (b.bytes ?? -1) - (a.bytes ?? -1));
+  return {
+    folders,
+    suggestions,
+    suggestions_dismissed: backupState.dismissed,
+    cloud_folder: backupState.ever ? `Backups/${state.settings.device_name}` : null,
+    default_excludes: [...DEFAULT_EXCLUDES],
+  };
+}
+
+function emitBackups() {
+  emit("drive://backups", overview());
+}
+
+function tickBackups() {
+  if (!state.setUp || state.paused) return;
+  let changed = false;
+  for (const b of backupState.folders) {
+    const i = b.info;
+    if (i.state === "scanning") {
+      changed = true;
+      b.scan--;
+      if (b.scan <= 0) {
+        Object.assign(i, { state: "backing_up", detail: null, files: b.totalFiles, bytes: b.totalBytes });
+      } else {
+        const share = (8 - Math.min(b.scan, 7)) / 8;
+        i.files = Math.round(b.totalFiles * share);
+        i.bytes = Math.round(b.totalBytes * share);
+        i.detail = `Looking through ${i.files.toLocaleString("en")} files…`;
+      }
+      i.pending = i.files - Math.min(i.done_files, i.files);
+    } else if (i.state === "backing_up") {
+      changed = true;
+      i.done_files = Math.min(i.files, i.done_files + Math.max(1, Math.round(b.totalFiles / b.ticks)));
+      i.done_bytes = i.done_files === i.files ? i.bytes : Math.round((i.bytes / Math.max(1, i.files)) * i.done_files);
+      i.pending = i.files - i.done_files;
+      if (i.done_files === i.files) {
+        i.state = "up_to_date";
+        i.last_complete_ms = Date.now();
+      }
+      if (b.cursor++ % 3 === 0 || i.state === "up_to_date") {
+        const a: Activity = {
+          id: ++state.tick + 20_000,
+          at_ms: Date.now(),
+          kind: "uploaded",
+          path: SAMPLE_FILES[Math.floor(b.cursor / 3) % SAMPLE_FILES.length],
+          backup: i.id,
+          bytes: 220_000,
+          detail: null,
+        };
+        state.activity.unshift(a);
+        emit("drive://activity", a);
+      }
+    }
+  }
+  if (changed) {
+    emitBackups();
+    emit("drive://status", status());
+  }
+}
+
+if (scenario !== "idle") setInterval(tickBackups, 700);
+
+/** The backup that's uploading, as the service shows it in the transfer list. */
+function backupItems(): TransferItem[] {
+  if (state.paused) return [];
+  return backupState.folders
+    .filter((b) => b.info.state === "backing_up")
+    .map((b, n) => {
+      const total = 1.4 * MB;
+      const done = ((b.cursor % 3) + 1) * (total / 3);
+      return {
+        id: 900 + n,
+        path: `${b.info.name} › ${SAMPLE_FILES[Math.floor(b.cursor / 3) % SAMPLE_FILES.length]}`,
+        direction: "upload",
+        state: "active",
+        reason: null,
+        bytes_done: Math.round(done),
+        bytes_total: Math.round(total),
+        rate_bps: Math.round(1.2 * MB),
+        eta_secs: 1,
+        retry_at_ms: null,
+        resumable: false,
+        mode: "auto",
+      } satisfies TransferItem;
+    });
+}
+
+function addBackup(raw: string): BackupInfo | Promise<never> {
+  const path = raw.trim().replace(/[\\/]+$/, "");
+  const inside = (p: string, root: string) => p.toLowerCase() === root.toLowerCase() || p.toLowerCase().startsWith(root.toLowerCase() + "\\");
+  const drive = state.settings.folder;
+  if (!path) return fail("bad_request", "Choose a folder to back up.");
+  if (inside(path, drive)) return fail("bad_request", "That folder is inside your Drive folder, so it's already in the cloud.");
+  if (inside(drive, path))
+    return fail("bad_request", "That folder contains your Drive folder. Choose a folder inside it instead, like Documents.");
+  for (const b of backupState.folders) {
+    if (b.info.path.toLowerCase() === path.toLowerCase()) return fail("bad_request", "That folder is already backed up.");
+    if (inside(path, b.info.path)) return fail("bad_request", `That folder is inside ${b.info.name}, which is already backed up.`);
+    if (inside(b.info.path, path))
+      return fail("bad_request", `That folder contains ${b.info.name}, which is already backed up. Stop backing up ${b.info.name} first.`);
+  }
+  const known = KNOWN.find((k) => k.path.toLowerCase() === path.toLowerCase()) ?? null;
+  const base = path.split(/[\\/]/).pop() || path;
+  let name = base;
+  for (let n = 2; backupState.folders.some((b) => b.info.name === name); n++) name = `${base} (${n})`;
+  const info = backupInfo(`b${++backupState.next}`, name, path, known?.known ?? null, Date.now());
+  backupState.folders.push({
+    info,
+    scan: 7,
+    ticks: 22,
+    totalFiles: known?.files ?? 4_210,
+    totalBytes: known?.bytes ?? 2.6 * GB,
+    cursor: 0,
+  });
+  backupState.ever = true;
+  emitBackups();
+  return { ...info };
+}
+
+function findBackup(id: unknown): MockBackup | undefined {
+  return backupState.folders.find((b) => b.info.id === id);
 }
 
 // ----- Updates
@@ -336,7 +631,9 @@ function batchItems(): TransferItem[] {
 
 function transferList(): TransferList {
   const t0 = Date.now();
-  const items = (transfers ? transfers.map((t) => itemOf(t, t0)) : batchItems()).sort((a, b) => rank(a.state) - rank(b.state));
+  const items = [...(transfers ? transfers.map((t) => itemOf(t, t0)) : batchItems()), ...backupItems()].sort(
+    (a, b) => rank(a.state) - rank(b.state),
+  );
   const ups = items.filter((t) => t.direction === "upload");
   const upRate = ups.reduce((n, t) => n + t.rate_bps, 0);
   const remaining = ups.filter((t) => rank(t.state) < 2).reduce((n, t) => n + t.bytes_total - t.bytes_done, 0);
@@ -404,6 +701,16 @@ function status(): Status {
       pending: transfers.length,
       transfer_bytes_total: Math.round(live.reduce((n, t) => n + t.total, 0)),
       transfer_bytes_done: Math.round(live.reduce((n, t) => n + t.done, 0)),
+    };
+  }
+  const backingUp = backupState.folders.filter((b) => b.info.state === "backing_up");
+  if (!syncing && backingUp.length) {
+    return {
+      ...base,
+      state: "syncing",
+      headline: `Backing up ${backingUp[0].info.name}…`,
+      uploading: backingUp.length,
+      pending: backingUp.reduce((n, b) => n + b.info.pending, 0),
     };
   }
   if (syncing) {
@@ -534,7 +841,59 @@ async function handle(cmd: string, a: Record<string, unknown>): Promise<unknown>
     case "resume":
       state.paused = cmd === "pause";
       emit("drive://status", status());
+      emitBackups();
       return null;
+    case "backups":
+      return overview();
+    case "add_backup":
+      return addBackup(String(a.path ?? ""));
+    case "pick_backup_folder":
+      return PICKS[picks++ % PICKS.length];
+    case "set_backup_enabled": {
+      const b = findBackup(a.id);
+      if (!b) return fail("not_found", "That folder isn't backed up anymore.");
+      b.info.enabled = a.enabled as boolean;
+      if (!b.info.enabled) Object.assign(b.info, { state: "off", detail: null });
+      else if (b.info.state !== "problem") {
+        // Looks through the folder again for what changed while it was off.
+        Object.assign(b.info, { state: "scanning", detail: "Looking for changes…" });
+        b.scan = 3;
+      }
+      emitBackups();
+      emit("drive://status", status());
+      return overview();
+    }
+    case "remove_backup": {
+      const b = findBackup(a.id);
+      if (!b) return fail("not_found", "That folder isn't backed up anymore.");
+      backupState.folders.splice(backupState.folders.indexOf(b), 1);
+      console.info(`[mock] stopped backing up ${b.info.name}`, a.deleteFromCloud ? "(cloud copy to trash)" : "(cloud copy kept)");
+      emitBackups();
+      emit("drive://status", status());
+      return overview();
+    }
+    case "set_backup_excludes": {
+      const b = findBackup(a.id);
+      if (!b) return fail("not_found", "That folder isn't backed up anymore.");
+      const list: string[] = [];
+      for (const raw of a.excludes as string[]) {
+        const e = raw.trim();
+        if (!e || list.includes(e)) continue;
+        if (/[\\/]/.test(e)) return fail("bad_request", `"${e}" has a slash. Enter just a name, like node_modules, or a pattern like *.tmp.`);
+        list.push(e);
+      }
+      b.info.excludes = list;
+      if (b.info.enabled && b.info.state !== "problem") {
+        Object.assign(b.info, { state: "scanning", detail: "Looking through the folder…" });
+        b.scan = 3;
+      }
+      emitBackups();
+      return { ...b.info, excludes: [...list] };
+    }
+    case "dismiss_backup_suggestions":
+      backupState.dismissed = true;
+      emitBackups();
+      return overview();
     case "check_account": {
       const { login, password } = a as { login: string; password: string };
       if (password === "wrong") return fail("auth_failed", "That login or password isn't right.");

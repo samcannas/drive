@@ -14,6 +14,8 @@
     cloud: p(CLOUD),
     "cloud-check": p(CLOUD) + p("M8 11.25l1.5 1.5 3-3"),
     "cloud-off": p(CLOUD) + p("M3 3l14 14"),
+    // A cloud with an arrow going up into it: a backup of something outside the Drive folder.
+    backup: p(CLOUD) + p("M10 13V9M8.25 10.75 10 9l1.75 1.75"),
     sync: p("M15.5 8.2A6 6 0 0 0 4.7 7M4.5 11.8A6 6 0 0 0 15.3 13M15.5 4.2v4h-4M4.5 15.8v-4h4"),
     pause: p("M7.5 5v10M12.5 5v10"),
     play: p("M7 4.9v10.2a.6.6 0 0 0 .92.5l7.7-5.1a.6.6 0 0 0 0-1L7.92 4.4A.6.6 0 0 0 7 4.9Z"),
