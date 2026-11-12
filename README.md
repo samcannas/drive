@@ -100,6 +100,28 @@ Build folders like `node_modules` are skipped. Deleted files stay in the uloz.to
 days. From the command line: `drive backup list`, `drive backup add <folder>`,
 `drive backup save-space <folder> on|off`.
 
+## Free up disk space
+
+**Settings → Disk space** shows where the space on your disk goes, not just what's in Drive:
+
+1. **See it.** Your disk's free space, what Drive already keeps off this PC, and the biggest
+   uses of space: your folders, installed apps, app data, the Recycle Bin, Windows itself.
+   The tray popover also shows how much is free and speaks up, quietly, when the disk is
+   almost full.
+2. **Get a recommendation.** For each of your own folders Drive says how much it could free.
+   Folders it shouldn't touch (apps, app data, code projects, other cloud apps' folders) say
+   why and who manages them.
+3. **Free it, with your OK.** *Save space* backs the folder up and makes it on-demand in one
+   step (Windows). Nothing moves and nothing is deleted. Files you haven't opened lately live
+   only in the cloud once they're backed up, and download again when you open them. For the
+   Drive folder, *Free up space* drops downloaded files (pinned ones stay). Switch back any
+   time in Settings → Backups.
+
+Drive already frees space by itself in the Drive folder when its cache is full or the disk runs
+low. From the command line: `drive space`, `drive space scan`, `drive space save <folder>`,
+`drive space free-drive`. On Linux, Drive measures the disk and backs folders up; saving space
+in place is Windows-only for now.
+
 ## uloz.to notes
 
 - Downloading through the API needs a uloz.to account that allows fast downloads (a paid

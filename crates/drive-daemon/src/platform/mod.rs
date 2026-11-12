@@ -87,6 +87,32 @@ pub fn backups_sidebar_entry(key: &str, folder: Option<&Path>) {
     let _ = (key, folder);
 }
 
+/// Other cloud apps' folders on this device, with the app's name. Windows asks the system;
+/// elsewhere the usual folder names in the home folder are recognised.
+pub fn other_cloud_folders() -> Vec<(PathBuf, String)> {
+    #[cfg(windows)]
+    let mut out = imp::other_cloud_folders();
+    #[cfg(not(windows))]
+    let mut out: Vec<(PathBuf, String)> = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        for (dir, app) in [
+            ("Dropbox", "Dropbox"),
+            ("OneDrive", "OneDrive"),
+            ("Google Drive", "Google Drive"),
+            ("MEGA", "MEGA"),
+            ("pCloudDrive", "pCloud"),
+            ("Nextcloud", "Nextcloud"),
+            ("iCloudDrive", "iCloud"),
+        ] {
+            let p = home.join(dir);
+            if p.is_dir() && !out.iter().any(|(o, _)| o == &p) {
+                out.push((p, app.to_string()));
+            }
+        }
+    }
+    out
+}
+
 /// Whether backed-up folders can be made on-demand in place on this platform.
 pub const ON_DEMAND_FOLDERS: bool = cfg!(windows);
 

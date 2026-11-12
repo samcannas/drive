@@ -431,6 +431,10 @@ pub fn backups_sidebar_entry(key: &str, folder: Option<&Path>) {
     }
 }
 
+pub fn other_cloud_folders() -> Vec<(PathBuf, String)> {
+    register::other_cloud_folders()
+}
+
 pub fn forget_registration(account: &str) {
     register::unregister_account(account);
 }

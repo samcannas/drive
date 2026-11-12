@@ -330,6 +330,34 @@ pub fn is_sync_root(folder: &Path) -> bool {
         .is_some()
 }
 
+/// Folders of other cloud apps registered with Windows (OneDrive, Dropbox, iCloud, …), with a
+/// display name for each.
+pub fn other_cloud_folders() -> Vec<(std::path::PathBuf, String)> {
+    let Ok(roots) = active_roots() else {
+        return Vec::new();
+    };
+    roots
+        .into_iter()
+        .filter_map(|r| {
+            let provider = provider_of(&r.id());
+            if provider == PROVIDER {
+                return None;
+            }
+            let name = match provider.to_lowercase().as_str() {
+                p if p.starts_with("onedrive") => "OneDrive".to_string(),
+                p if p.starts_with("icloud") => "iCloud".to_string(),
+                p if p.starts_with("dropbox") => "Dropbox".to_string(),
+                p if p.contains("google") => "Google Drive".to_string(),
+                _ => {
+                    let d = r.display_name().to_string_lossy().into_owned();
+                    if d.trim().is_empty() { provider } else { d }
+                }
+            };
+            Some((r.path(), name))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod path_tests {
     use super::same_path;

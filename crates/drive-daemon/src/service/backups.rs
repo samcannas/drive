@@ -829,7 +829,7 @@ impl Service {
 }
 
 /// Canonical path without Windows' `\\?\` prefix (so it compares with user-facing paths).
-fn dunce_canonical(p: &Path) -> PathBuf {
+pub(super) fn dunce_canonical(p: &Path) -> PathBuf {
     let c = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let s = c.to_string_lossy();
     match s.strip_prefix(r"\\?\") {

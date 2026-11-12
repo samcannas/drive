@@ -839,7 +839,7 @@
                         aria-describedby={b.on_demand ? `backup-${b.id}-locked` : undefined}
                         onclick={() => openSkip(b)}
                       >
-                        Edit skipped items…<span class="visually-hidden"> in {b.name}</span>
+                        Edit skipped items…<span class="visually-hidden">{` in ${b.name}`}</span>
                       </button>
                       <button
                         class="btn subtle"
@@ -847,7 +847,7 @@
                         aria-describedby={b.on_demand ? `backup-${b.id}-locked` : undefined}
                         onclick={() => openStop(b)}
                       >
-                        Stop backing up…<span class="visually-hidden"> {b.name}</span>
+                        Stop backing up…<span class="visually-hidden">{` ${b.name}`}</span>
                       </button>
                     </div>
                   </div>
@@ -883,7 +883,7 @@
                   </div>
                   {#if !f.blocked}
                     <button class="btn" aria-disabled={backupBusy !== null} onclick={() => addBackup(f.path, f.known)}>
-                      {backupBusy === `add:${f.known}` ? "Adding…" : "Back up"}<span class="visually-hidden"> {f.name}</span>
+                      {backupBusy === `add:${f.known}` ? "Adding…" : "Back up"}<span class="visually-hidden">{` ${f.name}`}</span>
                     </button>
                   {/if}
                 </li>

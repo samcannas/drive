@@ -27,6 +27,7 @@ use crate::platform::{self, Platform, PlatformContext};
 
 mod backups;
 mod on_demand;
+mod space;
 use backups::{BackupRuntime, MAIN_SOURCE, RawBackend};
 
 /// Name of the vault folder in the uloz.to account root.
@@ -73,6 +74,8 @@ pub struct Service {
     backups_folder: std::sync::Mutex<Option<BackupsFolderState>>,
     /// Why an on-demand folder couldn't start, by backup id.
     on_demand_problems: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// The disk space advisor.
+    space: Arc<crate::space::Advisor>,
 }
 
 fn rpc(code: ErrorCode, msg: impl Into<String>) -> RpcError {
@@ -134,6 +137,7 @@ impl Service {
         paths.ensure()?;
         let config = Config::load(&paths)?;
         let (events, _) = broadcast::channel(512);
+        let space = Arc::new(crate::space::Advisor::new(&paths.data_dir));
         Ok(Arc::new(Self {
             paths,
             inner: Mutex::new(Inner {
@@ -151,6 +155,7 @@ impl Service {
             on_demand: std::sync::Mutex::new(Vec::new()),
             on_demand_problems: std::sync::Mutex::new(Default::default()),
             backups_folder: std::sync::Mutex::new(None),
+            space,
         }))
     }
 
@@ -561,10 +566,18 @@ impl Service {
                     .await?,
             )
             .map_err(internal)?),
-            Call::Space { .. }
-            | Call::CancelSpaceScan
-            | Call::SaveSpace { .. }
-            | Call::FreeDriveCache => Err(rpc(ErrorCode::BadRequest, "Not available yet")),
+            Call::Space { rescan } => {
+                ok(serde_json::to_value(self.space(rescan).await).map_err(internal)?)
+            }
+            Call::CancelSpaceScan => {
+                self.cancel_space_scan();
+                ok(Value::Null)
+            }
+            Call::SaveSpace { path, keep_bytes } => ok(serde_json::to_value(
+                self.save_space(&path, keep_bytes).await?,
+            )
+            .map_err(internal)?),
+            Call::FreeDriveCache => self.free_drive_cache().await,
         }
     }
 

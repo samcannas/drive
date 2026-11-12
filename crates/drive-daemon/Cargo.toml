@@ -31,6 +31,7 @@ rpassword = "7"
 fs4 = { version = "0.13", features = ["sync"] }
 
 notify = "8"
+rayon = "1"
 tokio-util.workspace = true
 
 [target.'cfg(windows)'.dependencies]

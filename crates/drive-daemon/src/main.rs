@@ -8,6 +8,7 @@ mod config;
 mod ipc_server;
 mod platform;
 mod service;
+mod space;
 
 use std::io::{BufRead, Write};
 
@@ -102,6 +103,27 @@ enum Command {
     /// Back up folders outside the Drive folder (they stay where they are).
     #[command(subcommand)]
     Backup(BackupCommand),
+    /// What's using space on this computer, and what Drive can free.
+    Space {
+        #[command(subcommand)]
+        cmd: Option<SpaceCommand>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SpaceCommand {
+    /// Measure the disk again (the last report is shown otherwise).
+    Scan,
+    /// Back a folder up and save space in it (Windows): it stays where it is, and files not
+    /// used lately live only in the cloud.
+    Save {
+        path: String,
+        /// Keep this much of recently used files on this device.
+        #[arg(long)]
+        keep_gb: Option<u64>,
+    },
+    /// Free downloaded files in the Drive folder (pinned files stay).
+    FreeDrive,
 }
 
 #[derive(Subcommand)]
@@ -327,6 +349,95 @@ async fn find_backup(client: &Client, key: &str) -> Result<BackupInfo> {
             f.id == key || f.name.eq_ignore_ascii_case(key) || f.path.eq_ignore_ascii_case(&path)
         })
         .with_context(|| format!("No backed-up folder called {key}. Run `drive backup list`."))
+}
+
+async fn run_space(client: &Client, cmd: Option<SpaceCommand>) -> Result<()> {
+    use drive_core::ipc::{BackupInfo, Event, SpaceReport, SpaceScanState};
+    match cmd {
+        Some(SpaceCommand::Save { path, keep_gb }) => {
+            let info: BackupInfo = client
+                .call(Call::SaveSpace {
+                    path: absolute(&path),
+                    keep_bytes: keep_gb.map(|g| g << 30),
+                })
+                .await?;
+            println!(
+                "Saving space in {}. It stays where it is; files not opened lately will only be in the cloud once they're backed up.",
+                info.path
+            );
+            return Ok(());
+        }
+        Some(SpaceCommand::FreeDrive) => {
+            let v = client.call_value(Call::FreeDriveCache).await?;
+            println!(
+                "Freed {}.",
+                human_bytes(v.get("freed_bytes").and_then(|b| b.as_u64()).unwrap_or(0))
+            );
+            return Ok(());
+        }
+        _ => {}
+    }
+    let rescan = matches!(cmd, Some(SpaceCommand::Scan));
+    let mut events = client.subscribe().await?;
+    let mut report: SpaceReport = client.call(Call::Space { rescan }).await?;
+    let mut last_line = std::time::Instant::now();
+    while report.scan.state == SpaceScanState::Scanning {
+        match events.recv().await {
+            Ok(Event::Space(r)) => {
+                if last_line.elapsed().as_secs() >= 2 {
+                    eprintln!(
+                        "Checking the disk… {} in {} files",
+                        human_bytes(r.scan.scanned_bytes),
+                        r.scan.scanned_files
+                    );
+                    last_line = std::time::Instant::now();
+                }
+                report = r;
+            }
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+            Err(_) => bail!("lost the connection to the Drive service"),
+        }
+    }
+    if let Some(e) = &report.scan.error {
+        bail!("{e}");
+    }
+    for d in &report.disks {
+        println!(
+            "{}: {} free of {}",
+            d.name,
+            human_bytes(d.free_bytes),
+            human_bytes(d.total_bytes)
+        );
+    }
+    let saved = report.saved.drive_folder_bytes + report.saved.backups_bytes;
+    if saved > 0 {
+        println!(
+            "Drive already keeps {} off this computer.",
+            human_bytes(saved)
+        );
+    }
+    println!();
+    for i in &report.items {
+        let action = match i.action {
+            Some(a) if i.frees_bytes > 0 => {
+                format!("  → {:?}: frees about {}", a, human_bytes(i.frees_bytes))
+            }
+            Some(a) => format!("  → {a:?}"),
+            None => String::new(),
+        };
+        println!("{:>10}  {}{}", human_bytes(i.bytes), i.name, action);
+        if !i.path.is_empty() {
+            println!("            {}", i.path);
+        }
+    }
+    if report.can_free_bytes > 0 {
+        println!(
+            "\nDrive can free up to {}. Run `drive space save <folder>` to save space in a folder.",
+            human_bytes(report.can_free_bytes)
+        );
+    }
+    Ok(())
 }
 
 async fn run_backup(client: &Client, cmd: BackupCommand) -> Result<()> {
@@ -717,6 +828,7 @@ async fn run_client(cmd: Command) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&s)?);
         }
         Command::Backup(cmd) => run_backup(&client, cmd).await?,
+        Command::Space { cmd } => run_space(&client, cmd).await?,
         Command::Recovery => {
             let kit: RecoveryKit = client.call(Call::ExportRecovery).await?;
             println!("{}", kit.rclone_config);
