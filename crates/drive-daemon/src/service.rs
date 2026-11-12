@@ -846,7 +846,19 @@ impl Service {
             }
         } else if let (Some(r), Some(account)) = (&inner.running, &cfg.account) {
             let ec = self.engine_config(&cfg, account);
-            r.engine.update_config(|e| *e = ec);
+            r.engine.update_config(|e| *e = ec.clone());
+            // Backup engines take their transfer settings from the main one.
+            for (_, e) in self.backup_engines() {
+                e.update_config(|b| {
+                    b.max_parallel_transfers = ec.max_parallel_transfers;
+                    b.upload_limit_kbps = ec.upload_limit_kbps;
+                    b.download_limit_kbps = ec.download_limit_kbps;
+                    b.adaptive_upload = ec.adaptive_upload;
+                    b.night = ec.night;
+                    b.night_auto = ec.night_auto;
+                    b.night_min_bytes = ec.night_min_bytes;
+                });
+            }
         }
         serde_json::to_value(cfg.settings()).map_err(internal)
     }

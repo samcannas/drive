@@ -384,3 +384,47 @@ async fn missing_folder_is_reported_not_deleted() {
         "an unplugged folder must not empty the backup"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn uploads_as_many_files_at_once_as_set() {
+    let src = tempfile::tempdir().unwrap();
+    for i in 0..12u8 {
+        // Big enough for resumable uploads, which the test cloud slows down.
+        write(&src.path().join(format!("f{i:02}.bin")), &vec![i; 200_000]);
+    }
+    let mem = Arc::new(MemRemote::new());
+    mem.set_chunk_delay(Duration::from_millis(150));
+    let rig = Rig::with_mem(src.path(), mem, None).await;
+    let engine = rig.manager.engine().clone();
+    engine.update_config(|c| c.max_parallel_transfers = 4);
+    let watch = |want_at_least: u32, cap: u32, secs: u64| {
+        let engine = engine.clone();
+        async move {
+            let (mut most, deadline) = (0, Instant::now() + Duration::from_secs(secs));
+            let mut nudged = Instant::now() - Duration::from_secs(1);
+            while Instant::now() < deadline && most < want_at_least {
+                if nudged.elapsed() > Duration::from_millis(500) {
+                    engine.sync_now(); // lists the cloud, which lets the backup start
+                    nudged = Instant::now();
+                }
+                let up = engine.status().uploading;
+                assert!(up <= cap, "{up} uploads at once with the limit at {cap}");
+                most = most.max(up);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            most
+        }
+    };
+    // Nothing else uploads: the backup uses every slot.
+    assert_eq!(watch(4, 4, 15).await, 4);
+    // Lowering the setting applies right away (to uploads that start from now on).
+    engine.update_config(|c| c.max_parallel_transfers = 1);
+    tokio::time::sleep(Duration::from_millis(1500)).await; // the 4 running ones finish
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        assert!(engine.status().uploading <= 1);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    rig.settle().await;
+    assert_eq!(rig.uploads(), 12);
+}

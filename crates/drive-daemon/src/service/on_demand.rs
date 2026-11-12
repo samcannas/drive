@@ -76,7 +76,7 @@ fn engine_config(cfg: &Config, main: &EngineConfig, folder: &BackupFolder) -> En
         cache_limit_bytes: folder.keep_bytes.unwrap_or(DEFAULT_KEEP_BYTES),
         // Only this device changes its backups (others could, through their Drive folder).
         poll_interval: main.poll_interval.max(Duration::from_secs(5 * 60)),
-        max_parallel_transfers: (main.max_parallel_transfers / 2).max(1),
+        max_parallel_transfers: main.max_parallel_transfers,
         upload_limit_kbps: main.upload_limit_kbps,
         download_limit_kbps: main.download_limit_kbps,
         adaptive_upload: main.adaptive_upload,

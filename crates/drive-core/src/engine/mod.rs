@@ -14,6 +14,7 @@ pub mod local;
 pub mod mirror;
 pub mod plan;
 pub mod schedule;
+pub mod slots;
 pub mod throttle;
 mod transfers;
 
@@ -198,6 +199,10 @@ pub struct Engine {
     /// Uploads running in this engine and in engines linked to it (shared with
     /// [`Engine::new_linked`] engines so the automatic upload speed sees all of them).
     uploads_running: Arc<AtomicUsize>,
+    /// Files uploading at once, shared with linked engines.
+    upload_slots: Arc<slots::UploadSlots>,
+    /// The Drive folder's engine: owns the slot limit and goes first.
+    owns_slots: bool,
     /// Mirror engines: the local side has been fully read (after start, or after a backed-up
     /// folder was added). Until then cloud items can't be judged.
     local_ready: AtomicBool,
@@ -214,6 +219,7 @@ struct Shared {
     down: Arc<Throttle>,
     upload_speed: Arc<Mutex<adaptive::Snapshot>>,
     uploads_running: Arc<AtomicUsize>,
+    upload_slots: Arc<slots::UploadSlots>,
 }
 
 /// One change to a mirrored folder, for [`Engine::mirror_apply`].
@@ -283,6 +289,7 @@ impl Engine {
             down: main.down.clone(),
             upload_speed: main.upload_speed.clone(),
             uploads_running: main.uploads_running.clone(),
+            upload_slots: main.upload_slots.clone(),
         };
         Self::build(db, remote, cfg, Some(shared))
     }
@@ -305,11 +312,13 @@ impl Engine {
         let paused = db.kv_get("paused")?.as_deref() == Some("1");
         let (status_tx, _) = watch::channel(Status::default());
         let (events, _) = broadcast::channel(512);
+        let owns_slots = shared.is_none();
         let shared = shared.unwrap_or_else(|| Shared {
             up: Arc::new(Throttle::new(cfg.upload_limit_kbps)),
             down: Arc::new(Throttle::new(cfg.download_limit_kbps)),
             upload_speed: Arc::new(Mutex::new(adaptive::Snapshot::default())),
             uploads_running: Arc::new(AtomicUsize::new(0)),
+            upload_slots: slots::UploadSlots::new(cfg.max_parallel_transfers),
         });
         let mirror = cfg.mirror;
         let gated = cfg.mirror || cfg.scan_before_upload;
@@ -318,6 +327,8 @@ impl Engine {
             down: shared.down,
             upload_speed: shared.upload_speed,
             uploads_running: shared.uploads_running,
+            upload_slots: shared.upload_slots,
+            owns_slots,
             local_ready: AtomicBool::new(!mirror),
             mirror_linked: AtomicBool::new(!gated),
             mirror_roots: Mutex::new(HashSet::new()),
@@ -397,6 +408,9 @@ impl Engine {
     pub fn update_config(&self, f: impl FnOnce(&mut EngineConfig)) {
         let mut cfg = self.cfg.write().unwrap();
         f(&mut cfg);
+        if self.owns_slots {
+            self.upload_slots.set_limit(cfg.max_parallel_transfers);
+        }
         if !cfg.mirror {
             // Mirror engines share the main engine's throttles; it owns the limits.
             self.up.set_kbps(cfg.upload_limit_kbps);
@@ -2676,6 +2690,11 @@ impl Engine {
             let done = (info.confirmed as f64 * size as f64 / info.total as f64) as u64;
             progress.confirmed.store(done.min(size), Ordering::Relaxed);
         }
+        // Files at once is one budget for the Drive folder and its backups together.
+        let _slot = tokio::select! {
+            s = self.upload_slots.acquire(self.owns_slots) => s,
+            _ = self.cancel.cancelled() => return Ok(()),
+        };
         let cancel = self.cancel.child_token();
         self.upload_cancels
             .lock()

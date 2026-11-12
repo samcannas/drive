@@ -1163,7 +1163,10 @@
         <div class="card setting">
           <div class="setting-text">
             <label for="parallel">Files to transfer at once</label>
-            <p class="caption secondary">More is faster on a good connection. Fewer leaves room for other apps.</p>
+            <p class="caption secondary">
+              More is faster on a good connection. Fewer leaves room for other apps. Your Drive folder and
+              backups share it, and the Drive folder goes first.
+            </p>
           </div>
           <select
             id="parallel"

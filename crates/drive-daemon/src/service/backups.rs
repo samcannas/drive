@@ -77,8 +77,8 @@ pub(super) fn backup_engine_config(cfg: &Config, main: &EngineConfig) -> EngineC
         folder: dirs::home_dir().unwrap_or_default(),
         // The cloud copy only changes when someone tampers with it: look rarely.
         poll_interval: Duration::from_secs(30 * 60),
-        // Backups share the bandwidth with the Drive folder; leave it room.
-        max_parallel_transfers: (main.max_parallel_transfers / 2).max(1),
+        // Files at once is shared with the Drive folder (which goes first when it's waiting).
+        max_parallel_transfers: main.max_parallel_transfers,
         adaptive_upload: main.adaptive_upload,
         night: main.night,
         night_min_bytes: main.night_min_bytes,
@@ -872,6 +872,18 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(merge_status(main, &b).headline, "3 items need attention");
+    }
+
+    #[test]
+    fn backups_get_the_whole_files_at_once_setting() {
+        // The engines share one budget of uploads (the Drive folder goes first), so backups
+        // aren't halved: with nothing else uploading they use all of it.
+        let main = EngineConfig {
+            max_parallel_transfers: 4,
+            ..Default::default()
+        };
+        let b = backup_engine_config(&Config::default(), &main);
+        assert_eq!(b.max_parallel_transfers, 4);
     }
 
     #[test]
