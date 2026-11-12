@@ -57,6 +57,26 @@ pub struct BackupFolder {
     pub excludes: Vec<String>,
     #[serde(default)]
     pub added_ms: i64,
+    /// "Save space": the folder stays where it is, but files not used lately live only in the
+    /// cloud and download again when opened (an on-demand engine runs it instead of the mirror).
+    #[serde(default)]
+    pub on_demand: bool,
+    /// On-demand: keep this many bytes of recently used files on this device.
+    #[serde(default)]
+    pub keep_bytes: Option<u64>,
+    /// Switching back from on-demand to a full copy is under way (downloading everything).
+    #[serde(default)]
+    pub leaving_on_demand: bool,
+}
+
+/// On-demand folders keep this much of their recently used files on this device by default.
+pub const DEFAULT_KEEP_BYTES: u64 = 5 << 30;
+
+impl BackupFolder {
+    /// Whether the mirror engine backs this folder up (on-demand folders run on their own).
+    pub fn mirrored(&self) -> bool {
+        self.enabled && !self.on_demand
+    }
 }
 
 fn yes() -> bool {
@@ -500,7 +520,7 @@ impl Manager {
 
     fn sync_sources(&self) {
         let folders = self.folders.read().unwrap();
-        let enabled: Vec<&BackupFolder> = folders.iter().filter(|f| f.enabled).collect();
+        let enabled: Vec<&BackupFolder> = folders.iter().filter(|f| f.mirrored()).collect();
         *self.sources.write().unwrap() = enabled
             .iter()
             .map(|f| (name_key(&f.name), f.path.clone()))
@@ -519,7 +539,7 @@ impl Manager {
         self.sync_sources();
         let me = self.clone();
         tokio::spawn(async move {
-            for f in me.folders().into_iter().filter(|f| f.enabled) {
+            for f in me.folders().into_iter().filter(|f| f.mirrored()) {
                 me.full_scan(&f).await;
                 me.watch(&f);
             }
@@ -570,6 +590,12 @@ impl Manager {
         if folder.enabled == enabled {
             return Ok(());
         }
+        if folder.on_demand {
+            bail!(
+                "Switch off Save space for {} first, so all its files are on this PC again.",
+                folder.name
+            );
+        }
         for f in self
             .folders
             .write()
@@ -599,6 +625,12 @@ impl Manager {
         let Some(folder) = self.folder(id) else {
             bail!("No such backup");
         };
+        if folder.on_demand {
+            bail!(
+                "Switch off Save space for {} first, so all its files are on this PC again.",
+                folder.name
+            );
+        }
         if folder.enabled {
             self.set_enabled(id, false).await?;
         }
@@ -631,6 +663,12 @@ impl Manager {
     /// Replaces a folder's skip list and rereads it: newly skipped items leave the cloud copy
     /// (to its trash), newly included ones upload.
     pub async fn set_excludes(self: &Arc<Self>, id: &str, excludes: Vec<String>) -> Result<()> {
+        if let Some(f) = self.folder(id).filter(|f| f.on_demand) {
+            bail!(
+                "Switch off Save space for {} to change what's skipped.",
+                f.name
+            );
+        }
         for f in self
             .folders
             .write()
@@ -643,7 +681,7 @@ impl Manager {
         let Some(folder) = self.folder(id) else {
             bail!("No such backup");
         };
-        if folder.enabled {
+        if folder.mirrored() {
             let me = self.clone();
             tokio::spawn(async move {
                 me.full_scan(&folder).await;
@@ -654,11 +692,71 @@ impl Manager {
         Ok(())
     }
 
+    /// Changes a folder's settings in place (no other effect).
+    pub fn update_folder(&self, id: &str, f: impl FnOnce(&mut BackupFolder)) {
+        if let Some(folder) = self
+            .folders
+            .write()
+            .unwrap()
+            .iter_mut()
+            .find(|x| x.id == id)
+        {
+            f(folder);
+        }
+        (self.on_change)();
+    }
+
+    /// Hands a folder over to its on-demand engine (`on`), or takes it back. While on-demand,
+    /// this manager doesn't read or mirror it, and its cloud copy is left as it is (the
+    /// on-demand engine works on it). Taking it back matches the folder with the cloud copy
+    /// again: files that didn't change aren't uploaded again.
+    pub async fn set_on_demand(self: &Arc<Self>, id: &str, on: bool) -> Result<()> {
+        let Some(folder) = self.folder(id) else {
+            bail!("No such backup");
+        };
+        if folder.on_demand == on {
+            return Ok(());
+        }
+        if on {
+            let _guard = self.work.lock().await;
+            for f in self
+                .folders
+                .write()
+                .unwrap()
+                .iter_mut()
+                .filter(|f| f.id == id)
+            {
+                f.on_demand = true;
+            }
+            self.watches.lock().unwrap().remove(id);
+            self.sync_sources();
+            self.engine.forget_subtree(&folder.name)?;
+            self.set_runtime(id, |r| *r = Runtime::default());
+            (self.on_change)();
+        } else {
+            for f in self
+                .folders
+                .write()
+                .unwrap()
+                .iter_mut()
+                .filter(|f| f.id == id)
+            {
+                f.on_demand = false;
+                f.leaving_on_demand = false;
+            }
+            let folder = self.folder(id).expect("just updated");
+            if folder.enabled {
+                self.enable_now(folder).await;
+            }
+        }
+        Ok(())
+    }
+
     /// Rereads every enabled folder now.
     pub fn rescan_all(self: &Arc<Self>) {
         let me = self.clone();
         tokio::spawn(async move {
-            for f in me.folders().into_iter().filter(|f| f.enabled) {
+            for f in me.folders().into_iter().filter(|f| f.mirrored()) {
                 me.full_scan(&f).await;
             }
         });
@@ -669,7 +767,7 @@ impl Manager {
     /// Reads a whole folder and applies the differences.
     pub async fn full_scan(self: &Arc<Self>, folder: &BackupFolder) {
         let _guard = self.work.lock().await;
-        if self.cancel.is_cancelled() || !self.folder(&folder.id).is_some_and(|f| f.enabled) {
+        if self.cancel.is_cancelled() || !self.folder(&folder.id).is_some_and(|f| f.mirrored()) {
             return;
         }
         self.set_runtime(&folder.id, |r| r.scanning = true);
@@ -978,7 +1076,7 @@ impl Manager {
                 e.1 |= m.rescan;
             }
             for (id, (paths, rescan)) in by_folder {
-                let Some(folder) = self.folder(&id).filter(|f| f.enabled) else {
+                let Some(folder) = self.folder(&id).filter(|f| f.mirrored()) else {
                     continue;
                 };
                 if rescan {
@@ -1010,7 +1108,7 @@ impl Manager {
                 _ = self.cancel.cancelled() => return,
                 _ = tokio::time::sleep(every) => {}
             }
-            for f in self.folders().into_iter().filter(|f| f.enabled) {
+            for f in self.folders().into_iter().filter(|f| f.mirrored()) {
                 self.full_scan(&f).await;
                 self.watch_new_dirs(&f);
             }
@@ -1057,6 +1155,12 @@ impl Manager {
             let r = rt.entry(f.id.clone()).or_default();
             let (state, detail) = if !f.enabled {
                 (BackupState::Off, None)
+            } else if f.on_demand {
+                // Filled in by the service from the folder's on-demand engine.
+                (
+                    BackupState::Converting,
+                    Some("Getting the folder ready…".to_string()),
+                )
             } else if let Some(p) = &r.problem {
                 (BackupState::Problem, Some(p.clone()))
             } else if r.scanning || !linked {
@@ -1077,7 +1181,9 @@ impl Manager {
             } else {
                 (BackupState::UpToDate, None)
             };
-            if state == BackupState::UpToDate {
+            if f.on_demand {
+                // Tracked by the on-demand engine.
+            } else if state == BackupState::UpToDate {
                 if !r.complete_now {
                     r.complete_now = true;
                     let t = now_ms();
@@ -1107,6 +1213,10 @@ impl Manager {
                 skipped_online_only: r.online_only,
                 added_ms: f.added_ms,
                 last_complete_ms: r.last_complete_ms,
+                on_demand: f.on_demand,
+                on_demand_available: crate::platform::ON_DEMAND_FOLDERS,
+                local_bytes: s.bytes,
+                keep_bytes: f.keep_bytes.unwrap_or(DEFAULT_KEEP_BYTES),
             });
         }
         out

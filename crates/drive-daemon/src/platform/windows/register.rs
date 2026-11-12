@@ -268,15 +268,24 @@ fn register_native(folder: &Path) -> Result<()> {
 /// Removes every Drive registration of `folder` (Shell and native). Best effort.
 pub fn unregister(folder: &Path) {
     let mut ids: Vec<SyncRootId> = Vec::new();
-    if let Ok(id) = SyncRootId::from_path(folder) {
-        ids.push(id);
+    match SyncRootId::from_path(folder) {
+        Ok(id) => ids.push(id),
+        Err(e) => debug!("no sync root id at {}: {e}", folder.display()),
     }
-    if let Ok(roots) = active_roots() {
-        for r in roots {
-            if same_path(&r.path(), folder) {
-                ids.push(r.id());
+    match active_roots() {
+        Ok(roots) => {
+            for r in roots {
+                debug!(
+                    "active root {} ({})",
+                    r.path().display(),
+                    provider_of(&r.id())
+                );
+                if same_path(&r.path(), folder) {
+                    ids.push(r.id());
+                }
             }
         }
+        Err(e) => debug!("listing sync roots failed: {e}"),
     }
     for id in ids {
         if provider_of(&id) != PROVIDER {
@@ -290,6 +299,26 @@ pub fn unregister(folder: &Path) {
     if let Ok(path) = U16CString::from_os_str(folder.as_os_str()) {
         let _ = unsafe { CfUnregisterSyncRoot(PCWSTR(path.as_ptr())) };
     }
+}
+
+/// Removes the registration made for `account` (see [`sync_root_id`]), wherever it points.
+/// Finding it by path doesn't work everywhere (Windows can't resolve some folders, e.g. under
+/// `AppData\Local\Temp`).
+pub fn unregister_account(account: &str) {
+    let Ok(id) = sync_root_id(account) else {
+        return;
+    };
+    // Not `is_registered` first: it fails the same way for those folders.
+    match id.unregister() {
+        Ok(()) => info!("unregistered sync root of {account}"),
+        Err(e) => debug!("unregistering the sync root of {account}: {e}"),
+    }
+}
+
+/// Whether the registration made for `account` exists.
+#[cfg(test)]
+pub fn is_registered_account(account: &str) -> bool {
+    sync_root_id(account).is_ok_and(|id| id.is_registered().unwrap_or(false))
 }
 
 /// Whether `folder` is currently a sync root (by any registration).

@@ -87,8 +87,14 @@ They stay where they are; Drive only keeps an encrypted copy in your vault.
 3. **Back up with one click.** Pick a folder and Drive keeps a copy up to date as you work. It
    never moves, changes or deletes your files, and each folder has an off switch.
 
+**Save space (Windows).** Turn on *Save space on this PC* for a backed-up folder, and it
+becomes on-demand like the Drive folder: it stays where it is, but files you haven't opened
+lately live only in the cloud and download when you open them. Turning it off downloads
+everything back first.
+
 Build folders like `node_modules` are skipped. Deleted files stay in the uloz.to trash for 30
-days. From the command line: `drive backup list`, `drive backup add <folder>`.
+days. From the command line: `drive backup list`, `drive backup add <folder>`,
+`drive backup save-space <folder> on|off`.
 
 ## uloz.to notes
 

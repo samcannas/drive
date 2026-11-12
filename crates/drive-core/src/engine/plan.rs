@@ -132,6 +132,8 @@ struct MNode {
     generation: i64,
     op_seq: i64,
     pinned: bool,
+    size: u64,
+    mtime_ms: i64,
 }
 
 struct Model {
@@ -167,6 +169,8 @@ impl Model {
                     generation: n.generation,
                     op_seq: n.op_seq,
                     pinned: n.pinned,
+                    size: n.size,
+                    mtime_ms: n.mtime_ms,
                 },
             );
             if let Some(p) = n.parent_id {
@@ -241,6 +245,8 @@ impl Model {
                 generation: 0,
                 op_seq: 0,
                 pinned,
+                size: e.size,
+                mtime_ms: e.mtime_ms,
             },
         );
         self.children.entry(parent).or_default().push(id);
@@ -587,6 +593,23 @@ fn place(
                     m.set_remote(x, e);
                     return Some(x);
                 }
+            }
+            (Kind::File, Kind::File)
+                if xn.remote_id.is_none()
+                    && xn.size == e.size
+                    && (xn.mtime_ms - e.mtime_ms).abs() <= super::mirror::MTIME_TOLERANCE_MS =>
+            {
+                // The same file is already in the cloud (a folder that was backed up before,
+                // or a reinstall): recognise it instead of uploading it again.
+                out.changes.push(Change::Adopt {
+                    node: x,
+                    generation: xn.generation,
+                    entry: e.clone(),
+                });
+                m.set_remote(x, e);
+                let mn = m.nodes.get_mut(&x).unwrap();
+                mn.pending &= !pending::PUSH;
+                return Some(x);
             }
             (Kind::File, Kind::File) if xn.remote_id.is_none() => {
                 // Created here and there with the same name before either synced.
@@ -944,6 +967,27 @@ mod tests {
                 ("x.txt".into(), false)
             ]
         );
+    }
+
+    #[test]
+    fn identical_local_file_is_adopted_not_conflicted() {
+        let mut f = node(2, 1, "movie.mkv", Kind::File, None);
+        f.pending = pending::PUSH;
+        f.dirty = true;
+        let mut e = entry("M", "R", "movie.mkv", Kind::File);
+        e.size = f.size;
+        e.mtime_ms = f.mtime_ms + 500;
+        let p = run(&[root(), f.clone()], vec![e.clone()]);
+        assert!(
+            matches!(&p.changes[..], [Change::Adopt { node: 2, .. }]),
+            "{:?}",
+            p.changes
+        );
+        assert!(p.conflicts.is_empty());
+        // A different file with the same name is still a conflict.
+        e.size += 1;
+        let p = run(&[root(), f], vec![e]);
+        assert!(!p.conflicts.is_empty());
     }
 
     #[test]

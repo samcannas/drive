@@ -313,6 +313,121 @@ pub fn prepare(ctx: PlatformContext) -> Result<Box<dyn Platform>> {
     }))
 }
 
+/// Bytes and number of files under `folder` whose content is (partly) only in the cloud.
+pub fn cloud_only(folder: &Path) -> Result<(u64, u64)> {
+    let root = normalize_folder(folder)?;
+    let (mut bytes, mut files) = (0u64, 0u64);
+    for p in walk_items(&root) {
+        if let Ok(Some(item)) = util::inspect(&p, 0)
+            && item.ph.as_ref().is_some_and(|ph| ph.partial_on_disk)
+        {
+            bytes += item.size;
+            files += 1;
+        }
+    }
+    Ok((bytes, files))
+}
+
+/// Turns an on-demand folder back into an ordinary one: every placeholder becomes an ordinary
+/// file again and the sync root is unregistered. Refuses (changing nothing) while any file is
+/// still only in the cloud, so no file can disappear. Call after disconnecting.
+pub fn release(folder: &Path, account: &str) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::CloudFilters::{CF_REVERT_FLAG_NONE, CfRevertPlaceholder};
+    let (bytes, files) = cloud_only(folder)?;
+    if files > 0 {
+        anyhow::bail!("{files} files ({bytes} bytes) are still only in the cloud");
+    }
+    let root = normalize_folder(folder)?;
+    let mut items = walk_items(&root);
+    // Deepest first, so folders are reverted after their contents. The root goes last, after
+    // unregistering (Windows finds the registration through it).
+    items.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    let mut failed = 0u32;
+    let mut revert = |p: &Path| {
+        // Skipped files are ordinary ones, but pinning the folder marked them too.
+        clear_pin_attributes(p);
+        let Ok(Some(item)) = util::inspect(p, 0) else {
+            return;
+        };
+        if item.ph.is_none() {
+            return;
+        }
+        let result = util::open_attrs(p).and_then(|f| {
+            unsafe { CfRevertPlaceholder(HANDLE(f.as_raw_handle()), CF_REVERT_FLAG_NONE, None) }
+                .map_err(util::win_err)
+        });
+        if let Err(e) = result {
+            failed += 1;
+            warn!("making {} an ordinary file failed: {e}", p.display());
+        }
+        clear_pin_attributes(p);
+    };
+    for p in &items {
+        revert(p);
+    }
+    register::unregister(&root);
+    register::unregister_account(account);
+    revert(&root);
+    if failed > 0 {
+        warn!(
+            "{failed} items in {} stayed placeholders (their content is on disk)",
+            root.display()
+        );
+    }
+    info!("{} is an ordinary folder again", root.display());
+    Ok(())
+}
+
+/// Pin attributes mean nothing on ordinary files. Clear them, so the files don't come back as
+/// "always keep on this device" if the folder is made on-demand again.
+fn clear_pin_attributes(p: &Path) {
+    use std::os::windows::fs::MetadataExt;
+    use windows::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_PINNED, FILE_ATTRIBUTE_UNPINNED, FILE_FLAGS_AND_ATTRIBUTES,
+        SetFileAttributesW,
+    };
+    let Ok(meta) = std::fs::symlink_metadata(p) else {
+        return;
+    };
+    let pin = FILE_ATTRIBUTE_PINNED.0 | FILE_ATTRIBUTE_UNPINNED.0;
+    let attrs = meta.file_attributes();
+    if attrs & pin == 0 {
+        return;
+    }
+    let wide = windows::core::HSTRING::from(p.as_os_str());
+    if let Err(e) = unsafe { SetFileAttributesW(&wide, FILE_FLAGS_AND_ATTRIBUTES(attrs & !pin)) } {
+        debug!("clearing the pin state of {} failed: {e}", p.display());
+    }
+}
+
+pub fn forget_registration(account: &str) {
+    register::unregister_account(account);
+}
+
+/// Every file and folder under `root` (not following links).
+fn walk_items(root: &Path) -> Vec<PathBuf> {
+    let mut items = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
+                stack.push(entry.path());
+            }
+            items.push(entry.path());
+        }
+    }
+    items
+}
+
 /// Name of the folder (next to the Drive folder) that receives files that were never uploaded
 /// when the account is disconnected.
 pub const NOT_UPLOADED_FOLDER: &str = "Drive (not uploaded)";

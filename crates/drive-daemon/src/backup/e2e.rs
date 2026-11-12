@@ -31,6 +31,9 @@ struct Rig {
 
 fn folder(path: &Path) -> BackupFolder {
     BackupFolder {
+        on_demand: false,
+        keep_bytes: None,
+        leaving_on_demand: false,
         id: "f1".into(),
         name: "Documents".into(),
         path: path.to_path_buf(),

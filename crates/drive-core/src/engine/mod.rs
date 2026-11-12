@@ -74,6 +74,10 @@ pub struct EngineConfig {
     pub exclude_remote: Vec<String>,
     /// Local paths (relative, `/`-separated) that are never uploaded.
     pub exclude_local: Vec<String>,
+    /// Don't upload anything until the cloud has been listed once since the engine started, so
+    /// local files that are already in the cloud are recognised instead of uploaded again
+    /// (a folder that switches from a plain backup to on-demand).
+    pub scan_before_upload: bool,
 }
 
 impl Default for EngineConfig {
@@ -97,6 +101,7 @@ impl Default for EngineConfig {
             mirror: false,
             exclude_remote: Vec::new(),
             exclude_local: Vec::new(),
+            scan_before_upload: false,
         }
     }
 }
@@ -147,6 +152,8 @@ pub struct Engine {
     db: Arc<Db>,
     remote: Arc<dyn Remote>,
     local: OnceLock<Arc<dyn LocalSide>>,
+    /// Extra skip rules for local paths (backed-up folders' skip lists).
+    local_filter: OnceLock<LocalFilter>,
     /// Handle to ourselves for spawning work from `&self` methods; set by `start()`.
     me: OnceLock<std::sync::Weak<Engine>>,
     cfg: RwLock<EngineConfig>,
@@ -241,6 +248,19 @@ pub struct SubtreeStats {
     pub pending: u32,
 }
 
+/// The whole tree's size and how much of it is only in the cloud, for
+/// [`Engine::folder_stats`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FolderStats {
+    pub all: SubtreeStats,
+    /// Files whose content isn't on this device (on-demand).
+    pub cloud_only_files: u64,
+    pub cloud_only_bytes: u64,
+}
+
+/// Decides whether a local path (relative, `/`-separated) is skipped (never uploaded).
+pub type LocalFilter = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 impl Engine {
     pub fn new(db: Arc<Db>, remote: Arc<dyn Remote>, cfg: EngineConfig) -> Result<Arc<Self>> {
         Self::build(db, remote, cfg, None)
@@ -289,18 +309,20 @@ impl Engine {
             uploads_running: Arc::new(AtomicUsize::new(0)),
         });
         let mirror = cfg.mirror;
+        let gated = cfg.mirror || cfg.scan_before_upload;
         let engine = Arc::new(Self {
             up: shared.up,
             down: shared.down,
             upload_speed: shared.upload_speed,
             uploads_running: shared.uploads_running,
             local_ready: AtomicBool::new(!mirror),
-            mirror_linked: AtomicBool::new(!mirror),
+            mirror_linked: AtomicBool::new(!gated),
             mirror_roots: Mutex::new(HashSet::new()),
             hydrate_permits: Semaphore::new(cfg.max_parallel_transfers.max(1)),
             db,
             remote,
             local: OnceLock::new(),
+            local_filter: OnceLock::new(),
             me: OnceLock::new(),
             cfg: RwLock::new(cfg),
             status_tx,
@@ -337,6 +359,16 @@ impl Engine {
     /// Connects the platform layer. Must be called once, before [`Engine::start`].
     pub fn set_local(&self, local: Arc<dyn LocalSide>) {
         let _ = self.local.set(local);
+    }
+
+    /// Skips local paths the filter matches (they stay on this device and never upload).
+    /// Call before `start`.
+    pub fn set_local_filter(&self, filter: LocalFilter) {
+        let _ = self.local_filter.set(filter);
+    }
+
+    fn has_local_exclusions(&self) -> bool {
+        self.local_filter.get().is_some() || !self.cfg.read().unwrap().exclude_local.is_empty()
     }
 
     fn local(&self) -> &Arc<dyn LocalSide> {
@@ -743,6 +775,13 @@ impl Engine {
 
     /// Whether `path` is (inside) a local path this engine never uploads.
     fn excluded_path(&self, path: &str) -> bool {
+        if self
+            .local_filter
+            .get()
+            .is_some_and(|f| f(path.trim_matches('/')))
+        {
+            return true;
+        }
         let cfg = self.cfg.read().unwrap();
         let key = name_key(path.trim_matches('/'));
         cfg.exclude_local.iter().any(|ex| {
@@ -752,7 +791,7 @@ impl Engine {
     }
 
     fn excluded_child(&self, parent: NodeId, name: &str) -> bool {
-        if self.cfg.read().unwrap().exclude_local.is_empty() {
+        if !self.has_local_exclusions() {
             return false;
         }
         match self.db.path_of(parent) {
@@ -763,7 +802,7 @@ impl Engine {
     }
 
     fn excluded_node(&self, id: NodeId) -> bool {
-        if self.cfg.read().unwrap().exclude_local.is_empty() {
+        if !self.has_local_exclusions() {
             return false;
         }
         matches!(self.db.path_of(id), Ok(Some(p)) if self.excluded_path(&p))
@@ -803,7 +842,7 @@ impl Engine {
             tx.execute(
                 "INSERT INTO node (parent_id, name, name_key, kind, size, mtime_ms, dirty, pending, changed_ms,
                                    hydrated, pinned, accessed_ms, created_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?9, ?9)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?9)",
                 params![
                     parent,
                     name,
@@ -816,6 +855,9 @@ impl Engine {
                     now,
                     kind == Kind::File,
                     p.pinned,
+                    // Files seen for the first time count as last used when last modified, so
+                    // freeing space starts with the oldest ones.
+                    if mtime_ms > 0 && mtime_ms < now { mtime_ms } else { now },
                 ],
             )?;
             Ok(Some(tx.last_insert_rowid()))
@@ -1504,6 +1546,9 @@ impl Engine {
         if let Some(me) = self.me.get().and_then(|w| w.upgrade()) {
             me.resume_pins();
         }
+        self.mirror_linked.store(true, Ordering::SeqCst);
+        // Files just recognised as already in the cloud can be freed now (on-demand folders).
+        self.wake_evictor.notify_one();
         let now = now_ms();
         self.last_sync_ms.store(now, Ordering::Relaxed);
         let _ = self.db.kv_set("last_sync_ms", &now.to_string());
@@ -1685,17 +1730,40 @@ impl Engine {
             }
             Change::Adopt {
                 node,
-                generation: _,
+                generation,
                 entry,
             } => {
+                let n = self.node(node)?;
+                if n.kind == Kind::File && n.generation != generation {
+                    return Ok(()); // changed since the plan: it uploads as usual
+                }
                 self.db.write(|tx| {
                     tx.execute(
-                        "UPDATE node SET remote_id = ?2, remote_parent_id = ?3, remote_name = ?4, pending = pending & ~1
+                        "UPDATE node SET remote_id = ?2, remote_parent_id = ?3, remote_name = ?4, pending = pending & ~1,
+                             dirty = CASE WHEN kind = 0 THEN 0 ELSE dirty END
                          WHERE id = ?1 AND deleted = 0",
                         params![node, entry.id, entry.parent_id, entry.name],
                     )?;
                     recompute_move(tx, node)
                 })?;
+                if n.kind == Kind::File {
+                    // Tell the platform the local file is the cloud's copy (on Windows: an
+                    // in-sync placeholder that can be freed later).
+                    let item = self.item(&self.node(node)?)?;
+                    let same = self
+                        .local()
+                        .uploaded(&item, entry.size, entry.mtime_ms)
+                        .unwrap_or(true);
+                    if !same {
+                        self.db.write(|tx| {
+                            tx.execute(
+                                "UPDATE node SET dirty = 1, pending = pending | 1, generation = generation + 1, changed_ms = ?2 WHERE id = ?1",
+                                params![node, now_ms()],
+                            )
+                            .map(|_| ())
+                        })?;
+                    }
+                }
             }
             Change::MoveAside {
                 node,
@@ -2100,6 +2168,38 @@ impl Engine {
         })?)
     }
 
+    /// The whole tree: file counts and sizes, and how much is only in the cloud.
+    pub fn folder_stats(&self) -> Result<FolderStats> {
+        Ok(self.db.read(|c| {
+            c.query_row(
+                "SELECT COUNT(*),
+                        COALESCE(SUM(size), 0),
+                        COUNT(*) FILTER (WHERE remote_id IS NOT NULL AND pending & 1 = 0),
+                        COALESCE(SUM(size) FILTER (WHERE remote_id IS NOT NULL AND pending & 1 = 0), 0),
+                        (SELECT COUNT(*) FROM node WHERE pending != 0),
+                        COUNT(*) FILTER (WHERE hydrated = 0),
+                        COALESCE(SUM(size) FILTER (WHERE hydrated = 0), 0)
+                 FROM node WHERE kind = 0 AND deleted = 0
+                     -- skipped files (never uploaded, nothing to do) don't count
+                     AND (remote_id IS NOT NULL OR pending & 1 != 0)",
+                [],
+                |r| {
+                    Ok(FolderStats {
+                        all: SubtreeStats {
+                            files: r.get::<_, i64>(0)? as u64,
+                            bytes: r.get::<_, i64>(1)? as u64,
+                            done_files: r.get::<_, i64>(2)? as u64,
+                            done_bytes: r.get::<_, i64>(3)? as u64,
+                            pending: r.get::<_, i64>(4)? as u32,
+                        },
+                        cloud_only_files: r.get::<_, i64>(5)? as u64,
+                        cloud_only_bytes: r.get::<_, i64>(6)? as u64,
+                    })
+                },
+            )
+        })?)
+    }
+
     fn subtree_has_changes(&self, id: NodeId) -> Result<bool> {
         Ok(self.db.read(|c| {
             c.query_row(
@@ -2152,7 +2252,7 @@ impl Engine {
     /// Starts as many due work items as the parallelism limit allows. Returns how many.
     fn dispatch(self: &Arc<Self>) -> usize {
         let cfg = self.config();
-        if cfg.mirror && !self.mirror_linked.load(Ordering::SeqCst) {
+        if (cfg.mirror || cfg.scan_before_upload) && !self.mirror_linked.load(Ordering::SeqCst) {
             return 0;
         }
         let now = now_ms();

@@ -598,6 +598,55 @@ async fn existing_files_are_adopted_and_offline_changes_caught_up() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn release_turns_the_folder_back_into_ordinary_files() {
+    let mut fx = Fixture::new("release");
+    std::fs::create_dir_all(fx.folder.join("sub")).unwrap();
+    std::fs::write(fx.path("sub/kept.txt"), b"kept").unwrap();
+    std::fs::write(fx.path("local.txt"), b"was here before").unwrap();
+    fx.start();
+    fx.put_cloud("cloud.bin", &pattern(300_000, 3)).await;
+    wait_for("local file in sync", || {
+        hydrated_in_sync(&fx.disk("local.txt"))
+    })
+    .await;
+    wait_for("cloud file appears", || cloud_only(&fx.disk("cloud.bin"))).await;
+    assert_eq!(super::cloud_only(&fx.folder).unwrap(), (300_000, 1));
+
+    // Refuses while something is only in the cloud.
+    fx.stop();
+    assert!(super::release(&fx.folder, &fx.account).is_err());
+    assert!(register::is_sync_root(&fx.folder));
+
+    // Download everything (as switching off does: keep it all on this device), then release.
+    fx.start();
+    fx.running.as_ref().unwrap().0.set_pinned("", true).unwrap();
+    wait_for("cloud.bin downloaded", || {
+        super::cloud_only(&fx.folder).is_ok_and(|c| c.1 == 0)
+    })
+    .await;
+    fx.stop();
+    assert!(register::is_registered_account(&fx.account));
+    super::release(&fx.folder, &fx.account).unwrap();
+    assert!(!register::is_sync_root(&fx.folder));
+    assert!(
+        !register::is_registered_account(&fx.account),
+        "still registered"
+    );
+    for (rel, data) in [
+        ("local.txt", b"was here before".to_vec()),
+        ("cloud.bin", pattern(300_000, 3)),
+    ] {
+        let d = fx.disk(rel).expect("still there");
+        assert!(d.ph.is_none(), "{rel} is still a placeholder");
+        let attrs = std::os::windows::fs::MetadataExt::file_attributes(
+            &std::fs::metadata(fx.path(rel)).unwrap(),
+        );
+        assert_eq!(attrs & 0x0018_0000, 0, "{rel} still has pin attributes");
+        assert_eq!(std::fs::read(fx.path(rel)).unwrap(), data);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sign_out_removes_the_folder_but_keeps_unsynced_files() {
     let mut fx = Fixture::new("teardown");
     fx.start();

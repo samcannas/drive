@@ -65,6 +65,29 @@ pub fn teardown(folder: &Path, cache_dir: &Path) -> Result<()> {
     imp::teardown(folder, cache_dir)
 }
 
+/// Removes the folder registration made for `account` (Windows), in case `teardown` couldn't
+/// find it by its path.
+pub fn forget_registration(account: &str) {
+    #[cfg(windows)]
+    imp::forget_registration(account);
+    #[cfg(not(windows))]
+    let _ = account;
+}
+
+/// Whether backed-up folders can be made on-demand in place on this platform.
+pub const ON_DEMAND_FOLDERS: bool = cfg!(windows);
+
+/// Bytes and number of files in an on-demand folder that are only in the cloud.
+pub fn cloud_only(folder: &Path) -> Result<(u64, u64)> {
+    imp::cloud_only(folder)
+}
+
+/// Makes an on-demand folder ordinary again (every file must be on disk first). `account` is
+/// the one its integration was prepared with.
+pub fn release(folder: &Path, account: &str) -> Result<()> {
+    imp::release(folder, account)
+}
+
 /// `~/Drive` (Windows: `%USERPROFILE%\Drive`).
 pub fn default_folder() -> PathBuf {
     dirs::home_dir()

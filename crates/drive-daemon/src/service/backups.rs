@@ -1,6 +1,9 @@
 //! The service side of folder backups: starting the mirror engine next to the main one,
-//! answering the backup calls, and merging the two engines' status, activity, issues and
-//! transfers into one view for the app.
+//! answering the backup calls, and merging every engine's status, activity, issues and
+//! transfers (main, mirror, on-demand folders) into one view for the app.
+//!
+//! Ids of items from backup engines are negative: `-(id * SLOTS + slot)`, where slot 0 is the
+//! mirror engine and 1.. are on-demand folders.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -33,6 +36,24 @@ pub(super) enum RawBackend {
     Uloz(Arc<UlozClient>),
     Mem(Arc<MemRemote>),
 }
+
+/// Number of id slots (backup engines) in a negative id.
+pub(super) const SLOTS: i64 = 1024;
+/// The source of events from the main engine (backup engines use their slot).
+pub(super) const MAIN_SOURCE: i64 = -1;
+
+/// A backup engine's item id as the app sees it.
+pub(super) fn encode_id(id: i64, slot: i64) -> i64 {
+    -(id.saturating_mul(SLOTS) + slot)
+}
+
+/// `(slot, id)` of a backup item id; `None` for main engine ids.
+pub(super) fn decode_id(id: i64) -> Option<(i64, i64)> {
+    (id < 0).then(|| (-id % SLOTS, -id / SLOTS))
+}
+
+/// Where an engine path belongs: `(backup id, path inside the folder, folder name)`.
+type Located = (String, String, String);
 
 /// A running backup engine.
 pub(super) struct BackupRuntime {
@@ -137,52 +158,55 @@ pub(super) fn merge_status(mut m: Status, b: &Status) -> Status {
     m
 }
 
-/// One transfer list for both engines. Backup items get negative ids and readable paths.
+/// One transfer list for every engine. Backup items get negative ids and readable paths.
 pub(super) fn merge_transfers(
     main: &TransferList,
-    b: &TransferList,
-    manager: Option<&Manager>,
+    others: &[(i64, &TransferList)],
+    locate: &dyn Fn(i64, &str) -> Option<Located>,
 ) -> TransferList {
     let mut out = main.clone();
-    out.items
-        .extend(b.items.iter().cloned().map(|mut t: TransferItem| {
-            t.id = -t.id;
-            if let Some((f, rest)) = manager.and_then(|m| m.split_engine_path(&t.path)) {
-                t.path = if rest.is_empty() {
-                    f.name
-                } else {
-                    format!("{} › {rest}", f.name)
-                };
-            }
-            t
-        }));
-    out.total_count += b.total_count;
-    out.upload_rate_bps += b.upload_rate_bps;
-    out.download_rate_bps += b.download_rate_bps;
-    out.upload_remaining_bytes += b.upload_remaining_bytes;
+    for (slot, b) in others {
+        out.items
+            .extend(b.items.iter().cloned().map(|mut t: TransferItem| {
+                t.id = encode_id(t.id, *slot);
+                if let Some((_, rest, name)) = locate(*slot, &t.path) {
+                    t.path = if rest.is_empty() {
+                        name
+                    } else {
+                        format!("{name} › {rest}")
+                    };
+                }
+                t
+            }));
+        out.total_count += b.total_count;
+        out.upload_rate_bps += b.upload_rate_bps;
+        out.download_rate_bps += b.download_rate_bps;
+        out.upload_remaining_bytes += b.upload_remaining_bytes;
+    }
     out.upload_eta_secs = (out.upload_rate_bps > 0)
         .then(|| out.upload_remaining_bytes / out.upload_rate_bps.max(1))
         .or(out.upload_eta_secs);
     out
 }
 
-fn map_activity(mut a: Activity, manager: &Manager) -> Activity {
-    a.id = -a.id;
-    if let Some((f, rest)) = manager.split_engine_path(&a.path) {
+fn map_activity(mut a: Activity, slot: i64, located: Option<Located>) -> Activity {
+    a.id = encode_id(a.id, slot);
+    if let Some((id, rest, _)) = located {
         a.path = rest;
-        a.backup = Some(f.id);
+        a.backup = Some(id);
     }
     a
 }
 
-fn map_issue(mut i: Issue, manager: &Manager) -> Issue {
-    i.id = -i.id;
-    if let Some((f, rest)) = i.path.as_deref().and_then(|p| manager.split_engine_path(p)) {
-        i.path = Some(rest);
-        i.backup = Some(f.id);
-    } else {
+fn map_issue(mut i: Issue, slot: i64, located: Option<Located>) -> Issue {
+    i.id = encode_id(i.id, slot);
+    match located {
+        Some((id, rest, _)) => {
+            i.path = Some(rest);
+            i.backup = Some(id);
+        }
         // Engine-wide issues (sign-in, mass deletes) are about backups as a whole.
-        i.backup = Some(String::new());
+        None => i.backup = Some(String::new()),
     }
     i
 }
@@ -197,8 +221,34 @@ impl Service {
     }
 
     pub(super) fn stop_backups(&self) {
+        self.stop_on_demand_all();
         if let Some(r) = self.backups.lock().unwrap().take() {
             r.stop();
+        }
+    }
+
+    /// Every running backup engine with its slot (mirror first).
+    pub(super) fn backup_engines(&self) -> Vec<(i64, Arc<Engine>)> {
+        let mut out = Vec::new();
+        if let Some(m) = self.backup_manager() {
+            out.push((0, m.engine().clone()));
+        }
+        out.extend(
+            self.on_demand_runtimes()
+                .into_iter()
+                .map(|o| (o.slot, o.engine.clone())),
+        );
+        out
+    }
+
+    /// Where a backup engine's path belongs (see [`Located`]).
+    pub(super) fn locate(&self, slot: i64, path: &str) -> Option<Located> {
+        if slot == 0 {
+            let (f, rest) = self.backup_manager()?.split_engine_path(path)?;
+            Some((f.id, rest, f.name))
+        } else {
+            let o = self.on_demand_by_slot(slot)?;
+            Some((o.folder_id.clone(), path.to_string(), o.name.clone()))
         }
     }
 
@@ -219,6 +269,7 @@ impl Service {
                 inner.config.clone(),
             )
         };
+        self.forget_stale_on_demand_data(&cfg);
         if cfg.backups.is_empty() {
             return Ok(());
         }
@@ -263,8 +314,11 @@ impl Service {
         let manager = Manager::new(engine.clone(), sources, cfg.backups.clone(), on_change);
         engine.start();
         manager.start();
-        let relay = self.spawn_relay(engine.subscribe(), true);
+        let relay = self.spawn_relay(engine.subscribe(), 0);
         *self.backups.lock().unwrap() = Some(BackupRuntime { manager, relay });
+        if cfg.backups.iter().any(|f| f.on_demand) {
+            tokio::spawn(self.clone().start_on_demand_after_backups());
+        }
         info!(
             "backing up {} folders to {}",
             cfg.backups.len(),
@@ -272,6 +326,10 @@ impl Service {
         );
         self.backups_changed.notify_one();
         Ok(())
+    }
+
+    async fn start_on_demand_after_backups(self: Arc<Self>) {
+        self.start_on_demand_all().await;
     }
 
     /// Finds or creates `Backups/<device>` in the vault and records it (and the main engine's
@@ -326,7 +384,7 @@ impl Service {
     pub(super) fn spawn_relay(
         self: &Arc<Self>,
         mut rx: broadcast::Receiver<Event>,
-        from_backup: bool,
+        source: i64,
     ) -> tokio::task::JoinHandle<()> {
         let weak: Weak<Service> = Arc::downgrade(self);
         tokio::spawn(async move {
@@ -344,14 +402,23 @@ impl Service {
                     },
                     Event::Transfers(list) => {
                         let mut t = svc.last_transfers.lock().unwrap();
-                        t[usize::from(from_backup)] = list;
-                        let m = svc.backup_manager();
-                        Event::Transfers(merge_transfers(&t[0], &t[1], m.as_deref()))
+                        t.insert(source, list);
+                        // Forget engines that stopped.
+                        let live: Vec<i64> =
+                            svc.backup_engines().into_iter().map(|(s, _)| s).collect();
+                        t.retain(|s, _| *s == MAIN_SOURCE || live.contains(s));
+                        let main = t.get(&MAIN_SOURCE).cloned().unwrap_or_default();
+                        let others: Vec<(i64, &TransferList)> = t
+                            .iter()
+                            .filter(|(s, _)| **s != MAIN_SOURCE)
+                            .map(|(s, l)| (*s, l))
+                            .collect();
+                        Event::Transfers(merge_transfers(&main, &others, &|s, p| svc.locate(s, p)))
                     }
-                    Event::Activity(a) if from_backup => match svc.backup_manager() {
-                        Some(m) => Event::Activity(map_activity(a, &m)),
-                        None => continue,
-                    },
+                    Event::Activity(a) if source != MAIN_SOURCE => {
+                        let located = svc.locate(source, &a.path);
+                        Event::Activity(map_activity(a, source, located))
+                    }
                     other => other,
                 };
                 let _ = svc.events.send(out);
@@ -372,7 +439,7 @@ impl Service {
     pub(super) async fn backup_overview(&self) -> BackupOverview {
         let cfg = self.inner.lock().await.config.clone();
         let manager = self.backup_manager();
-        let folders: Vec<BackupInfo> = match &manager {
+        let mut folders: Vec<BackupInfo> = match &manager {
             Some(m) => m.infos(),
             None => cfg
                 .backups
@@ -398,9 +465,16 @@ impl Service {
                     skipped_online_only: 0,
                     added_ms: f.added_ms,
                     last_complete_ms: None,
+                    on_demand: f.on_demand,
+                    on_demand_available: crate::platform::ON_DEMAND_FOLDERS,
+                    local_bytes: 0,
+                    keep_bytes: f.keep_bytes.unwrap_or(backup::DEFAULT_KEEP_BYTES),
                 })
                 .collect(),
         };
+        for f in &mut folders {
+            self.on_demand_info(f);
+        }
         let suggestions = if cfg.account.is_some() {
             let backed: Vec<PathBuf> = cfg.backups.iter().map(|f| f.path.clone()).collect();
             let own = [
@@ -478,6 +552,9 @@ impl Service {
                 enabled: true,
                 excludes: backup::scan::default_excludes(),
                 added_ms: now_ms(),
+                on_demand: false,
+                keep_bytes: None,
+                leaving_on_demand: false,
             };
             inner.config.backups.push(folder.clone());
             inner.config.save(&self.paths).map_err(internal)?;
@@ -501,7 +578,7 @@ impl Service {
             .ok_or_else(|| internal("the new backup disappeared"))
     }
 
-    async fn save_backup_folders(&self, manager: &Manager) -> Result<(), RpcError> {
+    pub(super) async fn save_backup_folders(&self, manager: &Manager) -> Result<(), RpcError> {
         let mut inner = self.inner.lock().await;
         inner.config.backups = manager.folders();
         inner.config.save(&self.paths).map_err(internal)?;
@@ -509,7 +586,7 @@ impl Service {
         Ok(())
     }
 
-    fn need_manager(&self) -> Result<Arc<Manager>, RpcError> {
+    pub(super) fn need_manager(&self) -> Result<Arc<Manager>, RpcError> {
         self.backup_manager()
             .ok_or_else(|| rpc(ErrorCode::NotSetUp, "Backups aren't running right now."))
     }
@@ -598,10 +675,9 @@ impl Service {
     // ---- merged views --------------------------------------------------------------------
 
     pub(super) fn merged_status(&self, main: Status) -> Status {
-        match self.backup_manager() {
-            Some(m) => merge_status(main, &m.engine().status()),
-            None => main,
-        }
+        self.backup_engines()
+            .into_iter()
+            .fold(main, |m, (_, e)| merge_status(m, &e.status()))
     }
 
     pub(super) fn merged_activity(
@@ -609,33 +685,57 @@ impl Service {
         mut list: Vec<Activity>,
         limit: u32,
     ) -> Result<Vec<Activity>, RpcError> {
-        if let Some(m) = self.backup_manager() {
-            let more = m
-                .engine()
-                .db()
-                .recent_activity(limit, None)
-                .map_err(internal)?;
-            list.extend(more.into_iter().map(|a| map_activity(a, &m)));
-            list.sort_by(|a, b| b.at_ms.cmp(&a.at_ms));
-            list.truncate(limit as usize);
+        let engines = self.backup_engines();
+        if engines.is_empty() {
+            return Ok(list);
         }
+        for (slot, e) in engines {
+            let more = e.db().recent_activity(limit, None).map_err(internal)?;
+            list.extend(more.into_iter().map(|a| {
+                let located = self.locate(slot, &a.path);
+                map_activity(a, slot, located)
+            }));
+        }
+        list.sort_by(|a, b| b.at_ms.cmp(&a.at_ms));
+        list.truncate(limit as usize);
         Ok(list)
     }
 
     pub(super) fn merged_issues(&self, mut list: Vec<Issue>) -> Result<Vec<Issue>, RpcError> {
-        if let Some(m) = self.backup_manager() {
-            let more = m.engine().issues().map_err(internal)?;
-            list.extend(more.into_iter().map(|i| map_issue(i, &m)));
-            list.sort_by(|a, b| b.created_ms.cmp(&a.created_ms));
+        let engines = self.backup_engines();
+        if engines.is_empty() {
+            return Ok(list);
         }
+        for (slot, e) in engines {
+            let more = e.issues().map_err(internal)?;
+            list.extend(more.into_iter().map(|i| {
+                let located = i.path.as_deref().and_then(|p| self.locate(slot, p));
+                // On-demand engines are one folder each: their engine-wide issues are too.
+                let located = located.or_else(|| {
+                    (slot > 0)
+                        .then(|| self.on_demand_by_slot(slot))
+                        .flatten()
+                        .map(|o| (o.folder_id.clone(), String::new(), o.name.clone()))
+                        .filter(|_| i.path.is_none())
+                });
+                map_issue(i, slot, located)
+            }));
+        }
+        list.sort_by(|a, b| b.created_ms.cmp(&a.created_ms));
         Ok(list)
     }
 
     pub(super) fn merged_transfers(&self, main: TransferList) -> TransferList {
-        match self.backup_manager() {
-            Some(m) => merge_transfers(&main, &m.engine().transfers(), Some(&m)),
-            None => main,
+        let engines = self.backup_engines();
+        if engines.is_empty() {
+            return main;
         }
+        let lists: Vec<(i64, TransferList)> = engines
+            .into_iter()
+            .map(|(s, e)| (s, e.transfers()))
+            .collect();
+        let refs: Vec<(i64, &TransferList)> = lists.iter().map(|(s, l)| (*s, l)).collect();
+        merge_transfers(&main, &refs, &|s, p| self.locate(s, p))
     }
 
     /// The engine that owns a (possibly negative, i.e. backup) issue or transfer id.
@@ -644,11 +744,14 @@ impl Service {
         main: Arc<Engine>,
         id: i64,
     ) -> Result<(Arc<Engine>, i64), RpcError> {
-        if id < 0 {
-            let m = self.need_manager()?;
-            Ok((m.engine().clone(), -id))
-        } else {
-            Ok((main, id))
+        match decode_id(id) {
+            None => Ok((main, id)),
+            Some((slot, id)) => self
+                .backup_engines()
+                .into_iter()
+                .find(|(s, _)| *s == slot)
+                .map(|(_, e)| (e, id))
+                .ok_or_else(|| rpc(ErrorCode::NotFound, "That backup isn't running right now.")),
         }
     }
 }
@@ -697,5 +800,15 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(merge_status(main, &b).headline, "3 items need attention");
+    }
+
+    #[test]
+    fn ids_round_trip() {
+        for (id, slot) in [(1, 0), (7, 1), (123_456_789, 1023), (1, 1023)] {
+            let e = encode_id(id, slot);
+            assert!(e < 0);
+            assert_eq!(decode_id(e), Some((slot, id)));
+        }
+        assert_eq!(decode_id(5), None);
     }
 }

@@ -126,6 +126,16 @@ enum BackupCommand {
         folder: String,
         patterns: Vec<String>,
     },
+    /// Save space (Windows): the folder stays where it is, but files not used lately live only
+    /// in the cloud and download again when opened. `off` downloads everything back first.
+    SaveSpace {
+        folder: String,
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+        /// Keep this many GB of recently used files on this device (default 5).
+        #[arg(long)]
+        keep_gb: Option<f64>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -328,7 +338,7 @@ async fn run_backup(client: &Client, cmd: BackupCommand) -> Result<()> {
             }
             for f in &ov.folders {
                 println!(
-                    "{:<12} {:?}{}
+                    "{:<12} {:?}{}{}
              {}
              {} of {} files ({} of {}) in the cloud",
                     f.name,
@@ -337,6 +347,11 @@ async fn run_backup(client: &Client, cmd: BackupCommand) -> Result<()> {
                         .as_deref()
                         .map(|d| format!(" · {d}"))
                         .unwrap_or_default(),
+                    if f.on_demand {
+                        format!(" · saves space, {} on this PC", human_bytes(f.local_bytes))
+                    } else {
+                        String::new()
+                    },
                     f.path,
                     f.done_files,
                     f.files,
@@ -431,11 +446,38 @@ Not backed up yet:"
                 .await?;
             println!("{} now skips: {}", info.name, info.excludes.join(", "));
         }
+        BackupCommand::SaveSpace {
+            folder,
+            state,
+            keep_gb,
+        } => {
+            let f = find_backup(client, &folder).await?;
+            let on = state == "on";
+            let info: BackupInfo = client
+                .call(Call::SetBackupOnDemand {
+                    id: f.id,
+                    on_demand: on,
+                    keep_bytes: keep_gb.map(|g| (g * (1u64 << 30) as f64) as u64),
+                })
+                .await?;
+            if on {
+                println!(
+                    "{} saves space now: it keeps {} of recently used files on this PC; the rest download when opened.",
+                    info.name,
+                    human_bytes(info.keep_bytes)
+                );
+            } else {
+                println!(
+                    "Downloading {} back to this PC. It's a full copy again when that's done.",
+                    info.name
+                );
+            }
+        }
     }
     Ok(())
 }
 
-fn human_bytes(b: u64) -> String {
+pub(crate) fn human_bytes(b: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut v = b as f64;
     let mut i = 0;

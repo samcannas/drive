@@ -26,7 +26,8 @@ use crate::config::{Account, Config, Paths, Secrets};
 use crate::platform::{self, Platform, PlatformContext};
 
 mod backups;
-use backups::{BackupRuntime, RawBackend};
+mod on_demand;
+use backups::{BackupRuntime, MAIN_SOURCE, RawBackend};
 
 /// Name of the vault folder in the uloz.to account root.
 pub const VAULT_FOLDER: &str = "Drive vault";
@@ -60,8 +61,13 @@ pub struct Service {
     backup_ops: Mutex<()>,
     backups_changed: Notify,
     suggestions: Arc<crate::backup::Suggestions>,
-    /// Latest transfer list of the main and the backup engine.
-    last_transfers: std::sync::Mutex<[drive_core::ipc::TransferList; 2]>,
+    /// Latest transfer list of each engine (by source: main, then backup slots).
+    last_transfers:
+        std::sync::Mutex<std::collections::BTreeMap<i64, drive_core::ipc::TransferList>>,
+    /// Backed-up folders running on-demand ("Save space").
+    on_demand: std::sync::Mutex<Vec<Arc<on_demand::OnDemand>>>,
+    /// Why an on-demand folder couldn't start, by backup id.
+    on_demand_problems: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 fn rpc(code: ErrorCode, msg: impl Into<String>) -> RpcError {
@@ -137,6 +143,8 @@ impl Service {
             backups_changed: Notify::new(),
             suggestions: Arc::new(crate::backup::Suggestions::default()),
             last_transfers: std::sync::Mutex::new(Default::default()),
+            on_demand: std::sync::Mutex::new(Vec::new()),
+            on_demand_problems: std::sync::Mutex::new(Default::default()),
         }))
     }
 
@@ -300,7 +308,7 @@ impl Service {
         }
 
         // Forward engine events to IPC subscribers (merged with the backup engine's).
-        let relay = self.spawn_relay(engine.subscribe(), false);
+        let relay = self.spawn_relay(engine.subscribe(), MAIN_SOURCE);
         info!(
             "syncing {} with uloz.to account {}",
             folder.display(),
@@ -407,22 +415,24 @@ impl Service {
                 .map(|r| serde_json::to_value(r).unwrap_or_default()),
             Call::Pause => {
                 self.engine().await?.pause();
-                if let Some(m) = self.backup_manager() {
-                    m.engine().pause();
+                for (_, e) in self.backup_engines() {
+                    e.pause();
                 }
                 ok(Value::Null)
             }
             Call::Resume => {
                 self.engine().await?.resume();
-                if let Some(m) = self.backup_manager() {
-                    m.engine().resume();
+                for (_, e) in self.backup_engines() {
+                    e.resume();
                 }
                 ok(Value::Null)
             }
             Call::SyncNow => {
                 self.engine().await?.sync_now();
+                for (_, e) in self.backup_engines() {
+                    e.sync_now();
+                }
                 if let Some(m) = self.backup_manager() {
-                    m.engine().sync_now();
                     m.rescan_all();
                 }
                 ok(Value::Null)
@@ -475,6 +485,14 @@ impl Service {
                 .await
                 .map(|k| serde_json::to_value(k).unwrap_or_default()),
             Call::SignOut => {
+                if let Some(name) = self.on_demand_folder_name().await {
+                    return Err(rpc(
+                        ErrorCode::BadRequest,
+                        format!(
+                            "{name} saves space with files that are only in the cloud. Switch off Save space for it first, so they're all on this PC."
+                        ),
+                    ));
+                }
                 self.sign_out().await.map_err(internal)?;
                 ok(Value::Null)
             }
@@ -525,6 +543,15 @@ impl Service {
                 self.dismiss_backup_suggestions().await?;
                 ok(Value::Null)
             }
+            Call::SetBackupOnDemand {
+                id,
+                on_demand,
+                keep_bytes,
+            } => ok(serde_json::to_value(
+                self.set_backup_on_demand(&id, on_demand, keep_bytes)
+                    .await?,
+            )
+            .map_err(internal)?),
         }
     }
 
@@ -824,6 +851,9 @@ impl Service {
         }
         if let Err(e) = platform::teardown(&folder, &self.paths.cache_dir.join("content")) {
             warn!("cleaning up the Drive folder failed: {e:#}");
+        }
+        if let Some(a) = &inner.config.account {
+            platform::forget_registration(&a.login);
         }
         remove_db(&self.paths.db_file());
         Secrets::delete(&self.paths);

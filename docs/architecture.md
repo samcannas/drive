@@ -99,8 +99,33 @@ Folders outside the Drive folder are mirrored **one way** by a second engine
 - **Main engine exclusion.** `EngineConfig::exclude_remote/exclude_local` hide this device's
   own `Backups/<device>` from its Drive folder, so it isn't shown twice. Other devices see it
   as normal cloud files.
-- **One view.** The service merges both engines' status, activity, issues and transfers.
-  Backup ids are negated so calls can be routed back to the right engine.
+- **One view.** The service merges every engine's status, activity, issues and transfers.
+  Backup ids are negative, `-(id * 1024 + slot)` (slot 0 is the mirror engine, 1.. are
+  on-demand folders), so calls can be routed back to the right engine.
+
+### Save space (on-demand backed-up folders, Windows)
+
+A backed-up folder can stay where it is but become on-demand like the Drive folder
+(`service/on_demand.rs`):
+
+- **Switching on.** The mirror engine forgets the folder (its cloud copy stays). The folder gets
+  its own **two-way** engine on `Backups/<device>/<name>`, linked to the main one, and its own
+  Cloud Files sync root (id `<login>~<backup id>`). `scan_before_upload` holds uploads until the
+  cloud has been listed, so files already backed up are **adopted** (same name, size and
+  modification time) instead of uploaded again. The evictor then frees the files used least
+  recently (new files count as last used when last modified) beyond `keep_bytes` (5 GB by
+  default). The skip list still applies: skipped files stay ordinary files and never upload.
+- **Switching off.** Refused unless the disk has room for everything only in the cloud plus
+  1 GB. The folder is pinned, so everything downloads (shown as `converting`; survives a
+  restart via `leaving_on_demand`). Once nothing is cloud-only, the folder is disconnected,
+  every placeholder is reverted to an ordinary file (`CfRevertPlaceholder`, pin attributes
+  cleared), the sync root is unregistered by its id, and the mirror engine takes the folder
+  back, linking files without uploading them again. `platform::release` refuses to run while
+  any file is still cloud-only.
+- **Guards.** Turning the backup off, removing it, changing its skip list and signing out are
+  refused while a folder is on-demand.
+- **Linux** reports `on_demand_available = false`: a FUSE mount over an existing folder would
+  hide its files.
 
 ## Encryption
 

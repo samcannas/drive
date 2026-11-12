@@ -119,6 +119,16 @@ pub enum Call {
     },
     /// Hides the "these folders aren't backed up" suggestion.
     DismissBackupSuggestions,
+    /// Makes a backed-up folder on-demand (files stay where they are, but ones that are safely
+    /// in the cloud can be freed and download again when opened), or a full copy again (which
+    /// first downloads everything back; fails if there isn't enough free space). `keep_bytes`
+    /// changes how much of it stays on this device. Returns [`BackupInfo`].
+    SetBackupOnDemand {
+        id: String,
+        on_demand: bool,
+        #[serde(default)]
+        keep_bytes: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -595,6 +605,19 @@ pub struct BackupInfo {
     pub added_ms: i64,
     /// When the backup was last fully up to date.
     pub last_complete_ms: Option<i64>,
+    /// On-demand: files stay at their place in the folder, but those not used lately live only
+    /// in the cloud and download again when opened (like the Drive folder).
+    #[serde(default)]
+    pub on_demand: bool,
+    /// Whether this device can make folders on-demand (Windows only for now).
+    #[serde(default)]
+    pub on_demand_available: bool,
+    /// Bytes of this folder stored on this device (all of it unless on-demand).
+    #[serde(default)]
+    pub local_bytes: u64,
+    /// On-demand: recently used files are kept on this device up to this size.
+    #[serde(default)]
+    pub keep_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -611,6 +634,9 @@ pub enum BackupState {
     Waiting,
     /// The folder is missing or unreadable (see `detail`).
     Problem,
+    /// Switching between a full copy and on-demand (see `detail`, e.g. "Downloading 12.4 GB
+    /// back to this PC…").
+    Converting,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]

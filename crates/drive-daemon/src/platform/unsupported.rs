@@ -13,3 +13,12 @@ pub fn prepare(_ctx: PlatformContext) -> Result<Box<dyn Platform>> {
 pub fn teardown(_folder: &Path, _cache_dir: &Path) -> Result<()> {
     Ok(())
 }
+
+/// Folders can't be made on-demand in place on this platform.
+pub fn cloud_only(_folder: &Path) -> Result<(u64, u64)> {
+    Ok((0, 0))
+}
+
+pub fn release(_folder: &Path, _account: &str) -> Result<()> {
+    Ok(())
+}
