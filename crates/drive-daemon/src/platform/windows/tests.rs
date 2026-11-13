@@ -51,31 +51,40 @@ struct Fixture {
 }
 
 /// Removes test sync roots left behind by earlier test processes that were killed before
-/// their `Drop` ran (they would otherwise linger in Explorer's navigation pane).
+/// their `Drop` ran (they would otherwise linger in Explorer's navigation pane). Reads the
+/// registrations from the registry: Windows' own list leaves out roots it can't resolve by
+/// path (e.g. under `AppData\Local\Temp`, or whose folder was deleted).
 fn sweep_stale_test_roots() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        let Ok(roots) = cloud_filter::root::active_roots() else {
-            return;
-        };
-        for info in roots {
-            let id = info.id();
-            let id_str = id.to_os_string().to_string_lossy().into_owned();
-            // Ids look like `Drive!<sid>!test-<name>-<pid>-<rand>`.
-            let Some(rest) = id_str
-                .split("!test-")
-                .nth(1)
-                .filter(|_| id_str.starts_with("Drive!"))
-            else {
-                continue;
-            };
-            let pid = rest.rsplit('-').nth(1).and_then(|p| p.parse::<u32>().ok());
-            let alive = pid.is_some_and(|p| p == std::process::id() || process_running(p));
-            if !alive {
-                let _ = id.unregister();
-            }
+        for account in stale_test_accounts() {
+            register::unregister_account(&account);
         }
     });
+}
+
+/// Accounts (`test-<name>-<pid>-<rand>`) of Drive test registrations whose process is gone.
+fn stale_test_accounts() -> Vec<String> {
+    let Ok(roots) = winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE)
+        .open_subkey(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager")
+    else {
+        return Vec::new();
+    };
+    roots
+        .enum_keys()
+        .flatten()
+        // Ids look like `Drive!<sid>!test-<name>-<pid>-<rand>`; nothing else is ever touched.
+        .filter(|id| id.starts_with("Drive!"))
+        .filter_map(|id| id.rsplit('!').next().map(str::to_string))
+        .filter(|account| account.starts_with("test-"))
+        .filter(|account| {
+            let pid = account
+                .rsplit('-')
+                .nth(1)
+                .and_then(|p| p.parse::<u32>().ok());
+            !pid.is_some_and(|p| p == std::process::id() || process_running(p))
+        })
+        .collect()
 }
 
 fn process_running(pid: u32) -> bool {
@@ -274,6 +283,8 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         self.stop();
         register::unregister(&self.folder);
+        // By id too: a folder under Temp can't be found by path.
+        register::unregister_account(&self.account);
         // The engine's tasks let go of the database shortly after shutdown.
         for _ in 0..50 {
             if std::fs::remove_dir_all(&self.base).is_ok() || !self.base.exists() {
@@ -616,6 +627,26 @@ async fn folders_can_stay_out_of_the_navigation_pane() {
     fx.show_in_explorer = true;
     fx.start();
     assert_eq!(super::navpane::sync_root_entry_visible(&id), Some(true));
+}
+
+#[test]
+fn registrations_left_by_dead_test_runs_are_swept() {
+    // As if a test run had crashed: pid 1 never belongs to a running test.
+    let account = format!("test-sweep-1-{}", rand::random::<u32>());
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/cfapi-tests")
+        .join(&account);
+    std::fs::create_dir_all(&base).unwrap();
+    let folder = super::util::strip_verbatim(&std::fs::canonicalize(&base).unwrap());
+    register::register(&folder, &account, "Drive (test)").unwrap();
+    // Even with its folder gone (Windows' own list leaves such roots out).
+    std::fs::remove_dir_all(&folder).unwrap();
+    assert!(stale_test_accounts().contains(&account));
+    for a in stale_test_accounts() {
+        register::unregister_account(&a);
+    }
+    assert!(!stale_test_accounts().contains(&account));
+    assert!(!register::is_registered_account(&account));
 }
 
 #[test]
